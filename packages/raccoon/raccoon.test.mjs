@@ -561,6 +561,83 @@ test("loader refreshes on 401, strips x-api-key, rewrites split SSE stream, and 
   expect(res402.headers.get("x-magpie-sign-in")).toBe("kept")
 })
 
+test("the vendor is asked with the SDK's User-Agent, over the one magpie sends", async () => {
+  // magpie sends `magpie/<version>` on every request a plugin's fetch makes,
+  // and a plugin can't unset it from the provider's side (a plugin's provider
+  // has an Account, so provider.PassesUserAgent is false, and its
+  // Account.sign is a no-op, so a `user-agent=agent` or a header can't reach
+  // it). So the plugin puts its own on here, as the desktop app does.
+  const tok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const seen = []
+  startServer({
+    "POST /api/web/llm/v2/chat/completions": (req) => {
+      seen.push({
+        ua: req.headers.get("user-agent"),
+        accept: req.headers.get("accept"),
+        contentType: req.headers.get("content-type"),
+      })
+      return Response.json({ id: "1", model: "sn-kimi-k3", choices: [{ message: { role: "assistant", content: "ok" } }] })
+    },
+  })
+
+  const stored = { type: "oauth", access: tok, refresh: "R1", expires: Date.now() + 3600_000 }
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const loaded = await hooks.auth.loader(async () => stored)
+  const res = await loaded.fetch(`${loaded.baseURL}/chat/completions`, {
+    method: "POST",
+    // what magpie's pluginFetch hands in: lowercased headers, magpie's own UA
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "user-agent": "magpie/dev",
+      "x-api-key": "raccoon",
+    },
+    body: JSON.stringify({ model: "sn-kimi-k3", messages: [{ role: "user", content: "hi" }] }),
+  })
+
+  expect(res.status).toBe(200)
+  expect(seen[0].ua).toBe("AsyncOpenAI/Python 2.8.0")
+  // and the three it always sets still win over what magpie sent
+  expect(seen[0].accept).toBe("*/*")
+  expect(seen[0].contentType).toBe("application/json")
+})
+
+test("RACCOON_USER_AGENT overrides the User-Agent the vendor is asked with", async () => {
+  const tok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const seen = []
+  startServer({
+    "POST /api/web/llm/v2/chat/completions": (req) => {
+      seen.push(req.headers.get("user-agent"))
+      return Response.json({ id: "1", model: "sn-kimi-k3", choices: [] })
+    },
+  })
+  const stored = { type: "oauth", access: tok, refresh: "R1", expires: Date.now() + 3600_000 }
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const loaded = await hooks.auth.loader(async () => stored)
+  const ask = () =>
+    loaded.fetch(`${loaded.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "user-agent": "magpie/dev" },
+      body: JSON.stringify({ model: "sn-kimi-k3", messages: [] }),
+    })
+
+  try {
+    expect(_internal.userAgent()).toBe("AsyncOpenAI/Python 2.8.0")
+    process.env.RACCOON_USER_AGENT = "MyClient/9.9"
+    expect(_internal.userAgent()).toBe("MyClient/9.9")
+    await ask()
+    expect(seen[0]).toBe("MyClient/9.9")
+    // "" hands the request back to magpie's own User-Agent, for a vendor that
+    // wants the magpie one
+    process.env.RACCOON_USER_AGENT = ""
+    expect(_internal.userAgent()).toBe("")
+    await ask()
+    expect(seen[1]).toBe("magpie/dev")
+  } finally {
+    delete process.env.RACCOON_USER_AGENT
+  }
+})
+
 test("desktop sign-in marks expired when desktop app switches to another account", async () => {
   tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
   process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
