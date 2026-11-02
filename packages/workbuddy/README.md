@@ -169,6 +169,63 @@ Not sent: `X-Device-Token`, which the desktop app gets from Tencent's
 native device SDK before each prompt, and a `traceparent`, which the CLI
 adds only while its server-side tracing is on.
 
+### Request format
+
+A chat to the China build can go out in the shape of the official CodeBuddy
+CLI, `@tencent-ai/codebuddy-code` 2.108.1, instead of WorkBuddy's own desktop
+app. Its option is `requestFormat`:
+
+    { "requestFormat": "codebuddy-2108" }
+
+In magpie it is set from the plugin's row on the Plugins page (Installed ›
+Options, which starts from the package's `magpie.options`), or in its
+`plugins.json` entry; in OpenCode,
+`["@magpie-community/opencode-workbuddy-auth", { "requestFormat": "codebuddy-2108" }]`.
+The default, `"magpie"`, is the format every request used before the option
+existed, and a value naming neither is read as `"magpie"`, so a typo sends
+what every request sent before rather than failing a chat.
+
+What changes:
+
+- `User-Agent: CLI/2.108.1 CodeBuddy/2.108.1`, `X-IDE-Type: CLI`,
+  `X-IDE-Name: CLI`, `X-IDE-Version: 2.108.1` — the CLI's own naming of
+  itself in place of the app's (`buildUserAgent()`,
+  `CliClientInfoProvider`);
+- `x-codebuddy-request: 1`, the mark a captured CLI chat carries;
+- `X-Private-Data: false` on a consumer account and `true` on an enterprise
+  one (`resolveModelOptimizationEnabled()` inverted);
+- `X-Agent-Type` and `X-Agent-Runtime` go: the CLI first sends them in
+  2.138.0 and 2.172.1, so 2.108.1 has neither;
+- `X-Stainless-Timeout` goes: no captured chat of any release carries it,
+  whatever the SDK would stamp for a client with a timeout set;
+- `X-Stainless-Runtime-Version` is `process.version`, the Node the plugin
+  itself runs on, not the app's Electron;
+- the body is not gzipped: no CLI capture carries a `Content-Encoding`;
+- a chat that asks for thinking gains `reasoning_summary: "auto"` and
+  `verbosity: "high"`, which the CLI's own interceptor writes beside a
+  `reasoning_effort` — and neither on a chat that asked for none, since
+  forcing reasoning onto a plain request makes CodeBuddy trip its content
+  filter. A caller's own values are kept.
+
+What does not change: the sign-in headers (`Authorization`, `X-User-Id`,
+`X-Domain`, `X-API-Key`, the enterprise pair), `X-Product`, the four
+conversation ids, `X-Agent-Intent`, `X-Agent-Purpose`, `X-Requested-With` and
+the rest of the `X-Stainless-*` set. Nor does anything else the plugin sends:
+the product config, the meter and the daily check-in are not chats, and
+`/v1/messages` and count_tokens are another API whose headers no CodeBuddy
+capture describes. WorkBuddy AI has the one format — the option is about the
+China build's chat endpoint.
+
+Where the fingerprint comes from: DurinDoor's own
+`docs/providers/codebuddy-cn.md` records what each
+`@tencent-ai/codebuddy-code` release contributes, from live captures of a
+dozen releases rather than from a reading of the bundle. 2.108.1 is the one to
+mirror here because it predates two changes a gateway cannot imitate: from
+2.146.0 the CLI mints UUIDv7 conversation ids, whose first 48 bits are a real
+creation timestamp, and later releases add headers and body fields (`baggage`
+in 2.164.0, `cache_retention` and `extra_vars` in 2.172.1) that a
+2.108.1-shaped request should not carry.
+
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
 
