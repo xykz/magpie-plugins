@@ -25,6 +25,16 @@ const LEAD_MS = 5 * 60 * 1000
 const KEEP_RENEWED_MS = 60 * 1000
 const CATALOG_TTL_MS = 10 * 60 * 1000
 
+// USER_AGENT is what the vendor's chat API is asked with. magpie sends its own
+// (`magpie/<version>`, internal/gateway/user_agent.go), and a plugin can't take
+// that back: a plugin's provider has an Account, so provider.PassesUserAgent is
+// false, and its Account.sign is a no-op (internal/provider/plugins.go), so
+// neither `user-agent=agent` nor the provider's `header.User-Agent` reaches the
+// request. So the fetch below puts this one on, over whatever magpie handed in.
+// RACCOON_USER_AGENT overrides it, "" leaves magpie's own alone.
+const USER_AGENT = "AsyncOpenAI/Python 2.8.0"
+const userAgent = () => process.env.RACCOON_USER_AGENT ?? USER_AGENT
+
 const desktopPlatform = (plat = process.platform) => (plat === "darwin" ? "desktop-mac" : "desktop-windows")
 const desktopHeaders = () => ({
   "X-Client-Platform": desktopPlatform(),
@@ -1105,6 +1115,8 @@ export const RaccoonAuthPlugin = async ({ client }) => {
               headers.set("Authorization", "Bearer " + cred.access)
               headers.set("Content-Type", "application/json")
               headers.set("Accept", "*/*")
+              const ua = userAgent()
+              if (ua) headers.set("User-Agent", ua)
               return fetch(req ? req.url : input, {
                 ...init,
                 method: init?.method ?? req?.method ?? "POST",
@@ -1221,6 +1233,8 @@ export const _internal = {
   renewToken,
   desktopPlatform,
   desktopOnboardingSettled,
+  USER_AGENT,
+  userAgent,
   renewed,
   renewing,
 }
