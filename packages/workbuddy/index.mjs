@@ -10,6 +10,7 @@
 // those of its current desktop app (see SITES' app, cli and appName).
 
 import { createHash, randomBytes } from "node:crypto"
+import { FORMAT_KEY, FORMAT_MAGPIE, FORMAT_2108, FORMATS, headersOn, bodyOn, streamed, whole, gzipOn } from "./codebuddy.mjs"
 import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, join } from "node:path"
@@ -30,22 +31,6 @@ const KEEP_RENEWED_MS = 60 * 1000 // how long a refresh's result answers for the
 // them). It is an option a person sets, never a default: a format that isn't
 // one of these two goes out as "magpie", which is what every request did
 // before the option existed.
-const FORMAT_KEY = "requestFormat"
-const FORMAT_MAGPIE = "magpie"
-const FORMAT_2108 = "codebuddy-2108"
-const FORMATS = new Set([FORMAT_MAGPIE, FORMAT_2108])
-
-// What 2.108.1 says it is. Its User-Agent is buildUserAgent()'s shape with the
-// CLI's own version in both halves, and X-IDE-Version is the same version
-// (CliClientInfoProvider falls back to its own package version). 2.108.1 is
-// the release to mirror because it predates two things a gateway cannot
-// imitate: from 2.146.0 the CLI mints UUIDv7 conversation ids, whose first 48
-// bits are a real creation timestamp, and later releases add headers and body
-// fields (baggage in 2.164.0, cache_retention and extra_vars in 2.172.1) that
-// a 2.108.1-shaped request must not carry.
-const CB_VERSION_2108 = "2.108.1"
-const CB_UA_2108 = `CLI/${CB_VERSION_2108} CodeBuddy/${CB_VERSION_2108}`
-
 // [id, name, context, efforts]
 const CN_MODELS = [
   ["auto", "Auto", 168000],
@@ -364,10 +349,10 @@ function formatOf(site, options) {
   return FORMATS.has(want) ? want : FORMAT_MAGPIE
 }
 
-// sign sets on headers what a request to WorkBuddy carries: the account's own,
-// the client's, and the attribution WorkBuddy's usage list shows as the client
-// that asked (使用端). The chat's ids — the conversation's, the turn's, the
-// message's — are attend's below.
+// sign sets on headers what WorkBuddy's desktop app sends with a chat: the
+// account's own, the client's, and the attribution WorkBuddy's usage list
+// shows as the client that asked (使用端). The chat's ids — the
+// conversation's, the turn's, the message's — are attend's below.
 //
 // WorkBuddy's own client sends the whole of this on both builds
 // (application-manifest.js: X-Agent-Purpose "conversation", X-IDE-Name/Type
@@ -376,11 +361,7 @@ function formatOf(site, options) {
 // when only some of the group is there. The gate below used to give the China
 // build none of the client's headers, so every China-build request was
 // attribution-less.
-//
-// fmt names which client the request goes as: WorkBuddy's desktop app (what
-// every request did before the option existed), or, for "codebuddy-2108", the
-// official CodeBuddy CLI 2.108.1.
-function sign(site, a, headers, fmt = FORMAT_MAGPIE) {
+function sign(site, a, headers) {
   headers.set("Authorization", "Bearer " + a.access)
   headers.set("X-User-Id", a.uid ?? "")
   if (a.source === "key") {
@@ -392,34 +373,6 @@ function sign(site, a, headers, fmt = FORMAT_MAGPIE) {
     headers.set("X-Domain", domainOf(site, a))
   }
   headers.set("X-Product", "SaaS")
-  for (const [k, v] of Object.entries(enterpriseHeaders(a))) headers.set(k, v)
-  if (fmt === FORMAT_2108) {
-    // 2.108.1 names itself in all four places the WorkBuddy app does, from the
-    // CLI's own version rather than the app's: buildUserAgent()'s
-    // `CLI/<v> CodeBuddy/<v>`, CliClientInfoProvider's X-IDE-Type and
-    // X-IDE-Name "CLI", and X-IDE-Version <v>. x-codebuddy-request and
-    // x-requested-with are on a captured CLI chat request; a source reading
-    // of the bundle drops the first of those two, which is why what ships
-    // here follows the capture.
-    headers.set("User-Agent", CB_UA_2108)
-    headers.set("X-IDE-Type", "CLI")
-    headers.set("X-IDE-Name", "CLI")
-    headers.set("X-IDE-Version", CB_VERSION_2108)
-    headers.set("x-codebuddy-request", "1")
-    headers.set("X-Requested-With", "XMLHttpRequest")
-    // X-Agent-Intent is 2.108.1's own (one of the six identity headers its
-    // release contributes); X-Agent-Purpose is the purpose every normal turn
-    // of the CLI's carries, in no release's added-list and so in all of them.
-    headers.set("X-Agent-Intent", "craft")
-    headers.set("X-Agent-Purpose", "conversation")
-    // resolveModelOptimizationEnabled() is on for a consumer account and off
-    // for an enterprise one, and this flag is that value inverted. It is not
-    // one of the login-flow headers no stored token can rebuild
-    // (X-Userinfo, X-Auth-Method, X-Id-Source, X-Department-Info): what it
-    // reads is the account's enterprise, which this plugin already knows.
-    headers.set("X-Private-Data", a.enterpriseId ? "true" : "false")
-    return
-  }
   headers.set("X-IDE-Type", "WorkBuddy")
   headers.set("User-Agent", cliAgent(site))
   headers.set("X-Requested-With", "XMLHttpRequest")
@@ -427,6 +380,7 @@ function sign(site, a, headers, fmt = FORMAT_MAGPIE) {
   headers.set("X-Agent-Purpose", "conversation")
   headers.set("X-IDE-Name", "WorkBuddy")
   headers.set("X-IDE-Version", site.app)
+  for (const [k, v] of Object.entries(enterpriseHeaders(a))) headers.set(k, v)
 }
 
 // cliAgent is the User-Agent WorkBuddy's desktop CLI sends its API calls
@@ -446,40 +400,24 @@ const NODE = "v22.21.1"
 const SDK_OS = { darwin: "MacOS", win32: "Windows", linux: "Linux", freebsd: "FreeBSD", openbsd: "OpenBSD", android: "Android" }
 const SDK_ARCH = { x64: "x64", arm64: "arm64", arm: "arm", ia32: "x32", x32: "x32" }
 
-// chatHeaders sets on a chat what its client adds to its model requests alone.
-// For WorkBuddy's own client (axiosToFetchAdapter, both builds): the agent type
-// (resolveModelCallAgentType, "main" for the conversation's own agent), the
-// runtime where a build sends one, and the OpenAI SDK's own headers, which the
-// CLI's fetch passes on. Its client has a 1200s timeout and no retries of its
-// own.
-//
-// For "codebuddy-2108" the same SDK headers go out — the official CLI's chat
-// client is that same bundled openai SDK — but the app's four do not: 2.108.1
-// sends no X-Agent-Type (first in 2.138.0) and no X-Agent-Runtime (first in
-// 2.172.1), and no captured chat of any release carries X-Stainless-Timeout,
-// whatever the SDK would stamp for a client with a timeout set. Its
-// X-Stainless-Runtime-Version is the CLI's own Node (process.version), not the
-// Electron the desktop app runs it on.
-function chatHeaders(site, headers, fmt = FORMAT_MAGPIE) {
+// chatHeaders sets on a chat what WorkBuddy's CLI adds to its model
+// requests alone (axiosToFetchAdapter, both builds): the agent type
+// (resolveModelCallAgentType, "main" for the conversation's own agent),
+// the runtime where a build sends one, and the OpenAI SDK's own headers,
+// which the CLI's fetch passes on. Its client has a 1200s timeout and
+// no retries of its own.
+function chatHeaders(site, headers) {
+  headers.set("X-Agent-Type", "main")
+  if (site.runtime) headers.set("X-Agent-Runtime", site.runtime)
+  else headers.delete("X-Agent-Runtime")
   headers.set("Accept", "application/json")
   headers.set("X-Stainless-Retry-Count", "0")
+  headers.set("X-Stainless-Timeout", "1200")
   headers.set("X-Stainless-Lang", "js")
   headers.set("X-Stainless-Package-Version", OPENAI_SDK)
   headers.set("X-Stainless-OS", SDK_OS[process.platform] ?? (process.platform ? `Other:${process.platform}` : "Unknown"))
   headers.set("X-Stainless-Arch", SDK_ARCH[process.arch] ?? (process.arch ? `other:${process.arch}` : "unknown"))
   headers.set("X-Stainless-Runtime", "node")
-  if (fmt === FORMAT_2108) {
-    headers.delete("X-Agent-Type")
-    headers.delete("X-Agent-Runtime")
-    headers.delete("X-Stainless-Timeout")
-    headers.set("Content-Type", "application/json")
-    headers.set("X-Stainless-Runtime-Version", process.version)
-    return
-  }
-  headers.set("X-Agent-Type", "main")
-  if (site.runtime) headers.set("X-Agent-Runtime", site.runtime)
-  else headers.delete("X-Agent-Runtime")
-  headers.set("X-Stainless-Timeout", "1200")
   headers.set("X-Stainless-Runtime-Version", NODE)
 }
 
@@ -3344,16 +3282,6 @@ function namesEffort(chat) {
   return chat.reasoning_effort !== undefined || (!!chat.reasoning && typeof chat.reasoning === "object" && chat.reasoning.effort !== undefined)
 }
 
-// asksReasoning is whether a chat asks for any thinking at all: the effort it
-// names, in either spelling, is not the gateway's "none" or "off". A chat with
-// no effort named has had the model's own default written in by
-// withDefaultEffort before this is asked, so what it names is what goes.
-function asksReasoning(chat) {
-  if (!chat || typeof chat !== "object") return false
-  const e = chat.reasoning_effort ?? chat.reasoning?.effort
-  return typeof e === "string" && e !== "none" && e !== "off"
-}
-
 async function liveModels(site, a) {
   const headers = new Headers()
   sign(site, a, headers)
@@ -3679,27 +3607,37 @@ function makePlugin(site) {
             // count_tokens keep this plugin's own whatever the option says —
             // another API, whose headers no CodeBuddy CLI capture describes.
             const fmt = completion ? formatOf(site, options) : FORMAT_MAGPIE
-            // 2.108.1's model-settings interceptor writes verbosity:"high"
-            // whenever thinking is on, and injectReasoningSummaryIfNeeded
-            // writes reasoning_summary:"auto" — both beside a reasoning_effort,
-            // never on a request that asked for none (forcing reasoning on a
-            // plain request makes CodeBuddy trip its content filter). A chat
-            // reaching here with no effort named has just been given its
-            // model's own default, as the CLI asks it, so it counts as asked.
-            if (fmt === FORMAT_2108 && chat && typeof chat === "object" && asksReasoning(chat)) {
-              if (chat.reasoning_summary === undefined) { chat.reasoning_summary = "auto"; changed = true }
-              if (chat.verbosity === undefined) { chat.verbosity = "high"; changed = true }
+            // The body as durindoor v3.18.0 sends it — that fork's codebuddy-cn
+            // request is the one checked against the gateway in production, so
+            // this format copies its transform rather than the CLI's bundle.
+            // Its executor does four things and nothing else: stream:true
+            // always (registry forceStream + `transformed.stream = true`), a
+            // reasoning_effort of "none"/"off" deleted outright ("the gateway
+            // has no none — just omit"), reasoning_summary:"auto" overwritten
+            // beside any other effort, and stream_options:{include_usage:true}
+            // added when the client named none. It never writes verbosity. Its
+            // effort reading is the top-level field alone, so a chat that
+            // spells it `reasoning: {effort}` gains nothing here, as there.
+            let forcedStream = false
+            if (fmt === FORMAT_2108 && chat && typeof chat === "object") {
+              if (bodyOn(chat)) changed = true
+              forcedStream = !streamed(chat)
+              if (forcedStream) changed = true
             }
-            sign(site, a, headers, fmt)
-            chatHeaders(site, headers, fmt)
+            if (fmt === FORMAT_2108) headersOn(headers, a.access)
+            else {
+              sign(site, a, headers)
+              chatHeaders(site, headers)
+            }
             let who = scopeOf(a)
-            let ids = attendChat(headers, chat, session, who)
+            // a 2.108.1 chat carries no conversation ids at all, so attendChat
+            // is skipped — and `ids` stays empty so the resend path's reattend
+            // adds none either
+            let ids = fmt === FORMAT_2108 ? { set: [], turn: "", conv: "" } : attendChat(headers, chat, session, who)
             const post = (b) => {
-              // a chat goes gzipped, as WorkBuddy's client sends it (gzipped);
-              // its size on the wire is what unanswered weighs. 2.108.1 sends
-              // plain JSON — no CodeBuddy CLI capture carries a
-              // Content-Encoding — so the format's own bytes go as they are.
-              const z = fmt === FORMAT_2108 ? null : gzipped(completion, b)
+              // a chat goes gzipped, as WorkBuddy's client sends it
+              // (gzipped); its size on the wire is what unanswered weighs
+              const z = gzipOn(fmt, completion, b, gzipped)
               if (z) headers.set("Content-Encoding", "gzip")
               else headers.delete("Content-Encoding")
               return fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: z ?? b }).catch((e) => unanswered(site, a, z ?? b, e, init?.signal))
@@ -3741,8 +3679,12 @@ function makePlugin(site) {
               if (!r.a) return out(r.why, gone(a, r, invalidToken(res)), res)
               renewed = true
               a = r.a
-              sign(site, a, headers, fmt)
-              ids = reattend(headers, ids, who, (who = scopeOf(a)))
+              if (fmt === FORMAT_2108) headersOn(headers, a.access)
+              else sign(site, a, headers)
+              // a 2.108.1 chat has no ids to re-account: reattend would write
+              // a fresh X-Conversation-Message-ID/X-Request-ID pair, which is
+              // exactly what this format must not carry
+              if (fmt !== FORMAT_2108) ids = reattend(headers, ids, who, (who = scopeOf(a)))
               const again = await post(b)
               if (again.status !== 401) return again
               return out("it refused the token renewed for it too", invalidToken(again), again)
@@ -3823,6 +3765,7 @@ function makePlugin(site) {
             }
             if (ours.has(res)) return res
             // renewed here: a mark the account had comes off
+            if (res.status < 400 && forcedStream) res = await whole(res, model)
             return res.status >= 400 ? explained(res) : kept(native ? res : unsaid(await renamed(res, names)), renewed ? "renewed" : "kept")
           },
         }

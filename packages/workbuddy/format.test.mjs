@@ -1,9 +1,11 @@
 // The request format option: a chat to WorkBuddy's China build can go out in
 // the shape of the official CodeBuddy CLI 2.108.1 instead of WorkBuddy's own
-// desktop app. What that shape is comes from durindoor's
-// docs/providers/codebuddy-cn.md, whose version history records what each
-// release contributes, so this file checks the plugin against that table
-// rather than against a reading of the CLI's bundle.
+// desktop app. What that shape is comes from durindoor v3.18.0's codebuddy-cn
+// executor, whose request is the one checked against the gateway in
+// production: this file pins the plugin against what that executor puts on
+// the wire — nine headers and no more, and the body transform beside them.
+// Rendered by running it, not read off its source, so the test and the
+// capture stay the same thing.
 //
 // Nothing of the option reaches anything but a chat. /v1/messages and
 // count_tokens are another API, whose headers no CodeBuddy capture
@@ -11,6 +13,8 @@
 // all. WorkBuddy AI has the one format. And a value naming no format this
 // plugin knows sends what every request sent before the option existed.
 import { afterEach, beforeEach, expect, test } from "bun:test"
+import { existsSync, readFileSync } from "node:fs"
+import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import { WorkBuddyAIAuthPlugin, WorkBuddyAuthPlugin, _internal } from "./index.mjs"
 
@@ -71,35 +75,47 @@ const text = (b) => {
 const send = (text, extra = {}) => ({ model: "glm-5.3", stream: true, messages: [{ role: "system", content: "be brief" }, { role: "user", content: text }], ...extra })
 const FORMAT = { requestFormat: "codebuddy-2108" }
 
-// WHAT_2108 is the header surface 2.108.1 sends on a chat, by the table in
-// durindoor's docs/providers/codebuddy-cn.md: the six identity headers its
-// release contributes, the CLI's own naming of itself, and the bundled OpenAI
-// SDK's headers. X-Agent-Type (2.138.0), X-Agent-Runtime (2.172.1),
-// X-Root-Request-ID and the seven b3/traceparent headers (2.138.0), baggage
-// (2.164.0), cache_retention and extra_vars (2.172.1) and X-Stainless-Timeout
-// (never, in any capture) are all absent.
+// WHAT_2108 is the whole header surface 2.108.1's chat carries: what
+// durindoor v3.18.0's executor puts on the wire, measured by running it, is
+// exactly these nine and nothing else.
 const WHAT_2108 = {
+  accept: "text/event-stream",
+  "content-type": "application/json",
   "user-agent": "CLI/2.108.1 CodeBuddy/2.108.1",
-  "x-ide-version": "2.108.1",
   "x-ide-type": "CLI",
   "x-ide-name": "CLI",
   "x-product": "SaaS",
   "x-codebuddy-request": "1",
   "x-requested-with": "XMLHttpRequest",
-  "x-agent-intent": "craft",
-  "x-agent-purpose": "conversation",
-  "x-private-data": "false",
-  accept: "application/json",
-  "x-stainless-retry-count": "0",
-  "x-stainless-lang": "js",
-  "x-stainless-package-version": "6.25.0",
-  "x-stainless-runtime": "node",
-  "x-stainless-runtime-version": process.version,
 }
 
+// NOT_2108 is everything else: the app's own headers (which sign() sets for
+// the plugin's format and the 2.108.1 branch takes back off), the four
+// conversation ids attendChat adds, the OpenAI SDK's X-Stainless-* set, and
+// the headers later CLI releases began sending.
 const NOT_2108 = [
+  "x-user-id",
+  "x-domain",
+  "x-api-key",
+  "x-enterprise-id",
+  "x-tenant-id",
+  "x-ide-version",
+  "x-agent-intent",
+  "x-agent-purpose",
+  "x-private-data",
+  "x-conversation-id",
+  "x-conversation-message-id",
+  "x-conversation-request-id",
+  "x-request-id",
   "x-agent-type",
   "x-agent-runtime",
+  "x-stainless-retry-count",
+  "x-stainless-lang",
+  "x-stainless-package-version",
+  "x-stainless-os",
+  "x-stainless-arch",
+  "x-stainless-runtime",
+  "x-stainless-runtime-version",
   "x-stainless-timeout",
   "x-root-request-id",
   "traceparent",
@@ -112,35 +128,25 @@ const NOT_2108 = [
   "baggage",
 ]
 
-test("a chat in 2.108.1's format carries its headers and none of a later release's", async () => {
+test("a chat in 2.108.1's format is nine headers and no more", async () => {
   const { headers } = await chat({ body: send("hi"), options: FORMAT })
+  const got = [...headers.keys()].sort()
+  expect(got).toEqual([...Object.keys(WHAT_2108), "authorization"].sort())
   for (const [k, v] of Object.entries(WHAT_2108)) expect([k, headers.get(k)]).toEqual([k, v])
   for (const k of NOT_2108) expect([k, headers.get(k)]).toEqual([k, null])
 })
 
-test("the headers 2.108.1 keeps are the ones it kept before: the sign-in and the host", async () => {
+test("the only headers the token adds are the bearer one", async () => {
   const { headers } = await chat({ body: send("hi"), options: FORMAT })
   expect(headers.get("authorization")).toBe("Bearer at")
-  expect(headers.get("x-user-id")).toBe("u1")
-  expect(headers.get("x-domain")).toBe("copilot.tencent.com")
-  expect(headers.get("content-type")).toBe("application/json")
 })
 
-test("an enterprise account says so, as the CLI's own resolution does", async () => {
+test("an enterprise account says nothing extra: 2.108.1 carries no enterprise pair", async () => {
   const auth = { type: "oauth", access: "at", refresh: "r", uid: "u1", enterpriseId: "ent-9", expires: later() }
   const { headers } = await chat({ body: send("hi"), options: FORMAT, auth })
-  expect(headers.get("x-private-data")).toBe("true")
-  expect(headers.get("x-enterprise-id")).toBe("ent-9")
-  expect(headers.get("x-tenant-id")).toBe("ent-9")
-})
-
-test("a conversation's ids still travel: 2.108.1 contributes all four", async () => {
-  const { headers } = await chat({ body: send("hi"), options: FORMAT })
-  const HEX32 = /^[0-9a-f]{32}$/
-  expect(headers.get("x-conversation-message-id")).toMatch(HEX32)
-  expect(headers.get("x-request-id")).toBe(headers.get("x-conversation-message-id"))
-  expect(headers.get("x-conversation-request-id")).toMatch(HEX32)
-  expect(headers.get("x-conversation-id")).toMatch(HEX32)
+  expect([...headers.keys()].sort()).toEqual([...Object.keys(WHAT_2108), "authorization"].sort())
+  expect(headers.get("x-enterprise-id")).toBe(null)
+  expect(headers.get("x-private-data")).toBe(null)
 })
 
 test("nothing is gzipped: no CodeBuddy capture carries a Content-Encoding", async () => {
@@ -159,37 +165,109 @@ test("a chat in the plugin's own format still gzips, so the option is what chang
   expect(headers.get("x-stainless-timeout")).toBe("1200")
 })
 
-// The two body fields. 2.108.1's model-settings interceptor writes
-// verbosity:"high" whenever thinking is on and injectReasoningSummaryIfNeeded
-// writes reasoning_summary:"auto"; both travel beside a reasoning_effort and
-// never on a request that asked for none (forcing reasoning on a plain
-// request makes CodeBuddy trip its content filter).
+// The body transform. durindoor's codebuddy-cn executor does four things and
+// nothing else: stream:true always (registry forceStream plus
+// `transformed.stream = true`, because the gateway answers 11101 to a
+// non-stream request), a top-level reasoning_effort of "none"/"off" deleted
+// outright, reasoning_summary:"auto" written beside any other effort, and
+// stream_options:{include_usage:true} added when the client named none. It
+// never writes verbosity.
 
-test("a chat that asks for thinking goes with both fields, as the CLI stamps them", async () => {
+test("a chat that asks for thinking keeps its effort and gains only the summary", async () => {
   const { body } = await chat({ body: send("hi", { reasoning_effort: "high" }), options: FORMAT })
   const b = JSON.parse(body)
-  expect([b.reasoning_effort, b.reasoning_summary, b.verbosity]).toEqual(["high", "auto", "high"])
+  expect([b.reasoning_effort, b.reasoning_summary]).toEqual(["high", "auto"])
+  expect("verbosity" in b).toBe(false)
 })
 
-test("a chat told not to think keeps saying so, and gains neither", async () => {
+test("none is deleted, not sent: the gateway has no such effort", async () => {
   const { body } = await chat({ body: send("hi", { reasoning_effort: "none" }), options: FORMAT })
   const b = JSON.parse(body)
-  expect(b.reasoning_effort).toBe("none")
+  expect("reasoning_effort" in b).toBe(false)
   expect("reasoning_summary" in b).toBe(false)
   expect("verbosity" in b).toBe(false)
 })
 
-test("off is the same as none", async () => {
-  const { body } = await chat({ body: send("hi", { reasoning: { effort: "off" } }), options: FORMAT })
+test("off is deleted too", async () => {
+  const { body } = await chat({ body: send("hi", { reasoning_effort: "off" }), options: FORMAT })
   const b = JSON.parse(body)
+  expect("reasoning_effort" in b).toBe(false)
   expect("reasoning_summary" in b).toBe(false)
-  expect("verbosity" in b).toBe(false)
 })
 
-test("a caller's own values are kept, not overwritten", async () => {
+test("a nested reasoning:{effort} is not read, as durindoor does not read it", async () => {
+  const { body } = await chat({ body: send("hi", { reasoning: { effort: "high" } }), options: FORMAT })
+  const b = JSON.parse(body)
+  expect(b.reasoning).toEqual({ effort: "high" })
+  expect("reasoning_summary" in b).toBe(false)
+})
+
+test("a caller's summary is overwritten, and its verbosity passes through", async () => {
   const { body } = await chat({ body: send("hi", { reasoning_effort: "high", reasoning_summary: "concise", verbosity: "low" }), options: FORMAT })
   const b = JSON.parse(body)
-  expect([b.reasoning_summary, b.verbosity]).toEqual(["concise", "low"])
+  expect([b.reasoning_summary, b.verbosity]).toEqual(["auto", "low"])
+})
+
+test("the body is streamed whatever the client asked, and asks for its usage", async () => {
+  for (const asked of [false, undefined]) {
+    const { body } = await chat({ body: { ...send("hi"), stream: asked }, options: FORMAT })
+    const b = JSON.parse(body)
+    expect([asked, b.stream]).toEqual([asked, true])
+    expect(b.stream_options).toEqual({ include_usage: true })
+  }
+})
+
+test("a client's own stream_options is left as it wrote it", async () => {
+  const { body } = await chat({ body: send("hi", { stream_options: { foo: 1 } }), options: FORMAT })
+  expect(JSON.parse(body).stream_options).toEqual({ foo: 1 })
+})
+
+test("a gpt-5.x model takes max_completion_tokens, as durindoor's rename reads it", async () => {
+  const { body } = await chat({ body: send("hi", { model: "gpt-5.5", max_completion_tokens: 50 }), options: FORMAT })
+  const b = JSON.parse(body)
+  expect([b.max_completion_tokens, b.max_tokens]).toEqual([50, undefined])
+})
+
+test("every other model takes max_tokens", async () => {
+  const { body } = await chat({ body: send("hi", { max_completion_tokens: 50 }), options: FORMAT })
+  const b = JSON.parse(body)
+  expect([b.max_tokens, b.max_completion_tokens]).toEqual([50, undefined])
+})
+
+// A client that asked for the whole reply at once still gets one: the chat
+// went out streamed, and the chunks are put back together for it.
+test("a non-streaming client gets one chat.completion back", async () => {
+  const sse = [
+    'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"glm-5.3","choices":[{"index":0,"delta":{"role":"assistant","content":"he"}}]}',
+    'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"llo"}}]}',
+    'data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"why"}}]}',
+    'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":3}}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n")
+  serve({
+    "/v2/chat/completions": () => new Response(sse, { headers: { "content-type": "text/event-stream" } }),
+  })
+  const hooks = await WorkBuddyAuthPlugin({ client: {} }, FORMAT)
+  const l = await hooks.auth.loader(async () => ({ type: "oauth", access: "at", refresh: "r", uid: "u1", expires: later() }))
+  const res = await l.fetch("https://copilot.tencent.com/v2/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(send("hi", { stream: false })),
+  })
+  expect(res.headers.get("content-type")).toBe("application/json")
+  const v = await res.json()
+  expect(v.object).toBe("chat.completion")
+  expect(v.id).toBe("c1")
+  expect(v.usage).toEqual({ total_tokens: 3 })
+  expect(v.choices[0].finish_reason).toBe("stop")
+  expect(v.choices[0].message).toEqual({ role: "assistant", content: "hello", reasoning_content: "why" })
+})
+
+test("a streaming client still gets the stream", async () => {
+  const { headers, calls } = await chat({ body: send("hi"), options: FORMAT })
+  expect(headers.get("accept")).toBe("text/event-stream")
+  expect(calls.at(-1).headers.get("accept")).toBe("text/event-stream")
 })
 
 test("the plugin's own format stamps neither field, as it never did", async () => {
@@ -270,6 +348,31 @@ test("the meter and the check-in are not chats: their headers do not move", asyn
   for (const c of calls) expect(c.headers.get("x-codebuddy-request")).toBe(null)
 })
 
+test("magpie's own hint headers never leave: the vendor sees the CLI's request", async () => {
+  const sent = []
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: new URL(String(url)), headers: new Headers(init?.headers) })
+    return STREAM()
+  }
+  const hooks = await WorkBuddyAuthPlugin({ client: {} }, FORMAT)
+  const l = await hooks.auth.loader(async () => ({ type: "oauth", access: "at", refresh: "r", uid: "u1", expires: later() }))
+  const res = await l.fetch("https://copilot.tencent.com/v2/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": "magpie/1.4.2",
+      "x-magpie-session": "sess-1",
+      "x-magpie-agent": "deepseek-harness",
+      "x-stainless-lang": "js",
+      "x-tenant-id": "t1",
+    },
+    body: JSON.stringify(send("hi")),
+  })
+  await res.text()
+  const got = [...sent.at(-1).headers.keys()].sort()
+  expect(got).toEqual([...Object.keys(WHAT_2108), "authorization"].sort())
+})
+
 // A 401 is answered by signing in again and sending once more, so the resend
 // carries the same format as the first try — an account refreshed into the
 // plugin's own headers would be a fingerprint that changes mid-conversation.
@@ -297,4 +400,15 @@ test("a resend after a renewed token keeps the format", async () => {
     expect(c.headers.get("x-stainless-timeout")).toBe(null)
   }
   expect(chats[1].headers.get("authorization")).toBe("Bearer at2")
+})
+
+// The shape lives in codebuddy.mjs so that following upstream's index.mjs
+// never has to merge past it. An install that left the file out would have a
+// plugin that cannot import, so package.json has to ship it — as cursor's
+// ships native-session.mjs.
+test("the module the shape lives in is in the package's files", () => {
+  const pkg = JSON.parse(readFileSync(join(import.meta.dir, "package.json"), "utf8"))
+  expect(pkg.files).toContain("codebuddy.mjs")
+  expect(existsSync(join(import.meta.dir, "codebuddy.mjs"))).toBe(true)
+  expect(new Set(pkg.files).size).toBe(pkg.files.length)
 })
