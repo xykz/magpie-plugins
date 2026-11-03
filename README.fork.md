@@ -98,6 +98,59 @@ The one thing it does not change is the version it reports of itself:
 no published version of this package to compare it with and the fork doesn't
 rename it.
 
+## `loomy`: password sign-in, and the session it keeps alive
+
+Loomy hands out no refresh token: a session lives 14 days and only signing in
+again extends it. So the account's password is the only renewal credential
+there is, and this fork adds a sign-in method that takes it, plus the renewal
+that keeps a password account running unattended.
+
+The sign-in is `账号密码登录（Password sign-in）`, beside the SMS one and the
+pasted session. Phone number and password go in as prompts; `node:crypto`
+seals the password to the public key `getPuKey` hands out (RSA PKCS#1 v1.5, no
+dependency added) and `byPwd` answers a session. `rcode` is that call's nonce,
+not a captcha, which is what makes the chain unattended — and therefore
+renewable. Two things the upstream does that a strict decoder rejects are both
+handled: the base64 `pukey` arrives without padding, and it may be an SPKI
+`SubjectPublicKeyInfo` or a bare PKCS#1 `RSAPublicKey`.
+
+The credentials are kept in the sign-in record's `refresh` field as
+`{"loginid","password"}` — that is the field magpie reads as an oauth
+account's secret (`host.js` `secretOf`), and where this repo already carries
+multi-part credentials (`zcode`'s `refresh: JSON.stringify(state)`, `mimo`'s
+the same). They land in `plugin-auth.json`, mode 600, **plaintext: not an
+encrypted vault** — the same trust model as a browser's saved passwords. SMS
+sign-ins and pasted sessions carry no password and behave exactly as before.
+
+Renewal runs on both paths, because the hosts differ:
+
+- magpie calls `auth.refresh` with `auth.refreshLead` set, so it renews once
+  per account 3 days before the end (`loomy2api`'s `session_renew_before_days`
+  default is the same 3). Failures throw rather than return undefined: the
+  host records its `RENEW_RETRY` cooldown only when this throws, and
+  `undefined` would have it retry the same doomed call on every hook until
+  the session expired on its own.
+- OpenCode never calls `auth.refresh`, so the loader's `fetch` renews itself:
+  a 401/403 signs in again and the request goes once more, answered with
+  `X-Magpie-Sign-In: renewed`. `usage` and `checkin` are wrapped the same way.
+
+A vendor refusal and a transport failure are kept apart. HTTP 200 with a
+business code that is not `000000` is the vendor saying no on purpose — that
+marks the sign-in lapsed (`signIn: "expired"`, or `X-Magpie-Sign-In: expired`).
+A network error or a 5xx is no verdict on the password and leaves the account
+as it was (`kept`). A renewal already made in this process is reused unless
+the caller is holding that very session, which was just refused.
+
+All of it is `packages/loomy/renew.mjs`, which `index.mjs` reaches in four
+places — an import, a `loomyRenewal()` call, `return renewal.extend({`, and
+the closing `})` — so that following upstream's `index.mjs` never has to merge
+past the new code: `extend()` mounts `refreshLead`/`refresh` and wraps
+`loader`/`usage`/`checkin` itself, so an upstream rewrite of those hooks is
+wrapped rather than lost. The shape of the file split follows
+`packages/workbuddy/codebuddy.mjs`. `package.json`'s `files` gains
+`renew.mjs`, since an install that left it out would have a plugin that
+cannot import.
+
 ## `helper/`: carrying sign-ins in from other tools
 
 Both scripts read another tool's store and write magpie's
@@ -141,3 +194,26 @@ later) and both take `--dry-run` and `--install`.
   转写成 magpie 的 `plugin-auth.json`，账号原样搬过来，不用重新登录、不碰
   厂商接口。两者都零依赖（`node:sqlite`、`node:crypto`，Node 22.5 起），
   都支持 `--dry-run` 与 `--install`。
+- **`loomy` 的密码登录与自动续登**：Loomy 没有 refresh token，session 只有
+  14 天，唯一能续期的凭据是账号密码，所以本 fork 加了第三种登录方式
+  「账号密码登录（Password sign-in）」，并用它让密码账号无人值守地活下去。
+  手机号与密码作为 prompt 输入，`node:crypto` 把密码封进 `getPuKey` 当场
+  下发的 RSA 公钥（PKCS#1 v1.5，不引入依赖），`byPwd` 换回 session
+  （`rcode` 是服务端 nonce 不是验证码，因此全程可自动化，也才可续期；公钥
+  base64 缺 padding、以及 SPKI 与裸 PKCS#1 两种 DER 都兼容）。凭据以
+  `{"loginid","password"}` 存进签入记录的 `refresh` 字段（magpie 把 oauth
+  账号的 `refresh` 当作 secret，`zcode`/`mimo` 也把多段凭据放这里），落在
+  `plugin-auth.json`（权限 600），**明文，不是加密保险库**——与浏览器保存
+  密码同一级别的信任模型；短信与粘贴 session 的账号没有密码，行为不变。
+  续登走两条路：magpie 在到期前 3 天调 `auth.refresh`（对齐 `loomy2api` 的
+  `session_renew_before_days` 默认值）且**失败必须 throw**（否则宿主不会记
+  `RENEW_RETRY` 冷却，会在每个钩子上重试同一个必败的调用）；OpenCode 不调
+  这个钩子，所以 loader 的 `fetch`、`usage`、`checkin` 自己在 401/403 时
+  重登一次并重发，响应带 `X-Magpie-Sign-In: renewed`。厂商明确拒绝（HTTP
+  200 + 非 `000000`）才标记登出（`expired`），网络错误与 5xx 只 `kept`。
+  代码全在 `packages/loomy/renew.mjs`，`index.mjs` 只动四处（import、
+  `loomyRenewal()`、`return renewal.extend({`、收尾 `})`），`extend()` 自己
+  挂 `refreshLead`/`refresh` 并包住 `loader`/`usage`/`checkin`，所以上游重写
+  这些钩子时会被包住而不是丢失——文件拆分方式与
+  `packages/workbuddy/codebuddy.mjs` 一致。`package.json` 的 `files` 加了
+  `renew.mjs`。
