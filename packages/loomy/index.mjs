@@ -1,13 +1,19 @@
 // @magpie-community/opencode-loomy-auth — the Loomy (讯飞) provider plugin
 // for OpenCode and magpie.
 //
-// Signs in with a Loomy account (SMS code or a pasted session), forwards
-// chat completions to its OpenAI-compatible model gateway, lists its models,
-// reads its two point wallets, and presses its daily first-login grant (the
-// 每日赠送积分 refresh). Request shapes are ported from aimod-cc/agent2api
-// (MIT), providers/loomy, rewritten for magpie's plugin API.
+// Signs in with a Loomy account (password, SMS code, or a pasted session),
+// forwards chat completions to its OpenAI-compatible model gateway, lists its
+// models, reads its two point wallets, and presses its daily first-login grant
+// (the 每日赠送积分 refresh). Request shapes are ported from aimod-cc/agent2api
+// (MIT), providers/loomy, rewritten for magpie's plugin API. The password
+// sign-in and the renewal of password accounts live in renew.mjs.
 
 import { createHash, createHmac, randomUUID } from "node:crypto"
+
+// password sign-in, where the password is kept, and the renewal paths. Its own
+// file so that a merge of upstream's index.mjs never has to touch it; the
+// wiring is the three lines marked "renewal" below.
+import { loomyRenewal } from "./renew.mjs"
 
 const ID = "loomy"
 const NAME = "Loomy（讯飞）"
@@ -310,6 +316,19 @@ function catalogModel(entry) {
 
 export async function LoomyAuthPlugin({ client } = {}) {
   const methods = []
+  // renewal (password sign-in, credential keeping, the two renewal paths) —
+  // it adds its method to `methods` and wraps the hooks when they are returned
+  const renewal = loomyRenewal({
+    client,
+    signedPost,
+    makeBase,
+    codeOf,
+    messageOf,
+    normalizePhone,
+    OK,
+    AUTH_CODES,
+    ID,
+  })
 
   methods.push({
     type: "oauth",
@@ -380,11 +399,14 @@ export async function LoomyAuthPlugin({ client } = {}) {
     },
   })
 
-  return {
+  // renewal: the password method, refreshLead/refresh, and the 401 fallbacks
+  // on loader/usage/checkin. Everything below is upstream's, unchanged.
+  return renewal.extend({
     auth: {
       provider: ID,
-      // Loomy has no renewal: a session lives 14 days, and its end is
-      // refreshed only by signing in again (SMS or import)
+      // Loomy hands out no refresh token: a session lives 14 days. Password
+      // accounts are renewed by renew.mjs (auth.refresh, and the 401 fallback
+      // in the loader below); SMS and pasted ones are still sign-in-only
       async loader(getAuth) {
         const a = await getAuth()
         if (a?.type !== "oauth") return {}
@@ -516,8 +538,8 @@ export async function LoomyAuthPlugin({ client } = {}) {
             ...(permanent != null ? [{ name: "永久积分", used: 0, display: `${permanent} credits`, aside: true }] : []),
           ]
           // no `signIn` on a clean read: that absence is how magpie takes an
-          // expired mark back off the account (Loomy has no renewal, so a
-          // "kept" here would leave a transient 401's lapse on forever)
+          // expired mark back off the account (a "kept" here would leave a
+          // transient 401's lapse on forever)
           return { plan: NAME, user: a.name || a.accountId, windows }
         } catch (e) {
           return { error: String(e?.message ?? e), signIn: e?.signIn === "expired" ? "expired" : "kept" }
@@ -596,7 +618,7 @@ export async function LoomyAuthPlugin({ client } = {}) {
         }
       },
     },
-  }
+  })
 }
 
 // for tests

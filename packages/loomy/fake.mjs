@@ -1,7 +1,7 @@
 // the fake Loomy upstream: the account domain (HMAC-signed SMS login) and
 // the integration gateway (models, chat, points, first-login) on local ports.
 
-import { createHash, createHmac } from "node:crypto"
+import { createHash, createHmac, createPublicKey, generateKeyPairSync, privateDecrypt, constants } from "node:crypto"
 
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
 const OK = "000000"
@@ -25,6 +25,12 @@ export function fakeLoomy() {
     phone: "13800138000",
     smsSent: null, // {phone, msgid}
     logins: 0,
+    password: "hunter2", // the account password the password sign-in must seal correctly
+    pukey: null, // set by getPuKey; byPwd refuses a sealed password made for another one
+    rcode: "",
+    pwdKeyCalls: 0,
+    pwdCalls: 0,
+    pwdAttempts: [], // what byPwd was asked, decoded: {loginid, password, rcode, type, expire}
     chatCalls: [],
     chatRefusal: null, // set to an upstream message to answer 400 instead
     imageCalls: [],
@@ -40,6 +46,12 @@ export function fakeLoomy() {
     reset() {
       state.smsSent = null
       state.logins = 0
+      state.password = "hunter2"
+      state.pukey = null
+      state.rcode = ""
+      state.pwdKeyCalls = 0
+      state.pwdCalls = 0
+      state.pwdAttempts = []
       state.chatCalls = []
       state.chatRefusal = null
       state.imageCalls = []
@@ -55,6 +67,22 @@ export function fakeLoomy() {
   }
   const AK = "2thryby66wxi53sk"
   const SK = "zsak6eadrbawz683wf5r3m2snrwj868r"
+
+  // the account domain's login key: 1024-bit, as the real getPuKey hands out
+  const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 1024 })
+  // sent WITHOUT base64 padding on purpose: the real upstream's key carries
+  // none, and Node's Buffer.from is the only thing that tolerates that
+  const puKeyDer = publicKey.export({ type: "spki", format: "der" }).toString("base64").replace(/=+$/, "")
+  // PKCS#1 v1.5 unsealing, spelled out by hand: Bun refuses to hand
+  // RSA_PKCS1_PADDING to privateDecrypt ("no longer supported"), so decrypt
+  // raw and strip the 00 02 <random> 00 prefix ourselves
+  const unseal = (sealed) => {
+    const raw = privateDecrypt({ key: privateKey, padding: constants.RSA_NO_PADDING }, sealed)
+    if (raw[0] !== 0 || raw[1] !== 2) throw new Error("not PKCS#1 v1.5")
+    const sep = raw.indexOf(0, 2)
+    if (sep < 10) throw new Error("bad PKCS#1 padding")
+    return raw.subarray(sep + 1).toString("utf8")
+  }
 
   // the account domain: every request must carry the client's HMAC-SHA1
   // signature over the 9-part string, as the real one checks
@@ -92,6 +120,36 @@ export function fakeLoomy() {
         state.logins++
         state.session = `sess-${state.logins}`
         return json(200, { code: OK, desc: "ok", data: { session: state.session, userid: "261014155255771375" } })
+      }
+      // the password sign-in: a public key and a nonce, then the password
+      // sealed to that key. rcode is the server's nonce, not a captcha, so
+      // the whole chain runs unattended — that is what makes renewal possible
+      if (url.pathname === "/login/account/getPuKey") {
+        state.pwdKeyCalls++
+        state.pukey = puKeyDer
+        state.rcode = `rc-${state.pwdKeyCalls}`
+        return json(200, { code: OK, desc: "ok", data: { pukey: puKeyDer, rcode: state.rcode } })
+      }
+      if (url.pathname === "/login/account/byPwd") {
+        state.pwdCalls++
+        const param = body?.param ?? {}
+        // decode the sealed password the way the real server does: RSA
+        // PKCS#1 v1.5, so a test that seals it wrong fails here, not later
+        let said = ""
+        try {
+          said = unseal(Buffer.from(String(param.password ?? ""), "base64"))
+        } catch {
+          return json(200, { code: "020009", desc: "密码无法解密" })
+        }
+        state.pwdAttempts.push({ loginid: param.loginid, password: said, rcode: param.rcode, type: param.type, expire: param.expire })
+        if (param.rcode !== state.rcode) return json(200, { code: "020010", desc: "rcode 已失效" })
+        if (param.type !== 1) return json(200, { code: "020011", desc: "type" })
+        if (param.expire !== 1209600) return json(200, { code: "020012", desc: "expire" })
+        if (String(param.loginid ?? "") !== state.phone) return json(200, { code: "020013", desc: "账号不存在" })
+        if (said !== state.password) return json(200, { code: "020014", desc: "账号或密码错误" })
+        state.logins++
+        state.session = `sess-${state.logins}`
+        return json(200, { code: OK, desc: "ok", data: { session: state.session, userid: "261014155255771375", phone: state.phone } })
       }
       return json(404, { code: "020008", desc: "no route" })
     },

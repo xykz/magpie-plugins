@@ -412,3 +412,253 @@ describe("a 400 that says the content is too long", () => {
     expect(_internal.retryableRefusal(500, vendor)).toBeNull()
   })
 })
+
+// ── password sign-in and renewal (renew.mjs) ────────────────────────────────
+//
+// Loomy hands out no refresh token, so the password IS the renewal
+// credential. These tests hold three things down: the password is sealed to
+// the key getPuKey hands out (never sent as plaintext), it is kept on the
+// sign-in record in `refresh`, and a dead session is renewed on both paths —
+// the host's auth.refresh and, for OpenCode which never calls it, a 401 on
+// the request itself.
+
+describe("password sign-in", () => {
+  const passwordMethod = () => plugin.auth.methods.find((m) => m.label.includes("Password"))
+
+  test("getPuKey's key seals the password, then byPwd answers a session", async () => {
+    const method = passwordMethod()
+    expect(method).toBeTruthy()
+    expect(method.type).toBe("oauth")
+    // the password prompt is type "password": OpenCode masks what is typed
+    expect(method.prompts.find((p) => p.key === "password")?.type).toBe("password")
+    const flow = await method.authorize({ loginid: "13800138000", password: "hunter2" })
+    // nothing to open — the sign-in is two calls behind the scenes
+    expect(flow.method).toBe("auto")
+    expect(flow.url).toBe("")
+    const result = await flow.callback()
+    expect(result.type).toBe("success")
+    expect(result.access).toBe(fake.state.session)
+    expect(result.source).toBe("password")
+    expect(result.accountId).toBe("138****8000")
+    expect(result.uid).toBe("261014155255771375")
+    expect(result.expires).toBeGreaterThan(Date.now() + 13 * 86400e3)
+    // the credentials ride on `refresh` as JSON — that is where magpie keeps
+    // an oauth account's secret, and where renewal reads them back from
+    expect(JSON.parse(result.refresh)).toEqual({ loginid: "13800138000", password: "hunter2" })
+    // and the password really was sealed: the fake decrypted it server-side
+    expect(fake.state.pwdKeyCalls).toBe(1)
+    expect(fake.state.pwdAttempts[0].password).toBe("hunter2")
+    expect(fake.state.pwdAttempts[0].rcode).toBe("rc-1")
+    expect(fake.state.pwdAttempts[0].expire).toBe(1209600)
+  })
+
+  test("a wrong password is refused with the vendor's reason", async () => {
+    const flow = await passwordMethod().authorize({ loginid: "13800138000", password: "nope" })
+    const result = await flow.callback()
+    expect(result.type).toBe("failed")
+    expect(result.error).toContain("账号或密码错误")
+  })
+
+  test("an invalid phone never reaches the upstream", async () => {
+    const bad = await passwordMethod().authorize({ loginid: "12345", password: "hunter2" })
+    // authorize refuses synchronously, so the picker shows the reason at once
+    expect(bad.type).toBe("failed")
+    expect(fake.state.pwdKeyCalls).toBe(0)
+  })
+
+  test("a rotated rcode is refused: the nonce getPuKey handed out is what byPwd wants", async () => {
+    const flow = await passwordMethod().authorize({ loginid: "13800138000", password: "hunter2" })
+    // the nonce rotates under it, as it would if another sign-in called
+    // getPuKey in between — the sealed password is worthless without the
+    // rcode that came with its key
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      const res = await realFetch(input, init)
+      if (String(url).includes("/login/account/getPuKey")) fake.state.rcode = "rc-99"
+      return res
+    }
+    try {
+      const result = await flow.callback()
+      expect(result.type).toBe("failed")
+      expect(result.error).toContain("rcode")
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+})
+
+describe("renewal", () => {
+  // its own store so saves can be counted: the shared one only keeps the record
+  let store
+  beforeEach(async () => {
+    store = {
+      auth: { type: "oauth", access: fake.state.session, expires: Date.now() + 14 * 86400e3, accountId: "138****8000", name: "138****8000" },
+      saves: [],
+    }
+    store.getAuth = async () => store.auth
+    store.client = {
+      auth: {
+        set: async ({ path, body }) => {
+          store.saves.push({ id: path.id, body })
+          store.auth = body
+        },
+      },
+    }
+    store.plugin = await LoomyAuthPlugin({ client: store.client })
+  })
+  const creds = (over = {}) => ({ ...store.auth, refresh: JSON.stringify({ loginid: "13800138000", password: "hunter2" }), ...over })
+
+  test("refreshLead sits on auth, 3 days before the 14-day session ends", async () => {
+    // host.js reads the lead off auth (leadOf), not off the hooks object
+    expect(store.plugin.auth.refreshLead).toBe(3 * 86400e3)
+    expect(typeof store.plugin.auth.refresh).toBe("function")
+  })
+
+  test("a password account signs in again, and only what changed comes back", async () => {
+    const out = await store.plugin.auth.refresh(creds())
+    expect(out.access).toBe(fake.state.session)
+    expect(out.expires).toBeGreaterThan(Date.now() + 13 * 86400e3)
+    expect(out.uid).toBe("261014155255771375")
+    // `refresh` itself is absent: the host merges this onto the record, and
+    // echoing the credentials back would be noise (it only wants changes)
+    expect(out.refresh).toBeUndefined()
+    // the record it hands back is written through, since this path is not one
+    // the host saves for us
+    expect(store.saves).toHaveLength(1)
+    expect(store.saves[0].id).toBe("loomy")
+    expect(store.saves[0].body.access).toBe(fake.state.session)
+  })
+
+  test("SMS and pasted sessions carry no password, so there is nothing to renew", async () => {
+    // "" is what both of those sign-ins write into `refresh`
+    expect(await store.plugin.auth.refresh({ ...store.auth, refresh: "" })).toBeUndefined()
+    expect(await store.plugin.auth.refresh({ ...store.auth })).toBeUndefined()
+    expect(await store.plugin.auth.refresh({ ...store.auth, type: "api" })).toBeUndefined()
+    expect(fake.state.pwdKeyCalls).toBe(0)
+  })
+
+  test("a vendor refusal ends the sign-in; a transport failure leaves it alone", async () => {
+    // wrong password: HTTP 200 with a business code is the vendor saying no
+    await expect(store.plugin.auth.refresh(creds({ refresh: JSON.stringify({ loginid: "13800138000", password: "nope" }) }))).rejects.toMatchObject({
+      signIn: "expired",
+    })
+    // a network failure must NOT mark the account, or a flaky moment would
+    // end a sign-in that is still perfectly good
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async () => {
+      throw new Error("offline")
+    }
+    try {
+      const err = await store.plugin.auth.refresh(creds()).catch((e) => e)
+      expect(err?.signIn).toBeUndefined()
+      expect(String(err?.message)).toContain("offline")
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  test("a dead session is renewed on the request path (OpenCode never calls refresh)", async () => {
+    store.auth = { ...creds(), access: "gone" }
+    const loader = await store.plugin.auth.loader(store.getAuth)
+    const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "spark-x", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain("data: [DONE]")
+    // the sign-in happened once, and the host was told the session is new
+    expect(fake.state.pwdCalls).toBe(1)
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
+    expect(store.saves).toHaveLength(1)
+    expect(store.auth.access).toBe(fake.state.session)
+  })
+
+  test("a draw is renewed the same way", async () => {
+    store.auth = { ...creds(), access: "gone" }
+    const loader = await store.plugin.auth.loader(store.getAuth)
+    const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/images/generations`, { method: "POST", body: JSON.stringify({ model: "m", prompt: "p" }) })
+    expect(res.status).toBe(200)
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
+    expect(fake.state.pwdCalls).toBe(1)
+  })
+
+  test("a pasted session that lapses says so on the header: no password, no rescue", async () => {
+    store.auth = { type: "oauth", access: "gone", expires: 0, accountId: "手动粘贴", refresh: "" }
+    const loader = await store.plugin.auth.loader(store.getAuth)
+    const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, { method: "POST", body: "{}" })
+    expect(res.status).toBe(401)
+    expect((await res.json()).error.message).toContain("登录态已失效")
+    // magpie takes the header off before the agent sees the answer, so this is
+    // how a session with no password behind it gets marked lapsed
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("expired")
+    expect(fake.state.pwdCalls).toBe(0)
+    expect(store.saves).toHaveLength(0)
+  })
+
+  test("a password the vendor no longer takes ends the sign-in; a flaky network does not", async () => {
+    // wrong password on the renewal: 200 + a business code is the vendor's no
+    store.auth = { ...creds({ refresh: JSON.stringify({ loginid: "13800138000", password: "nope" }) }), access: "gone" }
+    const loader = await store.plugin.auth.loader(store.getAuth)
+    const refused = await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, { method: "POST", body: "{}" })
+    expect(refused.status).toBe(401)
+    expect(refused.headers.get("X-Magpie-Sign-In")).toBe("expired")
+
+    // a network failure during renewal is not a verdict on the password
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/login/account/")) throw new Error("offline")
+      return realFetch(input, init)
+    }
+    try {
+      store.auth = { ...creds(), access: "gone" }
+      const loader2 = await store.plugin.auth.loader(store.getAuth)
+      const flaky = await loader2.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, { method: "POST", body: "{}" })
+      expect(flaky.status).toBe(401)
+      expect(flaky.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  test("checkin and usage renew a lapsed session instead of reporting it dead", async () => {
+    store.auth = { ...creds(), access: "gone" }
+    // checkin throws its lapse, usage returns it: both are caught and retried
+    const result = await store.plugin.auth.checkin(store.getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(fake.state.pwdCalls).toBe(1)
+  })
+
+  test("usage renews a lapsed session too", async () => {
+    store.auth = { ...creds(), access: "gone" }
+    const usage = await store.plugin.auth.usage(store.getAuth)
+    expect(usage.signIn).toBeUndefined()
+    expect(usage.windows.map((w) => w.name)).toContain("每日赠送积分")
+    expect(fake.state.pwdCalls).toBe(1)
+    expect(store.saves).toHaveLength(1)
+  })
+
+  test("a renewal already made is reused, not bought twice", async () => {
+    // the record a hook is handed can lag behind a renewal another hook just
+    // made — signing in again would spend a second session for nothing
+    store.auth = { ...creds(), access: "gone" }
+    await store.plugin.auth.usage(store.getAuth)
+    expect(fake.state.pwdCalls).toBe(1)
+    store.saves.length = 0
+    // still the stale copy, as an unsaved record would be
+    store.auth = { ...creds(), access: "gone" }
+    const again = await store.plugin.auth.usage(store.getAuth)
+    expect(again.signIn).toBeUndefined()
+    expect(fake.state.pwdCalls).toBe(1)
+    expect(store.saves).toHaveLength(0)
+  })
+
+  test("no password to renew with: usage still reports the lapse", async () => {
+    store.auth = { type: "oauth", access: "gone", expires: 0, accountId: "手动粘贴", refresh: "" }
+    const usage = await store.plugin.auth.usage(store.getAuth)
+    expect(usage.signIn).toBe("expired")
+    expect(fake.state.pwdCalls).toBe(0)
+  })
+})
+
