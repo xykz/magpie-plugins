@@ -13,7 +13,6 @@ OpenCode & Magpie provider plugin for **SenseTime Raccoon (商汤小浣熊, `xia
 - **Usage & allowances**: reports available credits, unexpired grant bills, daily expiration timestamps, and Pro/Free subscription plans.
 - **Daily check-in & desktop onboarding grant**: supports Magpie automatic daily check-in (`+300` credits/day) and one-time desktop onboarding grant (`+3000` credits).
 - **SSE model rewrite**: transparently rewrites internal upstream model names back to requested downstream models for client compatibility.
-- **Its own User-Agent**: magpie asks vendors with its own `magpie/<version>`, and a plugin can't take that back (a plugin's provider has an account, so magpie's `user-agent` setting and the provider's headers don't reach it). This plugin asks the chat API as the OpenAI SDK does, `AsyncOpenAI/Python 2.8.0`, the way the desktop app does. `RACCOON_USER_AGENT` overrides it; set it to an empty string to leave magpie's own alone.
 - **The card's name**: the account's own phone number (`138****8000`), read once per token from `/api/web/auth/v1/user_info` with the JWT the sign-in holds. `accountId` stays the account's identity (the JWT's `Raccoon-pu-<uuid>`, or the desktop app's name) — magpie keys the user's own name for the account, its proxy, model picks and a gateway key's list by it, so it never changes. The card shows usage's `user`, which is the phone once a sign-in or renewal has read it. A failed read changes nothing and never costs a sign-in.
 
 ## 中文
@@ -31,7 +30,6 @@ OpenCode & Magpie provider plugin for **SenseTime Raccoon (商汤小浣熊, `xia
 - **积分余额与套餐查询**：展示可用积分、未过期发放额度、每日积分过期时间与 Pro/Free 套餐状态。
 - **每日签到与桌面端登录奖励**：支持 Magpie 每日自动签到（`+300` 积分/天）及首次桌面端 `+3000` 积分登录奖励领取。
 - **SSE 模型名重写**：将上游响应中的内部模型名重写为下游请求的 `model`，确保 Claude Code / Codex / OpenCode 等客户端兼容。
-- **自带 User-Agent**：magpie 默认以自己的 `magpie/<version>` 请求上游，插件无法从 provider 侧改掉它（插件 provider 恒有 account，magpie 的 `user-agent` 设置和 provider 的 headers 都到不了这里）。本插件按桌面端的做法，以 OpenAI SDK 的 `AsyncOpenAI/Python 2.8.0` 请求对话接口；环境变量 `RACCOON_USER_AGENT` 可覆盖，设为空字符串则沿用 magpie 自己的。
 
 ### Browser callback lifecycle
 
