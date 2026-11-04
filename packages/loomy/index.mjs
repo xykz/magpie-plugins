@@ -513,30 +513,41 @@ export async function LoomyAuthPlugin({ client } = {}) {
           // this endpoint is a records list, so a reply without the balance
           // fields is a realistic case — "unknown" must not read as a
           // confident zero
-          const pairPresent = toNum(data.dailyLimitPoints) != null && toNum(data.dailyRemainingPoints) != null
-          if (daily == null && permanent == null && !pairPresent)
-            return { error: `积分响应没有返回余额字段（${JSON.stringify(data).slice(0, 120)}）`, signIn: "kept" }
-          // the daily wallet from the vendor's own numbers: spent is
-          // dailyLimitPoints - dailyRemainingPoints. When the pair is absent
-          // the wallet is an amount with no limit — a made-up limit would
-          // always read as full
           const dailyLimit = toNum(data.dailyLimitPoints)
           const dailyRemaining = toNum(data.dailyRemainingPoints)
-
+          // a zero limit is no share at all, so the pair only counts with one
+          const pairPresent = dailyLimit > 0 && dailyRemaining != null
+          if (daily == null && permanent == null && !pairPresent)
+            return { error: `积分响应没有返回余额字段（${JSON.stringify(data).slice(0, 120)}）`, signIn: "kept" }
           // the daily wallet shows from whichever numbers came back: the
           // limit/remaining pair alone is enough (remaining IS its number);
           // with only dailyBalance it is an amount without a limit; with
           // neither, no daily wallet at all — a missing one is not 0
-          const dailyWallet =
-            dailyLimit != null && dailyRemaining != null
-              ? { name: "每日赠送积分", used: Math.max(0, dailyLimit - dailyRemaining), amount: dailyRemaining, limit: dailyLimit, unit: "credits", resetsAt: beijingMidnight(), span: 86400 }
-              : daily != null
-                ? { name: "每日赠送积分", used: 0, display: `${daily} credits`, aside: true }
-                : null
-          const windows = [
-            ...(dailyWallet ? [dailyWallet] : []),
-            ...(permanent != null ? [{ name: "永久积分", used: 0, display: `${permanent} credits`, aside: true }] : []),
-          ]
+          //
+          // magpie reads `used` as a 0–100 share and `amount` as the share's
+          // count (host.js), so the pair goes in as a share plus a count: an
+          // absolute spent count in `used` reads as "2000 percent used"
+          const spent = pairPresent ? Math.max(0, dailyLimit - dailyRemaining) : null
+          const dailyWallet = pairPresent
+            ? { name: "每日赠送积分", used: Math.min(100, (spent / dailyLimit) * 100), amount: spent, limit: dailyLimit, unit: "credits", resetsAt: beijingMidnight(), span: 86400 }
+            : daily != null
+              ? // no pair means no limit, and a made-up one always reads as
+                // full; a balance says what is left without inventing it
+                { name: "每日赠送积分", balance: daily, unit: "credits" }
+              : null
+          // a prepaid wallet knows what is left and no share of what (#3950)
+          const permanentWallet = permanent != null ? { name: "永久积分", balance: permanent, unit: "credits" } : null
+          // magpie weighs an account by the windows it does not set aside
+          // (`routing.go`: `if w.Aside || w.Text { continue }`), and one with
+          // none of those reads 剩余额度未知 on the Routing page. So exactly
+          // one window has to stay un-aside: the wallet while it holds
+          // credits, the grant only when the wallet is empty — a lone
+          // balance of 0 is read as used up, and a spent day must not bench
+          // an account its wallet still pays for
+          const walletCarries = permanentWallet != null && (permanent > 0 || dailyWallet == null)
+          if (dailyWallet && walletCarries) dailyWallet.aside = true
+          if (permanentWallet && !walletCarries) permanentWallet.aside = true
+          const windows = [dailyWallet, permanentWallet].filter(Boolean)
           // no `signIn` on a clean read: that absence is how magpie takes an
           // expired mark back off the account (a "kept" here would leave a
           // transient 401's lapse on forever)
