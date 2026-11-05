@@ -12,6 +12,11 @@ import { readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+// extras: the phone-side grant, the check-in triage, the vision whitelist,
+// extra_body.thinking, the max_tokens floor and the refresh_conflict heal.
+// Its own file so an upstream merge keeps only the wiring at the bottom.
+import { extendRaccoon } from "./extras.mjs"
+
 const PROVIDER_ID = "raccoon"
 const PROVIDER_NAME = "商汤小浣熊"
 const NPM = "@ai-sdk/openai-compatible"
@@ -411,6 +416,11 @@ function parseCatalog(payload) {
   const seen = new Set()
   const out = []
   for (const cat of categories) {
+    // the picker can only route a completion to a chat model; the catalog
+    // mixes other categories in (modelmux PROTOCOL.md 5.2: take the
+    // `type === 'chat'` one). A category with no type is kept.
+    const kind = String(cat?.type ?? "").trim().toLowerCase()
+    if (kind && kind !== "chat") continue
     for (const entry of Array.isArray(cat?.models) ? cat.models : []) {
       const id = String(entry?.name || entry?.model_name || "").trim()
       if (!id || seen.has(id)) continue
@@ -1014,7 +1024,7 @@ function desktopSignIn() {
 
 // ---- Plugin export ----------------------------------------------------------
 
-export const RaccoonAuthPlugin = async ({ client }) => {
+const raccoonBase = async ({ client }) => {
   const saveAuth = async (next) => {
     try {
       await client?.auth?.set?.({ path: { id: PROVIDER_ID }, body: next })
@@ -1212,6 +1222,24 @@ export const RaccoonAuthPlugin = async ({ client }) => {
       ],
     },
   }
+}
+
+// extras: everything above is upstream's, unchanged. The wrapper adds the
+// phone-side grant, the check-in triage, the vision whitelist, extra_body
+// .thinking, the max_tokens floor and the refresh_conflict heal; see
+// extras.mjs for the measurements behind each one.
+export const RaccoonAuthPlugin = async (args = {}) => {
+  const plugin = await raccoonBase(args)
+  return extendRaccoon(plugin, {
+    apiGetJson,
+    readDesktop: readDesktopAuth,
+    refreshOnce: (token) => callRefreshApi(token),
+    saveAuth: async (body) => {
+      try {
+        await args?.client?.auth?.set?.({ path: { id: PROVIDER_ID }, body })
+      } catch {}
+    },
+  })
 }
 
 export const _internal = {
