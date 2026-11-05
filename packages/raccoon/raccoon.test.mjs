@@ -284,6 +284,27 @@ test("usage does not invent 300/9000 floors when bills do not cover balance", as
     expires: Date.now() + 3600_000,
   }))
   expect(u.balance).toBe("500 credits")
+  // no floors are invented, but the balance is still a reading: a wallet
+  // window carries it, so routing knows the account (#3950)
+  expect(u.windows).toEqual([{ name: "Credits", balance: 500, unit: "credits" }])
+})
+
+test("a balance reply that names no balance makes no window, an unknown not a zero", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  startServer({
+    // the reply is a success with no number in it: 0 would claim the
+    // account is spent out, and routing would bench it
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const u = await hooks.auth.usage(async () => ({
+    type: "oauth",
+    access: validTok,
+    refresh: "rt1",
+    expires: Date.now() + 3600_000,
+  }))
   expect(u.windows).toEqual([])
 })
 
