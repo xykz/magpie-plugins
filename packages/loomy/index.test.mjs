@@ -107,35 +107,54 @@ describe("chat", () => {
     })
     await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
       method: "POST",
+      body: JSON.stringify({ model: "spark-x", stream: false, reasoning_effort: "xhigh", messages: [] }),
+    })
+    await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+      method: "POST",
       body: JSON.stringify({ model: "spark-x", stream: false, reasoning_effort: "none", messages: [] }),
     })
     expect(fake.state.chatCalls[0].body.reasoning_effort).toBe("low")
     expect(fake.state.chatCalls[1].body.reasoning_effort).toBe("high")
-    expect(fake.state.chatCalls[2].body.reasoning_effort).toBeUndefined()
+    // xhigh is a level magpie hands a plugin untouched (effortOf passes it
+    // through, fitFor leaves it alone for a model that declares no levels).
+    // Folding it away would ask for the vendor's default instead of the
+    // strongest level — a silent downgrade.
+    expect(fake.state.chatCalls[2].body.reasoning_effort).toBe("high")
+    expect(fake.state.chatCalls[3].body.reasoning_effort).toBeUndefined()
   })
 
-  test("deepseek images become base64 markers merged into the text", async () => {
+  // The client sends images to a deepseek model as plain image_url parts and
+  // the model reads them: measured in its own traffic, 4 parts in one user
+  // message, `image_url` twice, `<image_base64>` never, vendor 200 with a
+  // description of the screenshot. This plugin used to rewrite that into a
+  // text marker, which dropped the part the client had just sent. So the
+  // assertion is that the body arrives as it was handed over.
+  test("images reach the upstream as image_url, deepseek or not", async () => {
     const loader = await plugin.auth.loader(getAuth)
-    await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
-      method: "POST",
-      body: JSON.stringify({
-        model: "deepseek-v4-flash",
-        stream: false,
-        messages: [
-          { role: "user", content: [
-            { type: "text", text: "看这张图" },
-            { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
-            { type: "image_url", image_url: { url: "https://example.com/x.png" } },
-          ] },
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "看这张图" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
+          { type: "image_url", image_url: { url: "https://example.com/x.png" } },
         ],
-      }),
-    })
-    const content = fake.state.chatCalls[0].body.messages[0].content
-    expect(content).toHaveLength(2)
-    expect(content[0].text).toContain("看这张图")
-    expect(content[0].text).toContain("<image_base64>data:image/png;base64,QUJD</image_base64>")
-    // an http(s) URL stays as it was (no evidence the marker accepts URLs)
-    expect(content[1].type).toBe("image_url")
+      },
+    ]
+    for (const model of ["deepseek-v4-flash", "spark-x"]) {
+      await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({ model, stream: false, messages }),
+      })
+    }
+    for (const call of fake.state.chatCalls) {
+      const content = call.body.messages[0].content
+      expect(content).toHaveLength(3)
+      expect(content[0]).toEqual({ type: "text", text: "看这张图" })
+      expect(content[1].type).toBe("image_url")
+      expect(content[2].type).toBe("image_url")
+      expect(JSON.stringify(call.body)).not.toContain("<image_base64>")
+    }
   })
 
   test("a refused session says 401", async () => {
@@ -271,6 +290,13 @@ describe("models", () => {
     expect(list["glm-5.3-flash"].modalities).toEqual({ input: ["text", "image"], output: ["text"] })
     expect(list["plain"].rate).toBeUndefined()
     expect(list["plain"].name).toBe("No Suffix At All")
+    // the catalog's own field names, and both spellings of the output cap:
+    // spark-x carries context_length/max_output_tokens, deepseek carries the
+    // resolved limit{} shape. Reading only `max_tokens` left output unset for
+    // every live model, because the catalogue never spells it that way.
+    expect(list["spark-x"].limit).toEqual({ context: 128000, output: 8192 })
+    expect(list["deepseek-v4-flash"].limit).toEqual({ context: 64000, output: 16384 })
+    expect(list["plain"].limit).toBeUndefined()
   })
 })
 

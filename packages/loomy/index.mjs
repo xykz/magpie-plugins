@@ -20,6 +20,10 @@ import { loomyRenewal } from "./renew.mjs"
 // only the call sites below.
 import { extendLoomy, traceHeaders } from "./extras.mjs"
 
+// the attribution headers Loomy's own 0.9.39 client sends, measured from its
+// traffic. Same reason as the two above: call sites stay here, shapes live there.
+import { clientUserAgent, accountUserAgent, AXIOS_ACCEPT, chatAttribution, traceparent } from "./headers.mjs"
+
 const ID = "loomy"
 const NAME = "Loomy（讯飞）"
 
@@ -162,6 +166,11 @@ function signHeaders(method, path, bodyString) {
     Date: date,
     Nonce: nonce,
     "Content-Type": "application/json",
+    // an axios-shaped call, which is what the client's account chain is.
+    // Accept is not one of the nine signed parts, so adding it cannot break
+    // the signature; only Content-Type is signed, and that is unchanged.
+    Accept: AXIOS_ACCEPT,
+    "User-Agent": accountUserAgent(),
   }
   if (md5) headers["Content-MD5"] = md5
   return headers
@@ -183,19 +192,29 @@ async function signedPost(pathname, body) {
   return payload
 }
 
-// one request on the integration gateway with the session's double headers
-// (the model and points gateways prefer different header names; the client
-// sends both, and so does this)
-async function tokenRequest(method, path, session, body) {
+// one request on the integration gateway with the session header.
+//
+// Not every gateway path wants the same headers, and the client's own traffic
+// shows they genuinely differ: /api/v1/models is asked for as JSON with an
+// Accept and a Content-Type, while the two points paths send neither and take
+// whatever Accept the runtime defaults to. `headers` per call is how those
+// differences are expressed without a second function.
+async function tokenRequest(method, path, session, body, opts = {}) {
   if (!session?.trim()) throw new SignedOut("Loomy 账号缺少 session")
   const init = {
     method,
-    headers: { token: session, Authorization: `Bearer ${session}` },
+    // `token` only: the session header the Loomy gateway reads. The client
+    // sends no Authorization on these endpoints, so neither does this.
+    headers: { token: session, ...(opts.accept ? { Accept: opts.accept } : {}) },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT),
   }
   if (body !== undefined) {
     init.headers["Content-Type"] = "application/json"
     init.body = JSON.stringify(body)
+  } else if (opts.json) {
+    // /api/v1/models is a GET that still declares its type in the client's
+    // traffic — declared there, so declared here
+    init.headers["Content-Type"] = "application/json"
   }
   const res = await fetch(integrationBase() + path, init)
   if (res.status === 401 || res.status === 403) throw expired("Loomy 登录态已失效，请重新登录")
@@ -217,15 +236,23 @@ function normalizePhone(raw) {
 
 // ── chat body adaptation ───────────────────────────────────────────────────
 
-// the thinking levels Loomy's client offers are low/medium/high; a wider
-// level the agent asked is folded into them, off/none and unknowns are left
-// off (agent2api mod.rs reasoning_patch)
+// the thinking levels Loomy's client offers are low/medium/high, and only
+// those three: its picker is [low, medium, high] with medium the default, and
+// "off" is sent as no field at all rather than as "none". A wider level the
+// agent asked is folded into the top one, off/none and unknowns are left off
+// (agent2api mod.rs reasoning_patch)
+//
+// xhigh folds to high, not away: magpie's effortOf passes xhigh through
+// (internal/gateway/ir.go), and a plugin model declares no levels, so
+// fitFor hands it over untouched (internal/gateway/decide.go). Dropping the
+// field would ask for whatever the vendor defaults to — a silent downgrade
+// from the strongest level, which is the one thing a fold must not do.
 function foldReasoning(body) {
   let changed = false
   const of = (v) => {
     if (v === "minimal" || v === "low") return "low"
     if (v === "medium") return "medium"
-    if (v === "high" || v === "max") return "high"
+    if (v === "high" || v === "xhigh" || v === "max") return "high"
     return null
   }
   if (typeof body.reasoning_effort === "string") {
@@ -245,37 +272,6 @@ function foldReasoning(body) {
     }
   }
   return changed
-}
-
-// deepseek models on Loomy read images only as <image_base64> markers, not
-// OpenAI image_url parts; data-URI images are turned into the marker and
-// merged into the text before them (agent2api images.rs)
-function prefersTagFormat(model) {
-  return String(model ?? "").toLowerCase().includes("deepseek")
-}
-function toTagText(part) {
-  const kind = String(part?.type ?? "").trim().toLowerCase()
-  if (kind !== "image_url" && kind !== "input_image") return null
-  const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url
-  if (typeof url !== "string" || !url.startsWith("data:")) return null
-  return `<image_base64>${url}</image_base64>`
-}
-function rewriteImagesToTags(body) {
-  let converted = 0
-  for (const message of body.messages ?? []) {
-    if (!Array.isArray(message.content)) continue
-    for (let i = message.content.length - 1; i >= 0; i--) {
-      const tag = toTagText(message.content[i])
-      if (!tag) continue
-      message.content.splice(i, 1)
-      const prev = i > 0 && message.content[i - 1]?.type === "text" ? message.content[i - 1] : null
-      if (prev) prev.text += `\n${tag}`
-      else if (message.content[i]?.type === "text") message.content[i].text = `${tag}\n${message.content[i].text}`
-      else message.content.splice(i, 0, { type: "text", text: tag })
-      converted++
-    }
-  }
-  return converted
 }
 
 // the vendor's /models: OpenAI-shaped entries whose capabilities say what a
@@ -312,7 +308,12 @@ function catalogModel(entry) {
   const config = { name: name || id }
   const limit = {}
   const context = toNum(entry?.context_window ?? entry?.context_length ?? entry?.limit?.context)
-  const output = toNum(entry?.max_tokens ?? entry?.limit?.output)
+  // the catalogue names the output cap `max_output_tokens` — the client's own
+  // mapper reads limit.output, then max_output_tokens, then max_completion_tokens
+  // (A9 in its bundle), and two independent ports of the same catalogue agree
+  // (loomy2api's PROTOCOL.md and its max_output_tokens()). `max_tokens` is kept
+  // last only because an entry carrying it costs nothing to read.
+  const output = toNum(entry?.limit?.output ?? entry?.max_output_tokens ?? entry?.max_completion_tokens ?? entry?.max_tokens)
   if (context != null) limit.context = context
   if (output != null) limit.output = output
   if (Object.keys(limit).length) config.limit = limit
@@ -438,10 +439,16 @@ export async function LoomyAuthPlugin({ client } = {}) {
             res = await fetch(`${modelBase()}/images/generations`, {
               method: "POST",
               headers: {
-                "Content-Type": "application/json;charset=utf-8",
+                "Content-Type": "application/json",
                 Accept: "application/json",
                 token: session,
                 Authorization: `Bearer ${session}`,
+                // the client's draw carries traceparent but no loomy-version
+                // (its image path never calls withLoomyVersionHeader), so
+                // traceHeaders() — which returns the pair — is not used here
+                traceparent: traceparent(),
+                "user-agent": clientUserAgent(),
+                "x-loomy-request-purpose": "image.generate",
               },
               body,
               signal,
@@ -477,23 +484,32 @@ export async function LoomyAuthPlugin({ client } = {}) {
             const session = (await getAuth())?.access ?? a.access
             if (!session) return errorResponse(401, "Loomy 登录态缺失，请重新登录")
 
-            // the body as Loomy's own client writes it: reasoning folded to
-            // its three levels, and deepseek's images as base64 markers
+            // Only the reasoning fold remains. The client's own traffic shows
+            // images going to a deepseek model as plain image_url parts — the
+            // <image_base64> marker this used to emit is in neither the client
+            // nor the vendor's answer, and rewriting it dropped the image part
+            // the client had just sent (measured: 623,871 -> 623,858 bytes,
+            // image_url 2 -> 0). A body that arrives correct is left alone.
             try {
               foldReasoning(chat)
-              if (prefersTagFormat(chat.model)) rewriteImagesToTags(chat)
             } catch {}
             let res
             try {
               res = await fetch(`${modelBase()}/chat/completions`, {
                 method: "POST",
                 headers: {
-                  // charset=utf-8 is load-bearing: without it the upstream
-                  // reads the body as GBK and CJK text arrives corrupted
-                  "Content-Type": "application/json;charset=utf-8",
-                  Accept: "text/event-stream",
-                  token: session,
+                  // bare application/json, as the client's own traffic has it:
+                  // the body it sends carries CJK text and the vendor answers
+                  // 200, so the charset parameter was never load-bearing
+                  "Content-Type": "application/json",
+                  // opencode's own request on the imodel plane arrives with
+                  // */*, and the vendor streams SSE regardless
+                  Accept: "*/*",
+                  // the session travels as Authorization here, and NOT as
+                  // `token`: the client sends one or the other depending on
+                  // the plane, and the chat plane is the Bearer one
                   Authorization: `Bearer ${session}`,
+                  ...chatAttribution(init.headers, chat),
                   // the client's own tracing pair; see extras.mjs traceHeaders
                   ...traceHeaders(),
                 },
@@ -519,7 +535,7 @@ export async function LoomyAuthPlugin({ client } = {}) {
         try {
           const a = await getAuth()
           if (a?.type !== "oauth") return { error: "not signed in", signIn: "kept" }
-          const payload = await tokenRequest("GET", "/api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat", a.access)
+          const payload = await tokenRequest("GET", "/api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat", a.access, undefined, { accept: "*/*" })
           const code = codeOf(payload)
           if (AUTH_CODES.has(code)) return { error: "Loomy 登录态已失效，请重新登录", signIn: "expired" }
           if (code !== OK) return { error: `积分查询失败：${messageOf(payload) || `code=${code}`}`, signIn: "kept" }
@@ -583,7 +599,7 @@ export async function LoomyAuthPlugin({ client } = {}) {
         const a = await getAuth()
         if (a?.type !== "oauth" || !a.access) throw new SignedOut("Loomy：未登录")
         const readDaily = async () => {
-          const rec = await tokenRequest("GET", "/api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat", a.access)
+          const rec = await tokenRequest("GET", "/api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat", a.access, undefined, { accept: "*/*" })
           return toNum(rec?.data?.data?.dailyBalance ?? rec?.data?.dailyBalance)
         }
         let before
@@ -597,7 +613,7 @@ export async function LoomyAuthPlugin({ client } = {}) {
         }
         let payload
         try {
-          payload = await tokenRequest("POST", "/api/v1/points/first-login", a.access, {})
+          payload = await tokenRequest("POST", "/api/v1/points/first-login", a.access, {}, { accept: "*/*" })
         } catch (e) {
           if (e?.signIn === "expired" || e instanceof SignedOut) throw expired("Loomy 登录态已失效，无法刷新每日积分（请重新登录）")
           return { outcome: "failed", message: `每日积分刷新失败：${e?.message ?? e}` }
@@ -631,7 +647,7 @@ export async function LoomyAuthPlugin({ client } = {}) {
       async models(p, { auth } = {}) {
         if (auth?.type !== "oauth" || !auth.access) return p.models
         try {
-          const payload = await tokenRequest("GET", "/api/v1/models", auth.access)
+          const payload = await tokenRequest("GET", "/api/v1/models", auth.access, undefined, { accept: "application/json", json: true })
           if (codeOf(payload) && codeOf(payload) !== OK) return p.models
           const entries = Array.isArray(payload?.data) ? payload.data : []
           for (const entry of entries) {
@@ -658,8 +674,6 @@ export const _internal = {
   escapedPath,
   contentMD5,
   foldReasoning,
-  prefersTagFormat,
-  rewriteImagesToTags,
   splitRateSuffix,
   catalogModel,
   normalizePhone,

@@ -155,21 +155,47 @@ export function fakeLoomy() {
     },
   })
 
-  // the integration gateway: double auth headers on everything
+  // The integration gateway.
+  //
+  // Auth is per plane, because the Loomy client's own traffic is: the chat and
+  // draw planes carry the session as `Authorization: Bearer`, everything else
+  // (models, the two points paths, onboarding) carries it as bare `token` and
+  // sends no Authorization at all. Enforcing that here is what keeps the
+  // plugin from quietly regressing into sending both everywhere.
+  //
+  // Note what a green test then means: the plugin matches the captures. Whether
+  // the real gateway insists on the same split is not something this fake can
+  // know — it was never observable from outside. The client proves the shape is
+  // accepted; nothing proves the old shape is refused.
   const gateway = Bun.serve({
     port: 0,
     async fetch(req) {
       const url = new URL(req.url)
       const token = req.headers.get("token") ?? ""
       const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "")
-      if (token !== state.session || bearer !== state.session) return json(401, { code: "100002", desc: "session refused" })
+      // chat: Bearer only. draw: both (the client's image service keeps the
+      // token header). everything else: token only.
+      const isChat = url.pathname === "/api/v1/chat/completions"
+      const isDraw = url.pathname === "/api/v1/images/generations"
+      if (isChat) {
+        if (bearer !== state.session) return json(401, { code: "100002", desc: "session refused" })
+        if (token) return json(400, { code: "100004", desc: "the chat plane sends no token header" })
+      } else if (isDraw) {
+        if (bearer !== state.session || token !== state.session) return json(401, { code: "100002", desc: "session refused" })
+      } else {
+        if (token !== state.session) return json(401, { code: "100002", desc: "session refused" })
+        if (bearer) return json(400, { code: "100004", desc: `Authorization is not sent on ${url.pathname}` })
+      }
 
       if (url.pathname === "/api/v1/models") {
         state.modelsReads++
         return json(200, {
           data: [
-            { id: "spark-x", name: "Spark X2.5 (x0.1)", capabilities: { reasoning: true, function_calling: true, vision: false }, context_window: 128000, max_tokens: 8192 },
-            { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash 0731 (x3.0)", capabilities: { reasoning: true, function_calling: false, vision: true } },
+            // the live catalogue's own spelling: context_length /
+            // max_output_tokens, with capabilities{} alongside (loomy2api's
+            // PROTOCOL.md 3.5, and the client bundle's mapper reads exactly these)
+            { id: "spark-x", name: "Spark X2.5 (x0.1)", capabilities: { reasoning: true, function_calling: true, vision: false }, context_length: 128000, max_output_tokens: 8192 },
+            { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash 0731 (x3.0)", limit: { context: 64000, output: 16384 }, capabilities: { reasoning: true, function_calling: false, vision: true } },
             { id: "glm-5.3-flash", name: "GLM 5.3 Flash(x0.8)", capabilities: { reasoning: false, function_calling: false, vision: true } },
             { id: "plain", name: "No Suffix At All", capabilities: {} },
           ],
@@ -177,12 +203,13 @@ export function fakeLoomy() {
       }
 
       if (url.pathname === "/api/v1/chat/completions") {
-        // charset=utf-8 is load-bearing: without it the real upstream reads
-        // the body as GBK; the fake checks it is sent
+        // bare application/json, as the client's own traffic has it. The body
+        // carries CJK either way and the vendor answers 200, so a charset
+        // parameter is not what the upstream needs — it is a fingerprint.
         const ct = req.headers.get("content-type") ?? ""
-        if (!/charset\s*=\s*"?utf-8/i.test(ct)) return json(400, { code: "100009", desc: "content-type must name utf-8" })
+        if (/charset/i.test(ct)) return json(400, { code: "100009", desc: "content-type must not carry a charset" })
         const body = await req.json().catch(() => ({}))
-        state.chatCalls.push({ body })
+        state.chatCalls.push({ body, headers: Object.fromEntries(req.headers) })
         if (state.chatRefusal) return json(400, { error: { message: state.chatRefusal, type: "invalid_request_error" } })
         const reply = body.stream
           ? new Response(
@@ -200,8 +227,14 @@ export function fakeLoomy() {
 
       if (url.pathname === "/api/v1/images/generations") {
         const ct = req.headers.get("content-type") ?? ""
-        if (!/charset\s*=\s*"?utf-8/i.test(ct)) return json(400, { code: "100009", desc: "content-type must name utf-8" })
-        state.imageCalls.push({ accept: req.headers.get("accept"), token, bearer, body: await req.json().catch(() => null) })
+        if (/charset/i.test(ct)) return json(400, { code: "100009", desc: "content-type must not carry a charset" })
+        state.imageCalls.push({
+          accept: req.headers.get("accept"),
+          token,
+          bearer,
+          headers: Object.fromEntries(req.headers),
+          body: await req.json().catch(() => null),
+        })
         if (state.imageStatus) return json(state.imageStatus, { error: { message: `refused ${state.imageStatus}` } })
         // the reporter's measured answer, byte for byte (#609)
         return new Response('{"created":1793554989,"data":[{"url":"https://aigc-output-image-...png"}],"points_consumed":110}', { headers: { "content-type": "application/json" } })
