@@ -15,6 +15,11 @@ import { createHash, createHmac, randomUUID } from "node:crypto"
 // wiring is the three lines marked "renewal" below.
 import { loomyRenewal } from "./renew.mjs"
 
+// extras: the onboarding tasks, the thinking-level table, the catalog's
+// vision map and the trace headers. Same reason as renew.mjs — the code lives
+// outside this file so an upstream merge keeps only the call sites below.
+import { extendLoomy, foldReasoningBody, needsTagFormat, catalogIds, traceHeaders } from "./extras.mjs"
+
 const ID = "loomy"
 const NAME = "Loomy（讯飞）"
 
@@ -214,37 +219,20 @@ function normalizePhone(raw) {
 
 // the thinking levels Loomy's client offers are low/medium/high; a wider
 // level the agent asked is folded into them, off/none and unknowns are left
-// off (agent2api mod.rs reasoning_patch)
+// off (agent2api mod.rs reasoning_patch). The table moved to extras.mjs: the
+// old one dropped xhigh instead of folding it to high, and folded high to
+// high where upstream's walk over ["minimal","low","medium","high","xhigh",
+// "max"] two at a time lands on medium (reasoning.rs EFFORT_LEVELS).
 function foldReasoning(body) {
-  let changed = false
-  const of = (v) => {
-    if (v === "minimal" || v === "low") return "low"
-    if (v === "medium") return "medium"
-    if (v === "high" || v === "max") return "high"
-    return null
-  }
-  if (typeof body.reasoning_effort === "string") {
-    const folded = of(body.reasoning_effort)
-    if (folded !== body.reasoning_effort) {
-      if (folded) body.reasoning_effort = folded
-      else delete body.reasoning_effort
-      changed = true
-    }
-  }
-  if (body.reasoning && typeof body.reasoning === "object" && typeof body.reasoning.effort === "string") {
-    const folded = of(body.reasoning.effort)
-    if (folded !== body.reasoning.effort) {
-      if (folded) body.reasoning.effort = folded
-      else delete body.reasoning.effort
-      changed = true
-    }
-  }
-  return changed
+  return foldReasoningBody(body)
 }
 
 // deepseek models on Loomy read images only as <image_base64> markers, not
 // OpenAI image_url parts; data-URI images are turned into the marker and
-// merged into the text before them (agent2api images.rs)
+// merged into the text before them (agent2api images.rs). The name rule is
+// the fallback only: the live catalog declares per model whether it reads
+// images, and DeepSeek-V4.1-Flash declares that it does (extras.mjs
+// needsTagFormat; upstream images.rs fixed the same over-match).
 function prefersTagFormat(model) {
   return String(model ?? "").toLowerCase().includes("deepseek")
 }
@@ -296,6 +284,12 @@ function splitRateSuffix(name) {
 function catalogModel(entry) {
   const id = String(entry?.id ?? "").trim()
   if (!id) return null
+  // a non-chat entry (an image model, say) is not something the picker can
+  // route a completion to; the vendor's /models mixes them in (modelmux
+  // PROTOCOL.md 3.3, xux23's port). An entry with no type is kept: the live
+  // list has been seen both ways.
+  const kind = String(entry?.type ?? "").trim().toLowerCase()
+  if (kind && kind !== "chat") return null
   const caps = entry?.capabilities ?? {}
   const { name, rate } = splitRateSuffix(entry?.name ?? entry?.display_name ?? id)
   const config = { name: name || id }
@@ -401,7 +395,10 @@ export async function LoomyAuthPlugin({ client } = {}) {
 
   // renewal: the password method, refreshLead/refresh, and the 401 fallbacks
   // on loader/usage/checkin. Everything below is upstream's, unchanged.
-  return renewal.extend({
+  // extras: the one-time onboarding tasks ride along with the daily grant
+  // inside auth.checkin, so nothing else has to know they exist. Everything
+  // else above is upstream's, unchanged — see extras.mjs for why.
+  return extendLoomy(renewal.extend({
     auth: {
       provider: ID,
       // Loomy hands out no refresh token: a session lives 14 days. Password
@@ -463,11 +460,30 @@ export async function LoomyAuthPlugin({ client } = {}) {
             const session = (await getAuth())?.access ?? a.access
             if (!session) return errorResponse(401, "Loomy 登录态缺失，请重新登录")
 
+            // a model the live catalog no longer lists is answered by the
+            // gateway with its default model and a 200 — billed to a model
+            // nobody picked. Say so instead. The static table counts as
+            // known (it is what the picker offers before the first sign-in),
+            // and a catalog that could not be read answers null: the request
+            // then goes through as it always did.
+            try {
+              const asked = String(chat.model ?? "").trim()
+              const knownIds = await catalogIds(session)
+              const staticIds = new Set(Object.keys(STATIC_MODELS).map((k) => k.toLowerCase()))
+              if (knownIds && asked) {
+                const lower = [...knownIds].map((id) => String(id).toLowerCase())
+                if (!lower.includes(asked.toLowerCase()) && !staticIds.has(asked.toLowerCase()))
+                  return errorResponse(400, `Loomy 目录里没有模型 ${asked}，请重新选择`)
+              }
+            } catch {}
+
             // the body as Loomy's own client writes it: reasoning folded to
-            // its three levels, and deepseek's images as base64 markers
+            // its three levels, and images as base64 markers for the models
+            // that read them that way. Which models do is the live catalog's
+            // answer, not the name's (extras.mjs needsTagFormat).
             try {
               foldReasoning(chat)
-              if (prefersTagFormat(chat.model)) rewriteImagesToTags(chat)
+              if (await needsTagFormat(chat.model, session)) rewriteImagesToTags(chat)
             } catch {}
             let res
             try {
@@ -480,6 +496,8 @@ export async function LoomyAuthPlugin({ client } = {}) {
                   Accept: "text/event-stream",
                   token: session,
                   Authorization: `Bearer ${session}`,
+                  // the client's own tracing pair; see extras.mjs traceHeaders
+                  ...traceHeaders(),
                 },
                 body: JSON.stringify(chat),
                 signal: init.signal,
@@ -618,7 +636,7 @@ export async function LoomyAuthPlugin({ client } = {}) {
         }
       },
     },
-  })
+  }))
 }
 
 // for tests

@@ -15,6 +15,9 @@ beforeAll(async () => {
   fake = fakeLoomy()
   process.env.LOOMY_POINTS_BASE_URL = fake.gatewayUrl
   process.env.LOOMY_XFYUN_BASE_URL = fake.accountUrl
+  // the onboarding gifts are extras.mjs's business and are covered there;
+  // these tests stay what they were (and no ledger is written to $HOME)
+  process.env.LOOMY_ONBOARDING = "0"
 })
 
 afterAll(() => {
@@ -111,28 +114,35 @@ describe("chat", () => {
     expect(fake.state.chatCalls[2].body.reasoning_effort).toBeUndefined()
   })
 
-  test("deepseek images become base64 markers merged into the text", async () => {
+  test("images stay as image_url parts when the catalog says the model reads them", async () => {
+    // deepseek-v4-flash declares vision:true in the live catalog, so its
+    // images must NOT be turned into markers — that rewrite is for the models
+    // that only read markers, and doing it here doubled the prompt once
+    // (upstream images.rs:12-16)
     const loader = await plugin.auth.loader(getAuth)
+    const messages = [
+      { role: "user", content: [
+        { type: "text", text: "看这张图" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
+        { type: "image_url", image_url: { url: "https://example.com/x.png" } },
+      ] },
+    ]
     await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
       method: "POST",
-      body: JSON.stringify({
-        model: "deepseek-v4-flash",
-        stream: false,
-        messages: [
-          { role: "user", content: [
-            { type: "text", text: "看这张图" },
-            { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
-            { type: "image_url", image_url: { url: "https://example.com/x.png" } },
-          ] },
-        ],
-      }),
+      body: JSON.stringify({ model: "deepseek-v4-flash", stream: false, messages }),
     })
     const content = fake.state.chatCalls[0].body.messages[0].content
-    expect(content).toHaveLength(2)
-    expect(content[0].text).toContain("看这张图")
-    expect(content[0].text).toContain("<image_base64>data:image/png;base64,QUJD</image_base64>")
-    // an http(s) URL stays as it was (no evidence the marker accepts URLs)
+    expect(content).toHaveLength(3)
     expect(content[1].type).toBe("image_url")
+    expect(JSON.stringify(content)).not.toContain("<image_base64>")
+  })
+
+  test("a model the catalog does not know keeps the deepseek name rule", async () => {
+    // the catalog can be stale or unreadable; a model it has never heard of
+    // falls back to the name, which is all the old code ever had
+    const { needsTagFormat } = await import("./extras.mjs")
+    expect(await needsTagFormat("deepseek-v9-future", fake.state.session)).toBe(true)
+    expect(await needsTagFormat("glm-9-future", fake.state.session)).toBe(false)
   })
 
   test("a refused session says 401", async () => {

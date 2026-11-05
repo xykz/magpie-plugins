@@ -8,6 +8,7 @@
   "files": [
     "index.mjs",
     "renew.mjs",
+    "extras.mjs",
     "README.md"
   ],
   "keywords": [
