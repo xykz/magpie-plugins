@@ -707,11 +707,19 @@ async function queryUsage(token) {
     }
   }
 
+  // A balance the bills cannot account for tells no share, but it is still a
+  // reading: a wallet window carries it, so routing knows the account and
+  // sorts it by what it has left (#3950). A balance string alone is the
+  // card's, and routing would still say 剩余额度未知. A reply that names no
+  // number makes no window: 0 is what a missing figure reads as, and one at
+  // 0 is a spent-out account.
+  const said = points?.available_points
+  const told = said != null && said !== "" && Number.isFinite(Number(said))
   return {
     plan,
     ...(proEnable && expireAt ? { until: new Date(expireAt).toISOString() } : {}),
     balance: `${avail} credits`,
-    windows: [],
+    windows: told ? [{ name: "Credits", balance: avail, unit: "credits" }] : [],
   }
 }
 
