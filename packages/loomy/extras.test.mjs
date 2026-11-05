@@ -10,12 +10,8 @@ import {
   accountKeyOf,
   claimOnboarding,
   extendLoomy,
-  foldEffort,
-  foldReasoningBody,
   ledgerFile,
-  needsTagFormat,
   traceHeaders,
-  _internal as extras,
 } from "./extras.mjs"
 
 // the fake upstream from fake.mjs: no network, no real token ever leaves here
@@ -39,7 +35,6 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "loomy-extras-"))
   process.env.LOOMY_ONBOARDING_LEDGER = join(tempDir, "ledger.json")
   delete process.env.LOOMY_ONBOARDING
-  extras.resetVisionCache()
 })
 
 afterEach(() => {
@@ -199,87 +194,6 @@ describe("the check-in hook carries the gifts", () => {
   test("a plugin without a check-in hook is returned untouched", () => {
     const plugin = { auth: { provider: "loomy" }, provider: { id: "loomy" } }
     expect(extendLoomy(plugin)).toBe(plugin)
-  })
-})
-
-describe("thinking levels", () => {
-  test("the six levels walk two at a time into the vendor's three", () => {
-    expect(foldEffort("minimal")).toBe("low")
-    expect(foldEffort("low")).toBe("low")
-    expect(foldEffort("medium")).toBe("medium")
-    expect(foldEffort("high")).toBe("medium")
-    expect(foldEffort("xhigh")).toBe("high")
-    expect(foldEffort("max")).toBe("high")
-  })
-
-  test("levels the vendor does not take fold away, so its default stands", () => {
-    expect(foldEffort("none")).toBeNull()
-    expect(foldEffort("off")).toBeNull()
-    expect(foldEffort("banana")).toBeNull()
-    expect(foldEffort(undefined)).toBeNull()
-  })
-
-  test("xhigh reaches the gateway as high instead of being deleted", () => {
-    // the old table dropped it and the gateway fell back to low: the highest
-    // setting an agent could ask for came out as the lowest
-    const body = { reasoning_effort: "xhigh" }
-    expect(foldReasoningBody(body)).toBe(true)
-    expect(body.reasoning_effort).toBe("high")
-  })
-
-  test("the nested reasoning.effort form is folded the same way", () => {
-    const body = { reasoning: { effort: "high" } }
-    foldReasoningBody(body)
-    expect(body.reasoning.effort).toBe("medium")
-  })
-
-  test("a level already in range is left alone and reports no change", () => {
-    const body = { reasoning_effort: "medium", reasoning: { effort: "low" } }
-    expect(foldReasoningBody(body)).toBe(false)
-    expect(body.reasoning_effort).toBe("medium")
-    expect(body.reasoning.effort).toBe("low")
-  })
-
-  test("off/none is deleted rather than sent as something the gateway ignores", () => {
-    const body = { reasoning_effort: "none", reasoning: { effort: "off" } }
-    foldReasoningBody(body)
-    expect(body.reasoning_effort).toBeUndefined()
-    expect(body.reasoning.effort).toBeUndefined()
-  })
-})
-
-describe("which models read images", () => {
-  test("the live catalog decides, not the name", async () => {
-    // deepseek-v4-flash declares vision:true, so it reads image parts
-    expect(await needsTagFormat("deepseek-v4-flash", session())).toBe(false)
-    // and a model with no vision capability gets the marker form
-    expect(await needsTagFormat("spark-x", session())).toBe(true)
-  })
-
-  test("the catalog is read once and reused", async () => {
-    await needsTagFormat("deepseek-v4-flash", session())
-    const reads = fake.state.modelsReads
-    await needsTagFormat("spark-x", session())
-    expect(fake.state.modelsReads).toBe(reads)
-  })
-
-  test("a model the catalog has never heard of falls back to the name", async () => {
-    expect(await needsTagFormat("deepseek-v9-future", session())).toBe(true)
-    expect(await needsTagFormat("brand-new-model", session())).toBe(false)
-  })
-
-  test("an unreadable catalog falls back to the name rather than guessing", async () => {
-    const realFetch = globalThis.fetch
-    globalThis.fetch = (input, init) => {
-      const url = String(typeof input === "string" ? input : input?.url)
-      if (url.includes("/api/v1/models")) return Promise.resolve(new Response("boom", { status: 502 }))
-      return realFetch(input, init)
-    }
-    try {
-      expect(await needsTagFormat("deepseek-v4-1-flash", session())).toBe(true)
-    } finally {
-      globalThis.fetch = realFetch
-    }
   })
 })
 

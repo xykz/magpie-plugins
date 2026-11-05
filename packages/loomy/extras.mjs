@@ -6,10 +6,7 @@
 //
 // What lives here:
 //   - the eight onboarding tasks (one-time 10000 points, never claimed before)
-//   - the six-to-three thinking-level table (upstream reasoning.rs)
-//   - the "does this model read images" table from the live catalog
-//     (upstream images.rs; the name rule alone misreads DeepSeek-V4.1-Flash)
-//   - the traceparent / loomy-version headers
+//   - the traceparent / loomy-version headers (chat)
 
 import { randomUUID } from "node:crypto"
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
@@ -179,93 +176,6 @@ export async function claimOnboarding(session, a, opts = {}) {
   return { points, keys: claimed, settled: settled.size >= ONBOARDING_TASKS.length, expired }
 }
 
-// ── thinking levels ────────────────────────────────────────────────────────
-//
-// Loomy takes three levels. Upstream walks EFFORT_LEVELS
-// ["minimal","low","medium","high","xhigh","max"] two at a time
-// (loomy/mod.rs reasoning_patch): minimal+low to low, medium+high to medium,
-// xhigh+max to high. Fold anything else away so the gateway keeps its default.
-export const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"]
-
-export function foldEffort(level) {
-  if (typeof level !== "string") return null
-  const rank = EFFORT_LEVELS.indexOf(level.trim().toLowerCase())
-  if (rank < 0) return null
-  if (rank <= 1) return "low"
-  if (rank <= 3) return "medium"
-  return "high"
-}
-
-export function foldReasoningBody(body) {
-  let changed = false
-  const apply = (holder, field) => {
-    if (typeof holder?.[field] !== "string") return
-    const folded = foldEffort(holder[field])
-    if (folded === holder[field]) return
-    if (folded) holder[field] = folded
-    else delete holder[field]
-    changed = true
-  }
-  apply(body, "reasoning_effort")
-  if (body?.reasoning && typeof body.reasoning === "object") apply(body.reasoning, "effort")
-  return changed
-}
-
-// ── which models read images ───────────────────────────────────────────────
-//
-// The catalog declares it per model (capabilities.vision). The name rule on
-// its own is what upstream shipped first and then had to fix: DeepSeek-V4.1-
-// Flash declares vision and still matched "deepseek", so two JPEGs became
-// 828k characters of base64 text and the prompt went from 332k to 658k tokens
-// (loomy/images.rs:12-16, plugins #609's sibling bug).
-let visionCache = { base: "", map: null, at: 0 }
-const VISION_TTL_MS = 10 * 60 * 1000
-
-export async function visionMap(session, opts = {}) {
-  const base = integrationBase()
-  const now = Date.now()
-  if (!opts.force && visionCache.map && visionCache.base === base && now - visionCache.at < VISION_TTL_MS) {
-    return visionCache.map
-  }
-  const payload = await apiJson("/api/v1/models", session)
-  const entries = Array.isArray(payload?.data) ? payload.data : []
-  const map = new Map()
-  for (const entry of entries) {
-    const id = String(entry?.id ?? "").trim()
-    if (!id) continue
-    map.set(id, entry?.capabilities?.vision === true)
-  }
-  visionCache = { base, map, at: now }
-  return map
-}
-
-// True when the images must be sent as <image_base64> markers. A model the
-// catalog knows is answered by the catalog; anything else (no catalog yet,
-// a model added since, a read failure) keeps the old name rule rather than
-// guessing wrong in the other direction.
-export async function needsTagFormat(model, session, opts = {}) {
-  const name = String(model ?? "").trim()
-  if (!name) return false
-  try {
-    const map = await visionMap(session, opts)
-    if (map.has(name)) return map.get(name) !== true
-  } catch {}
-  return name.toLowerCase().includes("deepseek")
-}
-
-// The ids the live catalog lists, or null when it could not be read. The
-// gateway answers an unknown model with the default model and a 200
-// (xxhhlk/raccoon2api README), so a request for a model that has since been
-// retired would quietly be served by a different one and billed as such.
-export async function catalogIds(session, opts = {}) {
-  try {
-    const map = await visionMap(session, opts)
-    return map.size ? new Set(map.keys()) : null
-  } catch {
-    return null
-  }
-}
-
 // ── tracing headers ────────────────────────────────────────────────────────
 //
 // Five independent implementations send these on every gateway call; one
@@ -280,9 +190,10 @@ export function traceHeaders() {
 
 // ── the plugin wrapper ─────────────────────────────────────────────────────
 
-// Wraps the finished plugin. The chat path's header and body fixes are inside
-// index.mjs (they have to land before the request is built); what is left is
-// the daily hook, where the one-time gift rides along with the check-in.
+// Wraps the finished plugin. The trace headers are called from index.mjs's
+// chat path (they have to land before the request is built); what is left
+// here is the daily hook, where the one-time gift rides along with the
+// check-in.
 export function extendLoomy(plugin) {
   const auth = plugin?.auth
   if (!auth || typeof auth.checkin !== "function") return plugin
@@ -324,9 +235,5 @@ export const _internal = {
   AUTH_CODES,
   gateway,
   apiJson,
-  visionCache,
-  resetVisionCache: () => {
-    visionCache = { base: "", map: null, at: 0 }
-  },
   Expired,
 }

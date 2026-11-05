@@ -142,14 +142,27 @@ as it was (`kept`). A renewal already made in this process is reused unless
 the caller is holding that very session, which was just refused.
 
 All of it is `packages/loomy/renew.mjs`, which `index.mjs` reaches in four
-places — an import, a `loomyRenewal()` call, `return renewal.extend({`, and
-the closing `})` — so that following upstream's `index.mjs` never has to merge
-past the new code: `extend()` mounts `refreshLead`/`refresh` and wraps
+places — an import, a `loomyRenewal()` call, `return extendLoomy(renewal.extend({`,
+and the closing `}))` — so that following upstream's `index.mjs` never has to
+merge past the new code: `extend()` mounts `refreshLead`/`refresh` and wraps
 `loader`/`usage`/`checkin` itself, so an upstream rewrite of those hooks is
 wrapped rather than lost. The shape of the file split follows
-`packages/workbuddy/codebuddy.mjs`. `package.json`'s `files` gains
-`renew.mjs`, since an install that left it out would have a plugin that
-cannot import.
+`packages/workbuddy/codebuddy.mjs`.
+
+The second fork-only file is `packages/loomy/extras.mjs`: Loomy's client tells
+its own gateway that the eight onboarding tasks are done and is paid for
+saying so, and this fork sends the same eight `POST
+/api/v1/onboarding/tasks/complete` calls (one body field, `{"key": …}`, 10000
+points in all) inside the first check-in after sign-in — serially, in the
+client's order, once per account. Which keys an account has already been paid
+for is kept in `$XDG_CONFIG_HOME/magpie/loomy-onboarding.json` (or
+`LOOMY_ONBOARDING_LEDGER`), keyed by account id, mode 600; `LOOMY_ONBOARDING=0`
+turns the whole thing off, and a check-in whose own answer was anything but a
+claim pays nothing. The same file adds the `traceparent` and `loomy-version`
+pair, on the chat request.
+
+`package.json`'s `files` gains `renew.mjs` and `extras.mjs`, since an install
+that left either out would have a plugin that cannot import.
 
 ## `helper/`: carrying sign-ins in from other tools
 
@@ -212,8 +225,16 @@ later) and both take `--dry-run` and `--install`.
   重登一次并重发，响应带 `X-Magpie-Sign-In: renewed`。厂商明确拒绝（HTTP
   200 + 非 `000000`）才标记登出（`expired`），网络错误与 5xx 只 `kept`。
   代码全在 `packages/loomy/renew.mjs`，`index.mjs` 只动四处（import、
-  `loomyRenewal()`、`return renewal.extend({`、收尾 `})`），`extend()` 自己
-  挂 `refreshLead`/`refresh` 并包住 `loader`/`usage`/`checkin`，所以上游重写
-  这些钩子时会被包住而不是丢失——文件拆分方式与
-  `packages/workbuddy/codebuddy.mjs` 一致。`package.json` 的 `files` 加了
-  `renew.mjs`。
+  `loomyRenewal()`、`return extendLoomy(renewal.extend({`、收尾 `}))`），
+  `extend()` 自己挂 `refreshLead`/`refresh` 并包住 `loader`/`usage`/`checkin`，
+  所以上游重写这些钩子时会被包住而不是丢失——文件拆分方式与
+  `packages/workbuddy/codebuddy.mjs` 一致。另一个 fork 独有文件是
+  `packages/loomy/extras.mjs`：Loomy 客户端会自己向网关声明八个新手任务已完成
+  并因此拿到积分，本 fork 在登录后的首次签到里照发同样的八条
+  `POST /api/v1/onboarding/tasks/complete`（body 只有一个 `{"key": …}`，合计
+  10000 分），串行、按客户端顺序、每个账号只发一次；已领过哪些 key 记在
+  `$XDG_CONFIG_HOME/magpie/loomy-onboarding.json`（或 `LOOMY_ONBOARDING_LEDGER`），
+  按账号 id 分键，权限 600；`LOOMY_ONBOARDING=0` 可整体关闭，签到本身没领到
+  的那次不发礼包。同一个文件还加了客户端每次请求都带的 `traceparent` 与
+  `loomy-version`。`package.json` 的 `files` 加了 `renew.mjs` 与
+  `extras.mjs`。

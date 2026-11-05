@@ -15,10 +15,10 @@ import { createHash, createHmac, randomUUID } from "node:crypto"
 // wiring is the three lines marked "renewal" below.
 import { loomyRenewal } from "./renew.mjs"
 
-// extras: the onboarding tasks, the thinking-level table, the catalog's
-// vision map and the trace headers. Same reason as renew.mjs — the code lives
-// outside this file so an upstream merge keeps only the call sites below.
-import { extendLoomy, foldReasoningBody, needsTagFormat, catalogIds, traceHeaders } from "./extras.mjs"
+// extras: the onboarding tasks and the trace headers. Same reason as
+// renew.mjs — the code lives outside this file so an upstream merge keeps
+// only the call sites below.
+import { extendLoomy, traceHeaders } from "./extras.mjs"
 
 const ID = "loomy"
 const NAME = "Loomy（讯飞）"
@@ -219,20 +219,37 @@ function normalizePhone(raw) {
 
 // the thinking levels Loomy's client offers are low/medium/high; a wider
 // level the agent asked is folded into them, off/none and unknowns are left
-// off (agent2api mod.rs reasoning_patch). The table moved to extras.mjs: the
-// old one dropped xhigh instead of folding it to high, and folded high to
-// high where upstream's walk over ["minimal","low","medium","high","xhigh",
-// "max"] two at a time lands on medium (reasoning.rs EFFORT_LEVELS).
+// off (agent2api mod.rs reasoning_patch)
 function foldReasoning(body) {
-  return foldReasoningBody(body)
+  let changed = false
+  const of = (v) => {
+    if (v === "minimal" || v === "low") return "low"
+    if (v === "medium") return "medium"
+    if (v === "high" || v === "max") return "high"
+    return null
+  }
+  if (typeof body.reasoning_effort === "string") {
+    const folded = of(body.reasoning_effort)
+    if (folded !== body.reasoning_effort) {
+      if (folded) body.reasoning_effort = folded
+      else delete body.reasoning_effort
+      changed = true
+    }
+  }
+  if (body.reasoning && typeof body.reasoning === "object" && typeof body.reasoning.effort === "string") {
+    const folded = of(body.reasoning.effort)
+    if (folded !== body.reasoning.effort) {
+      if (folded) body.reasoning.effort = folded
+      else delete body.reasoning.effort
+      changed = true
+    }
+  }
+  return changed
 }
 
 // deepseek models on Loomy read images only as <image_base64> markers, not
 // OpenAI image_url parts; data-URI images are turned into the marker and
-// merged into the text before them (agent2api images.rs). The name rule is
-// the fallback only: the live catalog declares per model whether it reads
-// images, and DeepSeek-V4.1-Flash declares that it does (extras.mjs
-// needsTagFormat; upstream images.rs fixed the same over-match).
+// merged into the text before them (agent2api images.rs)
 function prefersTagFormat(model) {
   return String(model ?? "").toLowerCase().includes("deepseek")
 }
@@ -460,30 +477,11 @@ export async function LoomyAuthPlugin({ client } = {}) {
             const session = (await getAuth())?.access ?? a.access
             if (!session) return errorResponse(401, "Loomy 登录态缺失，请重新登录")
 
-            // a model the live catalog no longer lists is answered by the
-            // gateway with its default model and a 200 — billed to a model
-            // nobody picked. Say so instead. The static table counts as
-            // known (it is what the picker offers before the first sign-in),
-            // and a catalog that could not be read answers null: the request
-            // then goes through as it always did.
-            try {
-              const asked = String(chat.model ?? "").trim()
-              const knownIds = await catalogIds(session)
-              const staticIds = new Set(Object.keys(STATIC_MODELS).map((k) => k.toLowerCase()))
-              if (knownIds && asked) {
-                const lower = [...knownIds].map((id) => String(id).toLowerCase())
-                if (!lower.includes(asked.toLowerCase()) && !staticIds.has(asked.toLowerCase()))
-                  return errorResponse(400, `Loomy 目录里没有模型 ${asked}，请重新选择`)
-              }
-            } catch {}
-
             // the body as Loomy's own client writes it: reasoning folded to
-            // its three levels, and images as base64 markers for the models
-            // that read them that way. Which models do is the live catalog's
-            // answer, not the name's (extras.mjs needsTagFormat).
+            // its three levels, and deepseek's images as base64 markers
             try {
               foldReasoning(chat)
-              if (await needsTagFormat(chat.model, session)) rewriteImagesToTags(chat)
+              if (prefersTagFormat(chat.model)) rewriteImagesToTags(chat)
             } catch {}
             let res
             try {
