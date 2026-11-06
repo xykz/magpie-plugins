@@ -30,6 +30,31 @@ const LEAD_MS = 5 * 60 * 1000
 const KEEP_RENEWED_MS = 60 * 1000
 const CATALOG_TTL_MS = 10 * 60 * 1000
 
+// ---- How often the vendor's non-chat endpoints are read ---------------------
+// magpie reads an account's allowance on clocks of its own: routing re-reads
+// one account's reading once a minute while chat requests flow through it
+// (internal/provider/routing.go Allowances), the tray reads its cards every
+// three minutes (TrayUsageEvery), and the Usage page reads while it is open.
+// A hook is handed no sign of which of those asked, so answering from a young
+// reading is the only way to keep magpie's own polling off the vendor's rate
+// limit. Magpie caches a reading for a minute by itself
+// (internal/provider/login_usage.go), so a TTL at or under that would cut
+// nothing: three minutes leaves routing's sort at most one read behind and a
+// user pressing 刷新 at most three minutes stale. 0 turns the cache off.
+const msEnv = (name, fallback) => {
+  const raw = process.env[name]
+  if (raw == null || String(raw).trim() === "") return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+const usageTtlMs = () => msEnv("RACCOON_USAGE_TTL_MS", 3 * 60 * 1000)
+const billsTtlMs = () => msEnv("RACCOON_BILLS_TTL_MS", 10 * 60 * 1000)
+const entitlementTtlMs = () => msEnv("RACCOON_ENTITLEMENT_TTL_MS", 6 * 60 * 60 * 1000)
+// A read that failed is worth remembering for a moment: routing asks again a
+// minute later, and a vendor that just answered 500 three times does not need
+// a fourth. Short, because a lapse the host could clear must not be kept.
+const USAGE_FAIL_TTL_MS = 30 * 1000
+
 // USER_AGENT is what the vendor's chat API is asked with. magpie sends its own
 // (`magpie/<version>`, internal/gateway/user_agent.go), and a plugin can't take
 // that back: a plugin's provider has an Account, so provider.PassesUserAgent is
@@ -636,6 +661,22 @@ function beijingTodayKey(nowMs = Date.now()) {
   return new Date(nowMs + 8 * 3600_000).toISOString().slice(0, 10)
 }
 
+// The vendor's day is Beijing's, and a check-in answers for that day only.
+// magpie asks once more per account while the answer says the grant has not
+// landed and it is not yet noon ("provisional", internal/provider/checkin.go),
+// which is up to 24 asks a day for an account checked in early. A reply that
+// names when it stops being true ends that: magpie holds the answer until
+// `until` (internal/provider/plugin_checkin.go, workbuddy_checkin.go's
+// settled()). A press of 签到 still re-asks (checkin.go's `soon`), so this
+// costs the user nothing.
+function nextBeijingMidnight(nowMs = Date.now()) {
+  const day = 24 * 3600_000
+  const off = 8 * 3600_000
+  return Math.floor((nowMs + off) / day) * day + day - off
+}
+
+const untilAnswer = () => new Date(nextBeijingMidnight()).toISOString()
+
 async function claimDesktopOnboardingGrant(token) {
   try {
     const d = await apiGetJson("/api/web/desktop/v1/login/points/grant", token, desktopHeaders(), "POST")
@@ -663,33 +704,73 @@ async function allBills(token) {
   return bills
 }
 
-async function queryUsage(token) {
-  const [points, entitlement, bills] = await Promise.all([
-    apiGetJson("/api/web/points/v1/balance", token),
-    apiGetJson("/api/web/auth/v1/entitlement_info", token).catch(() => null),
-    allBills(token).catch(() => null),
-  ])
-  const avail = Math.floor(Number(points?.available_points) || 0)
+// ---- Caching the reads magpie makes on its own clocks -----------------------
+// Every map here is keyed by the ACCOUNT, not by the access token: a renewal
+// swaps the token for the same account, and a reading taken a minute before it
+// is still that account's reading.
+const usageCache = new Map() // key -> { at, value }
+const usageInFlight = new Map() // key -> promise
+const usageFailed = new Map() // key -> { at, error }
+const entitlementCache = new Map() // key -> { at, value }
+const billsCache = new Map() // key -> { at, value }
+const billsHealedAt = new Map() // key -> ms of the last forced bills read
 
-  const office = entitlement?.office ?? entitlement?.code ?? {}
-  const proEnable = office?.pro_enable === true || entitlement?.code?.pro_enable === true
-  const planType = office?.active_plan?.type || office?.plan_type || ""
-  const plan = proEnable ? (planType && planType !== "none" ? planType : "Pro") : "Free"
-  const expireAt = office?.pro_expired_time || office?.active_plan?.subscription_expired_at || null
+function accountKeyOf(a) {
+  return String(a?.uid || a?.accountId || a?.access || "")
+}
 
-  // Sum only what the vendor actually reports as granted in unexpired bills.
-  // If bills don't account for the current balance, report the balance with no window.
-  let grantedFromBills = 0
+// The card's name: the phone when the record has one, else what the account is
+// called (an older record has no phone).
+function nameOf(a) {
+  return a?.cardName || a?.accountId || a?.name || a?.uid
+}
+
+// fresh tells whether an entry may still answer. A ttl of 0 (or a negative
+// RACCOON_*_TTL_MS) means never.
+function fresh(entry, ttl) {
+  return !!entry && ttl > 0 && Date.now() - entry.at < ttl
+}
+
+// entitlement changes with a plan, not with a request: the office block names
+// the plan and the day it lapses. Reading it on every balance read spent one
+// of the three non-chat requests magpie makes each minute on a value that moves
+// a few times a year.
+async function readEntitlement(token, key) {
+  const hit = entitlementCache.get(key)
+  if (fresh(hit, entitlementTtlMs())) return hit.value
+  const value = await apiGetJson("/api/web/auth/v1/entitlement_info", token).catch(() => null)
+  if (value != null) entitlementCache.set(key, { at: Date.now(), value })
+  return value
+}
+
+// bills are the tail of an append-only ledger; a page read a few minutes ago is
+// still the beginning of the same tail. `again` forces the read a caller
+// already knows is stale.
+async function readBills(token, key, again = false) {
+  if (!again) {
+    const hit = billsCache.get(key)
+    if (fresh(hit, billsTtlMs())) return hit.value
+  }
+  const value = await allBills(token).catch(() => null)
+  // a failed read is not a reading: caching it would turn one bad answer into
+  // ten minutes of "no bills"
+  if (value != null && Array.isArray(value?.items)) billsCache.set(key, { at: Date.now(), value })
+  return value
+}
+
+// sumBills is the ledger's side of the reading: what it reports as granted and
+// still unexpired, and the earliest expiry among those.
+function sumBills(bills, now) {
+  let granted = 0
   let soonestExpMs = 0
   let expiringPts = 0
-  const now = Date.now()
   for (const item of Array.isArray(bills?.items) ? bills.items : []) {
     const pts = Math.floor(Number(item?.points) || 0)
     if (pts <= 0) continue
     const expStr = typeof item?.expire_at === "string" ? item.expire_at : ""
     const expMs = expStr ? Date.parse(expStr) : 0
     if (expMs > 0 && expMs <= now) continue
-    grantedFromBills += pts
+    granted += pts
     if (expMs > now) {
       if (!soonestExpMs || expMs < soonestExpMs) {
         soonestExpMs = expMs
@@ -699,6 +780,43 @@ async function queryUsage(token) {
       }
     }
   }
+  return { granted, soonestExpMs, expiringPts }
+}
+
+async function queryUsage(token, key) {
+  const [points, entitlement, firstBills] = await Promise.all([
+    apiGetJson("/api/web/points/v1/balance", token),
+    readEntitlement(token, key),
+    readBills(token, key),
+  ])
+  const avail = Math.floor(Number(points?.available_points) || 0)
+  const now = Date.now()
+
+  // Sum only what the vendor actually reports as granted in unexpired bills.
+  // If bills don't account for the current balance, report the balance with no window.
+  let bills = firstBills
+  let { granted: grantedFromBills, soonestExpMs, expiringPts } = sumBills(bills, now)
+
+  // The balance is read every time and the ledger is not, so a grant that
+  // landed a moment ago shows up in the balance first: the ledger then says
+  // less than the wallet holds, and `used` would read negative. That answer is
+  // the cache being stale, not the vendor disagreeing — read the ledger again,
+  // at most once per bills TTL so an account whose balance the ledger never
+  // accounts for does not turn this into two reads every time.
+  if (grantedFromBills > 0 && grantedFromBills < avail) {
+    const healed = billsHealedAt.get(key) ?? 0
+    if (now - healed >= billsTtlMs()) {
+      billsHealedAt.set(key, now)
+      bills = await readBills(token, key, true)
+      ;({ granted: grantedFromBills, soonestExpMs, expiringPts } = sumBills(bills, now))
+    }
+  }
+
+  const office = entitlement?.office ?? entitlement?.code ?? {}
+  const proEnable = office?.pro_enable === true || entitlement?.code?.pro_enable === true
+  const planType = office?.active_plan?.type || office?.plan_type || ""
+  const plan = proEnable ? (planType && planType !== "none" ? planType : "Pro") : "Free"
+  const expireAt = office?.pro_expired_time || office?.active_plan?.subscription_expired_at || null
   const runsOutAt = soonestExpMs ? new Date(soonestExpMs).toISOString() : null
   const runsOut = soonestExpMs ? Math.min(avail, expiringPts) : 0
 
@@ -856,11 +974,13 @@ async function performCheckIn(a, save) {
         outcome: "claimed",
         credit: onboardingPts,
         message: `桌面端首次登录奖励 +${onboardingPts}`,
+        until: untilAnswer(),
       }
     }
     return {
       outcome: "done",
       message: "今日已签到",
+      until: untilAnswer(),
     }
   }
 
@@ -916,11 +1036,16 @@ async function performCheckIn(a, save) {
       outcome: "claimed",
       credit: totalCredit,
       message: `${names.join(" + ") || "今日积分"} +${totalCredit}`,
+      until: untilAnswer(),
     }
   }
   return {
     outcome: "done",
     message: "今日已签到",
+    // The ledger lags the grant, so "done" here is "nothing new in the bills
+    // yet", not "the vendor has not paid". Saying when to ask again keeps that
+    // one re-ask instead of magpie's every-30-minutes-until-noon.
+    until: untilAnswer(),
   }
 }
 
@@ -1256,39 +1381,76 @@ const raccoonBase = async ({ client }) => {
           },
         }
       },
+      // usage is the hook magpie calls on clocks of its own — routing's
+      // allowance refresh once a minute per agent while chat flows, the tray
+      // every few minutes, the Usage page while it is open — and none of those
+      // says it is the user asking. One reading therefore answers every call
+      // for RACCOON_USAGE_TTL_MS (three minutes by default): the same credits,
+      // three or four times fewer requests to the vendor. A reading taken
+      // during a renewal keeps the account's key, so the token swap does not
+      // buy a second one.
       async usage(getAuth) {
         const auth = await getAuth()
         if (auth?.type !== "oauth" || !(auth.access || auth.source === "desktop")) {
           return { error: "not signed in", signIn: "kept" }
         }
-        try {
-          let { a, didRenew } = await currentAuth(client, auth)
-          let result
+        const key = accountKeyOf(auth)
+        const cached = usageCache.get(key)
+        // The kept reading carries its own name and says "kept": this call
+        // reissued nothing, and claiming "renewed" would tell magpie a lapse it
+        // never confirmed had been answered.
+        if (fresh(cached, usageTtlMs())) return { ...cached.value }
+        // a read that just failed is not asked again at once: routing is back
+        // in a minute, and an endpoint answering 500 should not be pressed on
+        // every pass. A lapse (signIn expired) is never kept this way — magpie
+        // has to see it.
+        const failed = usageFailed.get(key)
+        if (fresh(failed, USAGE_FAIL_TTL_MS)) return { ...failed.value }
+        const busy = usageInFlight.get(key)
+        if (busy) return busy
+
+        const read = (async () => {
           try {
-            result = await queryUsage(a.access)
-          } catch (e) {
-            if (e?.status === 401 && a.refresh && a.source !== "desktop") {
-              const retryAuth = await currentAuth(client, a, true)
-              a = retryAuth.a
-              didRenew = true
-              result = await queryUsage(a.access)
-            } else {
-              throw e
+            let { a, didRenew } = await currentAuth(client, auth)
+            let result
+            try {
+              result = await queryUsage(a.access, key)
+            } catch (e) {
+              if (e?.status === 401 && a.refresh && a.source !== "desktop") {
+                const retryAuth = await currentAuth(client, a, true)
+                a = retryAuth.a
+                didRenew = true
+                result = await queryUsage(a.access, key)
+              } else {
+                throw e
+              }
             }
+            usageFailed.delete(key)
+            const answer = {
+              ...result,
+              user: nameOf(a),
+              signIn: didRenew ? "renewed" : "kept",
+            }
+            // The reading is what is reused, not the account's name or the
+            // reissue: a hit says "kept" because this call renewed nothing.
+            usageCache.set(key, {
+              at: Date.now(),
+              value: { ...result, user: answer.user, signIn: "kept" },
+            })
+            return answer
+          } catch (e) {
+            const answer = {
+              error: e?.message ?? String(e),
+              signIn: e?.signIn === "expired" ? "expired" : "kept",
+            }
+            if (answer.signIn !== "expired") usageFailed.set(key, { at: Date.now(), value: answer })
+            throw answer
           }
-          return {
-            ...result,
-            // The card's name: the phone when the record has one, else what
-            // the account is called (an older record has no phone).
-            user: a.cardName || a.accountId || a.name || a.uid,
-            signIn: didRenew ? "renewed" : "kept",
-          }
-        } catch (e) {
-          return {
-            error: e?.message ?? String(e),
-            signIn: e?.signIn === "expired" ? "expired" : "kept",
-          }
-        }
+        })()
+          .catch((answer) => answer)
+          .finally(() => usageInFlight.delete(key))
+        usageInFlight.set(key, read)
+        return read
       },
       async checkin(getAuth) {
         const auth = await getAuth()
@@ -1314,6 +1476,12 @@ const raccoonBase = async ({ client }) => {
           })
         } catch (e) {
           return { outcome: "failed", message: e?.message ?? String(e) }
+        } finally {
+          // A check-in moves the balance this account's kept reading was taken
+          // from, and whoever pressed 签到 is about to look at that card: drop
+          // the reading rather than serve three minutes of the old one.
+          usageCache.delete(accountKeyOf(auth))
+          usageFailed.delete(accountKeyOf(auth))
         }
       },
       methods: [
@@ -1370,6 +1538,7 @@ export const _internal = {
   parseCallbackInput,
   rewriteSseModel,
   beijingTodayKey,
+  nextBeijingMidnight,
   billKey,
   popupGrantPoints,
   popupGrantReported,
@@ -1381,4 +1550,11 @@ export const _internal = {
   userAgent,
   renewed,
   renewing,
+  usageCache,
+  usageInFlight,
+  usageFailed,
+  entitlementCache,
+  billsCache,
+  billsHealedAt,
+  accountKeyOf,
 }

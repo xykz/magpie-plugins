@@ -372,6 +372,67 @@ for every model discovered live and only the hard-coded `STATIC_MODELS` numbers
 ever showed. `Buddy2api`'s `capacity_fields()` is a fourth independent reading of
 the same names. Fixed, with the fake serving the catalogue's real spelling.
 
+## `raccoon` and `loomy`: how often the vendor's non-chat endpoints are read
+
+magpie polls a plugin account's allowance on clocks it owns, and none of them
+is a user's click. In `internal/provider/routing.go` (`Allowances`) an account
+in a group with chat traffic is re-read once a minute per agent; the tray reads
+every `TrayUsageEvery` minutes (`internal/settings/settings.go`, default 3);
+the Usage page reads while it is open; and `internal/provider/checkin.go` wakes
+every minute, re-asking the day's check-in every 30 minutes
+(`wbCheckinEvery`) for as long as the account's answer does not say when it
+stops being true. A hook is handed no sign of which of those asked
+(`infoOf`, `internal/plugin/host.js`: id, name, source, env, options, npm,
+api, … — no "why"), so the only lever a plugin has is to answer once for
+several asks.
+
+That lever has a floor, which is why these numbers are what they are:
+magpie's own host already caches a reading for a minute
+(`cachedLoginReading`, `internal/provider/login_usage.go`), so any plugin TTL
+at or below 60s cuts nothing. And because the host's cache sits in front of the
+plugin, `refreshCards`/`forgetLoginReading` cannot reach through it — a user's
+刷新 can be answered from the plugin's reading. Three minutes was chosen as the
+shortest TTL that is a real cut and still short enough that a hand-pressed
+refresh is not visibly stale.
+
+- **`raccoon`**: `auth.usage` answers from one reading for
+  `RACCOON_USAGE_TTL_MS` (default 180000), single-flighted per account, with a
+  30-second negative cache so an endpoint answering 500 is not pressed every
+  pass — a lapse (`signIn: "expired"`) is never cached. Inside that reading the
+  two per-endpoint costs are cached separately because they move on different
+  clocks: `RACCOON_ENTITLEMENT_TTL_MS` (default 6h, the plan changes a few
+  times a year) and `RACCOON_BILLS_TTL_MS` (default 10min), while the balance is
+  read every time. Because the balance is fresh and the ledger is not, a grant
+  that lands mid-window shows up as `grantedFromBills < avail`; that answer is
+  re-read once per bills TTL (`billsHealedAt`) rather than reported as a
+  negative `used`. Caches are keyed by account, not by access token, so a
+  renewal does not buy a second read. A check-in clears the account's reading,
+  so the press is answered by what it just claimed.
+- **`loomy`**: `auth.usage` the same way (`LOOMY_USAGE_TTL_MS`, default
+  180000), and `provider.models` answers from one `GET /api/v1/models` for
+  `LOOMY_MODELS_TTL_MS` (default 600000), keyed by base URL plus account (the
+  endpoint is asked with the account's token, and nothing establishes that two
+  accounts see the same list). A failed catalogue read is not remembered: the
+  static table still answers and the next ask tries again.
+- **both, check-in `until`**: a check-in answer now carries `until`, the next
+  Beijing midnight, on every non-failed outcome (`claimed` and `done` alike;
+  never on `failed`). The host parses it into `ValidUntil`
+  (`internal/provider/plugin_checkin.go`) and `settled()`
+  (`internal/provider/workbuddy_checkin.go`) then holds the answer until it —
+  which is what suppresses the every-30-minutes re-ask, a rule that only
+  applies while `ValidUntil.IsZero()` (`checkin.go`). A user pressing 签到 still
+  re-asks (`if soon && prev.unclaimedAnswer() { settled = false }`), so this
+  costs nothing. `raccoon`'s `done` is "nothing new in the bills yet", not
+  "the vendor has not paid" — the ledger lags the grant — so it says when to
+  ask again too. `loomy`'s check-in still reads the daily balance before and
+  after the `first-login` POST: that pair is the only claimed-vs-done verdict
+  the endpoint allows.
+
+What this does not change: the chat path, any hook's answer shape, and every
+read a user's own action makes necessary. `RACCOON_*_TTL_MS` /
+`LOOMY_*_TTL_MS` set to `0` turns the corresponding cache off, which is what
+the tests use.
+
 ## `helper/`: carrying sign-ins in from other tools
 
 Both scripts read another tool's store and write magpie's
@@ -453,6 +514,42 @@ later) and both take `--dry-run` and `--install`.
   转写成 magpie 的 `plugin-auth.json`，账号原样搬过来，不用重新登录、不碰
   厂商接口。两者都零依赖（`node:sqlite`、`node:crypto`，Node 22.5 起），
   都支持 `--dry-run` 与 `--install`。
+- **`raccoon` / `loomy` 非对话接口的读取频率**：magpie 按自己的时钟轮询插件
+  账号的额度，没有一次是用户点的——分组里有对话流量时 `Allowances`
+  （`internal/provider/routing.go`）每分钟对每个 agent 重读一次，托盘每
+  `TrayUsageEvery` 分钟（`internal/settings/settings.go`，默认 3），Usage 页
+  开着时一直读，`internal/provider/checkin.go` 每分钟醒来、对「没说答案何时
+  失效」的账号每 30 分钟重问一次签到。hook 拿不到「是谁问的」（`infoOf`
+  只给 id/name/source/env/options/npm/api…），插件唯一能用的杠杆是一次读数
+  回答多次询问。这个杠杆有下限：宿主自己已经按账号缓存一分钟
+  （`cachedLoginReading`，`internal/provider/login_usage.go`），所以插件 TTL
+  ≤60s 等于没省；而宿主缓存挡在插件前面，`refreshCards` /
+  `forgetLoginReading` 穿不过去，用户按刷新可能被插件读数回答。取 180 秒是
+  「确实省下」与「手按刷新不至于明显过期」之间最短的一档。
+  `raccoon`：`auth.usage` 一次读数回答 `RACCOON_USAGE_TTL_MS`（默认 180000）
+  内的所有调用，按账号单飞，失败读数另存 30 秒（登录失效从不缓存）；读数内部
+  再按两端点各自的节奏分缓存——`RACCOON_ENTITLEMENT_TTL_MS`（默认 6 小时，
+  套餐一年才变几次）、`RACCOON_BILLS_TTL_MS`（默认 10 分钟），余额每次都读。
+  由于余额新鲜而流水不新鲜，窗口内到账的发放会表现为
+  `grantedFromBills < avail`，这种答案按流水 TTL 重读一次（`billsHealedAt`），
+  而不是报成负的 `used`。缓存按账号而不是 token 存，续期不会换来第二次读数；
+  签到会清掉该账号的读数，按下之后看到的就是刚领到的数。
+  `loomy`：`auth.usage` 同样（`LOOMY_USAGE_TTL_MS`，默认 180000）；
+  `provider.models` 一次 `GET /api/v1/models` 回答
+  `LOOMY_MODELS_TTL_MS`（默认 600000）——目录是应用的不是账号的，所以按 base
+  存。失败的目录读取不缓存：静态表照样回答，下一次再问。
+  两者的签到回答都带 `until`（下一个北京时间零点），`claimed` 与 `done` 都带，
+  `failed` 不带。宿主把它解析成 `ValidUntil`
+  （`internal/provider/plugin_checkin.go`），`settled()`
+  （`internal/provider/workbuddy_checkin.go`）于是把答案扣到那一刻——这正是
+  每 30 分钟重问的抑制条件，而该规则只在 `ValidUntil.IsZero()` 时生效
+  （`checkin.go`）。用户按「签到」仍会重问
+  （`if soon && prev.unclaimedAnswer() { settled = false }`），所以不吃亏。
+  `raccoon` 的 `done` 是「流水里还没有新发放」而不是「厂商没发」（流水滞后于
+  发放），所以它也说明何时再问；`loomy` 的签到仍要在 `first-login` 前后各读
+  一次每日余额——这对读数是该端点唯一能给出的 claimed/done 判据。
+  把对应的 `RACCOON_*_TTL_MS` / `LOOMY_*_TTL_MS` 设为 `0` 即关闭该缓存
+  （测试就是这么用的）。
 - **`loomy` 的密码登录与自动续登**：Loomy 没有 refresh token，session 只有
   14 天，唯一能续期的凭据是账号密码，所以本 fork 加了第三种登录方式
   「账号密码登录（Password sign-in）」，并用它让密码账号无人值守地活下去。
