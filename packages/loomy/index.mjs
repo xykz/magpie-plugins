@@ -570,15 +570,59 @@ export async function LoomyAuthPlugin({ client } = {}) {
           // a prepaid wallet knows what is left and no share of what (#3950)
           const permanentWallet = permanent != null ? { name: "永久积分", balance: permanent, unit: "credits" } : null
           // magpie weighs an account by the windows it does not set aside
-          // (`routing.go`: `if w.Aside || w.Text { continue }`), and one with
-          // none of those reads 剩余额度未知 on the Routing page. So exactly
-          // one window has to stay un-aside: the wallet while it holds
-          // credits, the grant only when the wallet is empty — a lone
-          // balance of 0 is read as used up, and a spent day must not bench
-          // an account its wallet still pays for
-          const walletCarries = permanentWallet != null && (permanent > 0 || dailyWallet == null)
-          if (dailyWallet && walletCarries) dailyWallet.aside = true
-          if (permanentWallet && !walletCarries) permanentWallet.aside = true
+          // (`routing.go`: `if w.Aside || w.Text { continue }`), and an
+          // account with none of those reads 剩余额度未知 on the Routing page.
+          //
+          // The day's grant carries always: its share (`used`, 0–100) is the
+          // only reading magpie can order an account by, and it is what expires
+          // at Beijing midnight. The wallet carries only once the day is gone,
+          // because until then nothing may rank by it: a wallet has no share and
+          // no expiry, so the one thing magpie can order wallets by is the most
+          // left (#3950, `byLeft`) — and since permanent points differ per
+          // account, weighing them early parks the pool on whichever account
+          // holds the most, while the 5000 a day that nobody spent expires at
+          // midnight.
+          //
+          // Once the day is gone the wallet joins *without* the grant stepping
+          // aside, and that is what keeps the order the pool's rather than this
+          // account's. The share stays at 100, which files the account in the
+          // used-up tier (`tier`, routes/strategies.go): behind every account
+          // whose day still has something in it, whatever its wallet holds. And
+          // the balance is read beside the share (`Allowance.For` takes the max
+          // share, `Allowance.Left` the min balance, each window on its own), so
+          // among the accounts whose days are all gone `usage` breaks the tie by
+          // the wallet — the balance with the most left first (LeastUsed, after
+          // the share). Under `smart` and `pace` the used-up tier is ordered by
+          // the share alone, so the balance decides nothing there: it never
+          // outranks a day still in hand, which is the point, but ranking the
+          // spent accounts by their wallets takes `usage`.
+          //
+          // Had the grant stepped aside instead, the account would read as one
+          // with no share at all — `usage` keeps those ahead of a share nearly
+          // gone and `smart` files them as fresh — so a wallet-heavy account
+          // would jump ahead of one still holding 10% of its day.
+          //
+          // A day's last point is the mark, not magpie's own 98%: those two
+          // points still pay, so they are still spent first.
+          //
+          // No limit/remaining pair means no share at all, so there is nothing
+          // to rank the account by: the wallet carries as it did before, and a
+          // lone balance of 0 steps aside rather than read as used up.
+          if (pairPresent) {
+            // the wallet weighs only behind a day already gone, and never one
+            // with nothing in it: a lone `balance: 0` reads as used up
+            if (permanentWallet && (dailyRemaining > 0 || permanent <= 0)) permanentWallet.aside = true
+          } else if (dailyWallet && daily != null && daily > 0) {
+            // no share to rank by, so a balance is all there is: the day's own
+            // figure carries, since that is what expires
+            if (permanentWallet) permanentWallet.aside = true
+          } else if (permanentWallet) {
+            // the day's figure is spent or unknown: the wallet carries while it
+            // holds something (a lone balance of 0 is read as used up, and a
+            // spent day must not bench an account its wallet still pays for)
+            if (dailyWallet) dailyWallet.aside = true
+            if (permanent <= 0) permanentWallet.aside = true
+          }
           const windows = [dailyWallet, permanentWallet].filter(Boolean)
           // no `signIn` on a clean read: that absence is how magpie takes an
           // expired mark back off the account (a "kept" here would leave a
