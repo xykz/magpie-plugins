@@ -12,12 +12,12 @@ import {
   VISION_MEASURED,
   _internal,
   claimMobileGrant,
+  dispatchThinking,
   extendRaccoon,
   healConflict,
   isConflict,
   liftMaxTokens,
   makeRefreshOnce,
-  patchThinking,
   stillUsable,
   triageCheckin,
   visionOf,
@@ -168,41 +168,105 @@ test("the live catalog's capabilities follow the measurement too", async () => {
 
 // ---- body fixes -------------------------------------------------------------
 
-test("thinking lands in extra_body where the vendor reads it", () => {
-  const a = { thinking: "enabled" }
-  expect(patchThinking(a)).toBe(true)
+test("a deepseek or doubao model gets thinking in extra_body, where it reads it", () => {
+  const a = { model: "sn-deepseek-v4-1-flash", thinking: "enabled" }
+  expect(dispatchThinking(a)).toBe(true)
   expect(a.extra_body.thinking.type).toBe("enabled")
+  expect(a.reasoning_effort).toBeUndefined()
 
-  const b = { thinking: { type: "disabled" } }
-  expect(patchThinking(b)).toBe(true)
+  const b = { model: "doubao-seed-1-6", thinking: { type: "disabled" } }
+  expect(dispatchThinking(b)).toBe(true)
   expect(b.extra_body.thinking.type).toBe("disabled")
-
-  const c = { extra_body: { thinking: "off" } }
-  expect(patchThinking(c)).toBe(true)
-  expect(c.extra_body.thinking.type).toBe("disabled")
 })
 
-test("a reasoning effort becomes a thinking switch and none means off", () => {
-  const a = { reasoning_effort: "high" }
-  expect(patchThinking(a)).toBe(true)
-  expect(a.extra_body.thinking.type).toBe("enabled")
+test("qwen is told enable_thinking, not thinking.type", () => {
+  // the vendor puts {'enable_thinking': bool} in params['extra_body'], and the
+  // SDK folds that container flat — so unlike deepseek (which the vendor wraps
+  // one deeper) this arrives as a top-level field
+  const a = { model: "qwen3-max", thinking: "enabled" }
+  expect(dispatchThinking(a)).toBe(true)
+  expect(a.enable_thinking).toBe(true)
+  expect(a.extra_body).toBeUndefined()
 
-  const b = { reasoning_effort: "none" }
-  expect(patchThinking(b)).toBe(true)
-  expect(b.extra_body.thinking.type).toBe("disabled")
+  const b = { model: "qwen3-max", reasoning_effort: "none" }
+  expect(dispatchThinking(b)).toBe(true)
+  expect(b.enable_thinking).toBe(false)
+})
 
-  const c = { reasoning_effort: "minimal" }
-  expect(patchThinking(c)).toBe(true)
-  expect(c.extra_body.thinking.type).toBe("disabled")
+test("kimi and glm take a reasoning effort, and off is low rather than none", () => {
+  const a = { model: "sn-kimi-k3", thinking: "enabled" }
+  expect(dispatchThinking(a)).toBe(true)
+  expect(a.reasoning_effort).toBe("high")
+
+  const b = { model: "sn-kimi-k3", thinking: "disabled" }
+  expect(dispatchThinking(b)).toBe(true)
+  expect(b.reasoning_effort).toBe("low")
+
+  const c = { model: "sn-glm-5-3", extra_body: { thinking: "off" } }
+  expect(dispatchThinking(c)).toBe(true)
+  expect(c.reasoning_effort).toBe("low")
+  expect(c.extra_body).toBeUndefined()
+})
+
+test("a reasoning effort on a plain model becomes high, not a thinking switch", () => {
+  const a = { model: "raccoon-chat-ml-5-5", reasoning_effort: "high" }
+  expect(dispatchThinking(a)).toBe(true)
+  expect(a.reasoning_effort).toBe("high")
+  expect(a.extra_body).toBeUndefined()
+})
+
+test("the gemini pair that rejects off is never told off", () => {
+  const a = { model: "gemini-2.5-pro", thinking: "disabled" }
+  expect(dispatchThinking(a)).toBe(true)
+  expect(a.reasoning_effort).toBeUndefined()
+
+  const b = { model: "gemini-2.5-pro", thinking: "enabled" }
+  expect(dispatchThinking(b)).toBe(true)
+  expect(b.reasoning_effort).toBe("high")
+
+  const c = { model: "gemini-3-pro", thinking: "disabled" }
+  expect(dispatchThinking(c)).toBe(true)
+  expect(c.reasoning_effort).toBe("none")
+})
+
+test("a gpt-6 with function tools is told none however thinking was set", () => {
+  const a = { model: "gpt-6-sol", thinking: "enabled", tools: [{ type: "function" }] }
+  expect(dispatchThinking(a)).toBe(true)
+  expect(a.reasoning_effort).toBe("none")
+
+  const b = { model: "gpt-6-sol", thinking: "enabled", tools: [{ type: "web_search" }] }
+  expect(dispatchThinking(b)).toBe(true)
+  expect(b.reasoning_effort).toBe("high")
+})
+
+test("sensenova defaults to none except the one measured low model", () => {
+  const a = { model: "sn-sensenova-6-8-flash-lite", thinking: "disabled" }
+  expect(dispatchThinking(a)).toBe(true)
+  expect(a.reasoning_effort).toBe("none")
+
+  const b = { model: "sensenova-flash-lite-20260727-v39-fp8-step4k-dpov2-mtp", thinking: "disabled" }
+  expect(dispatchThinking(b)).toBe(true)
+  expect(b.reasoning_effort).toBe("low")
+})
+
+test("a body carrying both shapes ends with one, whichever the model reads", () => {
+  const body = {
+    model: "sn-deepseek-v4-1-flash",
+    extra_body: { thinking: { type: "enabled" } },
+    reasoning_effort: "high",
+  }
+  expect(dispatchThinking(body)).toBe(true)
+  expect(body.reasoning_effort).toBeUndefined()
+  expect(body.extra_body.thinking.type).toBe("enabled")
 })
 
 test("a body that says nothing about thinking is left untouched", () => {
   const body = { model: "sn-kimi-k3", messages: [] }
-  expect(patchThinking(body)).toBe(false)
+  expect(dispatchThinking(body)).toBe(false)
   expect(body.extra_body).toBeUndefined()
 
-  const odd = { thinking: "banana" }
-  expect(patchThinking(odd)).toBe(false)
+  const odd = { model: "sn-kimi-k3", thinking: "banana" }
+  expect(dispatchThinking(odd)).toBe(false)
   expect(odd.extra_body).toBeUndefined()
 })
 
@@ -240,11 +304,30 @@ test("the loader hands the patched body to the vendor", async () => {
   const made = await out.auth.loader(async () => ({}))
   const res = await made.fetch("/chat/completions", {
     method: "POST",
-    body: JSON.stringify({ model: "sn-kimi-k3", max_tokens: 128, thinking: "enabled" }),
+    body: JSON.stringify({ model: "sn-deepseek-v4-1-flash", max_tokens: 128, thinking: "enabled" }),
   })
   const seen = JSON.parse(await res.text())
   expect(seen.max_tokens).toBe(MIN_OUTPUT_TOKENS)
   expect(seen.extra_body.thinking.type).toBe("enabled")
+})
+
+test("the loader gives a kimi body an effort, not a thinking switch", async () => {
+  const plugin = {
+    auth: {
+      loader: async () => ({
+        fetch: async (_input, init) => new Response(init.body, { status: 200 }),
+      }),
+    },
+  }
+  const out = extendRaccoon(plugin, {})
+  const made = await out.auth.loader(async () => ({}))
+  const res = await made.fetch("/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ model: "sn-kimi-k3", max_tokens: 100_000, thinking: "enabled" }),
+  })
+  const seen = JSON.parse(await res.text())
+  expect(seen.reasoning_effort).toBe("high")
+  expect(seen.extra_body).toBeUndefined()
 })
 
 test("a non-JSON body reaches the vendor untouched", async () => {
