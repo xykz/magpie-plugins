@@ -1,0 +1,228 @@
+{
+  "chatUrl": "https://xiaohuanxiong.com/api/web/llm/v2/chat/completions",
+  "headers": {
+    "agent": {
+      "X-RACCOON-Call-Kind": "chat",
+      "X-RACCOON-Session-ID": "00000000-0000-4000-8000-000000000000",
+      "X-RACCOON-Title": "a title",
+      "X-RACCOON-Turn-ID": "00000000-0000-4000-8000-000000000000"
+    },
+    "clientInfo": {
+      "linux-arm64": {
+        "x-client-channel": "official",
+        "x-client-name": "@raccoon/office-desktop",
+        "x-client-os-version": "6.8.0",
+        "x-client-platform": "desktop-linux-arm64",
+        "x-client-version": "v1.1.5"
+      },
+      "linux-x64": {
+        "x-client-channel": "official",
+        "x-client-name": "@raccoon/office-desktop",
+        "x-client-os-version": "6.8.0",
+        "x-client-platform": "desktop-linux-x64",
+        "x-client-version": "v1.1.5"
+      },
+      "macos-arm64": {
+        "x-client-channel": "official",
+        "x-client-name": "@raccoon/office-desktop",
+        "x-client-os-version": "25.2.0",
+        "x-client-platform": "desktop-macos-arm64",
+        "x-client-version": "v1.1.5"
+      },
+      "macos-x64": {
+        "x-client-channel": "official",
+        "x-client-name": "@raccoon/office-desktop",
+        "x-client-os-version": "25.2.0",
+        "x-client-platform": "desktop-macos-x64",
+        "x-client-version": "v1.1.5"
+      },
+      "windows-arm64": {
+        "x-client-channel": "official",
+        "x-client-name": "@raccoon/office-desktop",
+        "x-client-os-version": "10.0.22631",
+        "x-client-platform": "desktop-windows-arm64",
+        "x-client-version": "v1.1.5"
+      },
+      "windows-x64": {
+        "x-client-channel": "official",
+        "x-client-name": "@raccoon/office-desktop",
+        "x-client-os-version": "10.0.22631",
+        "x-client-platform": "desktop-windows-x64",
+        "x-client-version": "v1.1.5"
+      }
+    },
+    "stainless": {
+      "linux-arm64": {
+        "X-Stainless-Arch": "arm64",
+        "X-Stainless-Lang": "python",
+        "X-Stainless-OS": "Linux",
+        "X-Stainless-Package-Version": "2.8.0",
+        "X-Stainless-Runtime": "CPython",
+        "X-Stainless-Runtime-Version": "3.12.13"
+      },
+      "linux-x64": {
+        "X-Stainless-Arch": "x64",
+        "X-Stainless-Lang": "python",
+        "X-Stainless-OS": "Linux",
+        "X-Stainless-Package-Version": "2.8.0",
+        "X-Stainless-Runtime": "CPython",
+        "X-Stainless-Runtime-Version": "3.12.13"
+      },
+      "macos-arm64": {
+        "X-Stainless-Arch": "arm64",
+        "X-Stainless-Lang": "python",
+        "X-Stainless-OS": "MacOS",
+        "X-Stainless-Package-Version": "2.8.0",
+        "X-Stainless-Runtime": "CPython",
+        "X-Stainless-Runtime-Version": "3.12.13"
+      },
+      "macos-x64": {
+        "X-Stainless-Arch": "x64",
+        "X-Stainless-Lang": "python",
+        "X-Stainless-OS": "MacOS",
+        "X-Stainless-Package-Version": "2.8.0",
+        "X-Stainless-Runtime": "CPython",
+        "X-Stainless-Runtime-Version": "3.12.13"
+      },
+      "windows-arm64": {
+        "X-Stainless-Arch": "arm64",
+        "X-Stainless-Lang": "python",
+        "X-Stainless-OS": "Windows",
+        "X-Stainless-Package-Version": "2.8.0",
+        "X-Stainless-Runtime": "CPython",
+        "X-Stainless-Runtime-Version": "3.12.13"
+      },
+      "windows-x64": {
+        "X-Stainless-Arch": "other:amd64",
+        "X-Stainless-Lang": "python",
+        "X-Stainless-OS": "Windows",
+        "X-Stainless-Package-Version": "2.8.0",
+        "X-Stainless-Runtime": "CPython",
+        "X-Stainless-Runtime-Version": "3.12.13"
+      }
+    }
+  },
+  "schema": 1,
+  "source": {
+    "appVersion": "1.1.5",
+    "bundledPython": "3.12.13",
+    "clientName": "@raccoon/office-desktop",
+    "extractorPython": "3.12.15",
+    "openaiSdk": "2.8.0",
+    "appName": "@raccoon/office-desktop",
+    "runtimeVersion": "1.0.0",
+    "pylib": "python312.dll",
+    "zipSha256": "b4f8548fb293f2a453141296ac9204783c4fd1952fabebdd386ddd7d16ee323a",
+    "zip": ".sandbox/xhx.zip"
+  },
+  "thinking": {
+    "doubao-seed-1-6": {
+      "off": {
+        "extra_body": {
+          "thinking": {
+            "type": "disabled"
+          }
+        }
+      },
+      "on": {
+        "extra_body": {
+          "thinking": {
+            "type": "enabled"
+          }
+        }
+      }
+    },
+    "gemini-2.5-pro": {
+      "off": {},
+      "on": {
+        "reasoning_effort": "high"
+      }
+    },
+    "gemini-3-pro": {
+      "off": {
+        "reasoning_effort": "none"
+      },
+      "on": {
+        "reasoning_effort": "high"
+      }
+    },
+    "gpt-6-sol": {
+      "off": {},
+      "on": {
+        "reasoning_effort": "high"
+      }
+    },
+    "gpt-6-sol|tools": {
+      "on": {
+        "reasoning_effort": "none"
+      }
+    },
+    "qwen3-max": {
+      "off": {
+        "enable_thinking": false
+      },
+      "on": {
+        "enable_thinking": true
+      }
+    },
+    "sensenova-flash-lite-20260727-v39-fp8-step4k-dpov2-mtp": {
+      "off": {
+        "reasoning_effort": "low"
+      },
+      "on": {
+        "reasoning_effort": "high"
+      }
+    },
+    "sn-deepseek-v4-1-flash": {
+      "off": {
+        "extra_body": {
+          "thinking": {
+            "type": "disabled"
+          }
+        }
+      },
+      "on": {
+        "extra_body": {
+          "thinking": {
+            "type": "enabled"
+          }
+        }
+      }
+    },
+    "sn-glm-5-3": {
+      "off": {
+        "reasoning_effort": "low"
+      },
+      "on": {
+        "reasoning_effort": "high"
+      }
+    },
+    "sn-kimi-k3": {
+      "off": {
+        "reasoning_effort": "low"
+      },
+      "on": {
+        "reasoning_effort": "high"
+      }
+    },
+    "sn-sensenova-6-8-flash-lite": {
+      "off": {
+        "reasoning_effort": "none"
+      },
+      "on": {
+        "reasoning_effort": "high"
+      }
+    },
+    "unmatched-model": {
+      "off": {},
+      "on": {
+        "reasoning_effort": "high"
+      }
+    }
+  },
+  "_provenance": {
+    "generator": "helper/raccoon-vendor-fixture.mjs",
+    "extractor": "helper/raccoon-vendor-fixture.py",
+    "runs": "the app's own bytecode: openai._base_client.platform_headers, box_agent.client_info.ClientInfo.headers_for_url, box_agent.llm.base._agent_headers, box_agent.llm.openai_client._apply_thinking_params"
+  }
+}

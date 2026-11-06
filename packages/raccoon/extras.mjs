@@ -12,8 +12,32 @@
 //     desktop one)
 //   - check-in triage: a brand-new account is ineligible, not "already done"
 //   - the vision whitelist the catalog's tags get wrong in both directions
-//   - thinking in extra_body, and max_tokens lifted before the request leaves
+//   - thinking, in the shape the desktop app sends it for each model family
+//   - the app's own headers, and max_tokens lifted before the request leaves
 //   - the wrapper that wires all of it into the finished plugin
+
+import {
+  addStreamOptions,
+  conversationSessionId,
+  dispatchThinking,
+  effortToThinking,
+  normalizeThinking,
+  readOrgCode,
+  thinkingLevelOf,
+  wireHeaders,
+} from "./vendor-wire.mjs"
+
+// re-exported so callers and tests reach the request shape through one module
+export {
+  addStreamOptions,
+  conversationSessionId,
+  dispatchThinking,
+  effortToThinking,
+  normalizeThinking,
+  readOrgCode,
+  thinkingLevelOf,
+  wireHeaders,
+}
 
 const MOBILE_GRANT_PATH = "/api/web/mobile/v1/login/points/grant"
 
@@ -60,61 +84,37 @@ export const FALLBACK_IMAGES_FIX = {
 
 // ── request body fixes ─────────────────────────────────────────────────────
 
-// Raccoon reads `thinking` only from extra_body (modelmux upstream.ts:318-395
-// and PROTOCOL.md 3.1: "thinking must live in extra_body.thinking.type; not
-// passing it means enabled"). A body that carries the level anywhere the
-// agent might have put it is rewritten in place.
-export function patchThinking(body) {
-  if (!body || typeof body !== "object") return false
-  const level = thinkingLevelOf(body)
-  if (!level) return false
-  body.extra_body ??= {}
-  if (typeof body.extra_body !== "object") return false
-  body.extra_body.thinking = { ...(body.extra_body.thinking ?? {}), type: level }
-  return true
-}
-
-function thinkingLevelOf(body) {
-  const direct = body.thinking
-  if (typeof direct === "string") return normalizeThinking(direct)
-  if (direct && typeof direct === "object" && typeof direct.type === "string") return normalizeThinking(direct.type)
-  if (body.extra_body && typeof body.extra_body === "object") {
-    const nested = body.extra_body.thinking
-    if (typeof nested === "string") return normalizeThinking(nested)
-    if (nested && typeof nested.type === "string") return normalizeThinking(nested.type)
-  }
-  if (typeof body.reasoning_effort === "string") return effortToThinking(body.reasoning_effort)
-  return ""
-}
-
-function normalizeThinking(value) {
-  const v = String(value).trim().toLowerCase()
-  if (v === "enabled" || v === "enable" || v === "on" || v === "true") return "enabled"
-  if (v === "disabled" || v === "disable" || v === "off" || v === "false" || v === "none") return "disabled"
-  return ""
-}
-
-function effortToThinking(effort) {
-  const v = String(effort).trim().toLowerCase()
-  if (v === "none" || v === "off" || v === "minimal") return "disabled"
-  return "enabled"
-}
+// Thinking used to be rewritten here as one rule for every model: read the
+// level off the body and write it to extra_body.thinking.type. The app does
+// not do that — it decides by model family, and only deepseek and doubao read
+// `thinking` at all (box_agent/llm/openai_client.py:127). The rewrite now
+// lives in vendor-wire.mjs with the rest of the app's request shape, and this
+// loader calls it.
 
 // Thinking tokens are billed inside max_tokens, and the catalog's reasoning
 // flag is not reliable enough to decide per model, so the floor goes on for
 // everyone (rsfree internal/upstream/bodyfix.go:5-15). 16 or 512 came back
 // empty with finish_reason=length (its AGENTS.md:46).
+// The three names a reply length is asked for under. `/chat/completions`
+// callers send the first two; a caller speaking the Responses API sends the
+// third, and it was the one this floor used to miss — the request went out at
+// 16 tokens and came back empty with finish_reason=length, which is the
+// failure the floor exists to prevent. All three are lifted when present.
+export const OUTPUT_LENGTH_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+
 export const MIN_OUTPUT_TOKENS = 2048
 
 export function liftMaxTokens(body, floor = MIN_OUTPUT_TOKENS) {
   if (!body || typeof body !== "object") return false
-  const field = "max_tokens" in body ? "max_tokens" : "max_completion_tokens" in body ? "max_completion_tokens" : null
-  if (!field) return false
-  const now = Number(body[field])
-  if (!Number.isFinite(now)) return false
-  if (now >= floor) return false
-  body[field] = floor
-  return true
+  let touched = false
+  for (const field of OUTPUT_LENGTH_FIELDS) {
+    if (!(field in body)) continue
+    const now = Number(body[field])
+    if (!Number.isFinite(now) || now >= floor) continue
+    body[field] = floor
+    touched = true
+  }
+  return touched
 }
 
 // ── refresh_conflict (200822) self-healing ─────────────────────────────────
@@ -256,6 +256,14 @@ export async function claimMobileGrant(token, opts = {}) {
 
 // ── the wrapper ────────────────────────────────────────────────────────────
 
+// The URL a chat fetch is aimed at, whichever way it was given: the plugin's
+// own loader calls fetch(url, init) and magpie's SDK path passes a Request.
+function urlOf(input) {
+  if (typeof input === "string") return input
+  if (input && typeof input === "object" && typeof input.url === "string") return input.url
+  return ""
+}
+
 // Wraps the plugin the base file builds. Everything the base file does stays
 // exactly as it is; what changes is what the host sees on the way in and out.
 export function extendRaccoon(plugin, deps = {}) {
@@ -299,7 +307,7 @@ export function extendRaccoon(plugin, deps = {}) {
     }
   }
 
-  // the loader: thinking and max_tokens on the way in
+  // the loader: the app's headers, thinking, and max_tokens on the way in
   if (typeof auth.loader === "function") {
     const baseLoader = auth.loader
     auth.loader = async (getAuth) => {
@@ -307,17 +315,39 @@ export function extendRaccoon(plugin, deps = {}) {
       if (!made || typeof made.fetch !== "function") return made
       return {
         ...made,
-        fetch(input, init = {}) {
+        async fetch(input, init = {}) {
+          let parsed = null
           if (typeof init?.body === "string") {
             try {
-              const parsed = JSON.parse(init.body)
+              parsed = JSON.parse(init.body)
               let touched = false
-              if (patchThinking(parsed)) touched = true
+              if (dispatchThinking(parsed)) touched = true
               if (liftMaxTokens(parsed)) touched = true
+              if (addStreamOptions(parsed)) touched = true
               if (touched) init = { ...init, body: JSON.stringify(parsed) }
-            } catch {}
+            } catch {
+              parsed = null
+            }
           }
-          return made.fetch(input, init)
+          // The headers go on last so that what the base loader set — the
+          // bearer token above all — is already there to be kept. X-Org-Code
+          // comes from the auth record's office_identity, when the host's
+          // record carries one: the app reads it from the desktop app's own
+          // auth.json (box_agent/auth.py:140), which this fork does not open
+          // here — a personal account sends no such header either way, and
+          // that is the common case.
+          let auth = null
+          try {
+            auth = await getAuth()
+          } catch {
+            auth = null
+          }
+          const headers = wireHeaders(init.headers, {
+            url: urlOf(input),
+            body: parsed,
+            orgCode: readOrgCode(auth),
+          })
+          return made.fetch(input, { ...init, headers })
         },
       }
     }
@@ -449,5 +479,10 @@ export const _internal = {
   thinkingLevelOf,
   normalizeThinking,
   effortToThinking,
+  dispatchThinking,
+  addStreamOptions,
+  conversationSessionId,
+  readOrgCode,
+  wireHeaders,
   desktopMobileSettled,
 }

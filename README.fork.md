@@ -98,6 +98,70 @@ The one thing it does not change is the version it reports of itself:
 no published version of this package to compare it with and the fork doesn't
 rename it.
 
+## `raccoon`: the rest of the app's request
+
+The User-Agent was the first half of a larger difference. The desktop app's
+chat calls are not made by its JavaScript: the Electron build writes the config
+out and a bundled CPython sidecar (`resources/box-agent-runtime/`) makes the
+call with the `openai` 2.8.0 SDK over httpx. So the request is defined by
+Python code inside a PyInstaller archive, and the plugin had been guessing at
+it.
+
+What the app sends that the plugin did not, now in
+`packages/raccoon/vendor-wire.mjs`:
+
+- **`X-Stainless-*`**, six headers, one of which nobody guesses right: the
+  SDK's `platform_headers()` names `Windows`/`MacOS`/`Linux`, `CPython`,
+  `3.12.13` (the interpreter the app bundles) — and for arch, `other:amd64` on
+  a Windows x64 build, because `get_architecture()` maps `arm64`/`aarch64`,
+  `arm` and `x86_64` and nothing else, while `platform.machine()` on Windows
+  says `AMD64`. macOS and Linux name themselves normally.
+- **`x-client-*`**, five headers, from the `ClientInfo` the app hands its
+  sidecar over ACP: `@raccoon/office-desktop`, `official`, the app version as
+  `v1.1.5`, the OS version, and `desktop-windows-x64` — a second spelling of
+  the same machine, different from the SDK's next door. No device id is sent,
+  because the app has none. A version that is not exactly three numbers costs
+  that one header and nothing else; a non-ASCII name falls back to `raccoon`;
+  and none of the five goes to any host but `xiaohuanxiong.com`
+  (`RACCOON_CLIENT_HEADERS_HOSTS` adds hosts, for a relay).
+- **`X-RACCOON-Session-ID`/`-Turn-ID`/`-Title`/`-Call-Kind`**, the turn
+  headers. The plugin sees no session, so the session id is derived from the
+  conversation's first message — the same one on every turn of it, which is
+  what the app's own id does. `Call-Kind` is left off: the app's value comes
+  from its ACP caller, `box_agent` itself contains no `chat` literal, so
+  inventing one would be a guess — and an absent header is what the app sends
+  when its caller passes nothing.
+- **`X-Org-Code`**, from the auth record's `office_identity`: a team seat sends
+  it, a personal one sends nothing, which is why its absence is the usual case.
+- **`Accept-Encoding: gzip, deflate`**, httpx's own default, which Node's fetch
+  would otherwise replace with `br`/`zstd`.
+- **thinking, per model family.** This was the one real bug: the plugin wrote
+  `extra_body.thinking.type` for every model. Only deepseek and doubao read
+  that. qwen reads `enable_thinking`; kimi-k3 and the glm-5.3 pair take
+  `reasoning_effort` and treat *off* as `low`, not `none`; gemini and gpt-6
+  have models that must never be told "off" (`gemini-2.5-pro`,
+  `gemini-3.1-pro`); a gpt-6 given function tools is told `none` regardless;
+  and sensenova defaults to `none` except one measured model that defaults to
+  `low`. The plugin only sees what the agent asked for, so a body with no
+  thinking intent is left alone rather than given one.
+- **`stream_options: {include_usage: true}`** on every stream.
+
+Where these come from: not a reading of the app, but the app's own bytecode,
+executed. `helper/raccoon-vendor-fixture.mjs` unpacks the asar and the
+PyInstaller archive, and `helper/raccoon-vendor-fixture.py` runs
+`platform_headers`, `ClientInfo.headers_for_url`, `_agent_headers` and
+`_apply_thinking_params` out of it and prints what they return.
+`packages/raccoon/testdata/vendor-desktop-1.1.5.json` is that output, and
+`vendor-parity.test.mjs` pins the module against it. Regenerating needs
+CPython 3.12 and the app's zip, neither of which CI has, so the JSON is
+committed and `--check` is a local tool.
+
+What cannot be matched, and is listed as such in `KNOWN_DIVERGENCES`: `host`
+and `content-length` differ because a relay is not the app and the body is not
+byte-identical. `Connection: keep-alive` is set the way httpx sets it; whether
+a transport forwards a forbidden header is the transport's business (Bun does,
+Node's undici does not), so it is not listed as a divergence.
+
 ## `loomy`: password sign-in, and the session it keeps alive
 
 Loomy hands out no refresh token: a session lives 14 days and only signing in
@@ -202,6 +266,44 @@ later) and both take `--dry-run` and `--install`.
   `user-agent` 设置和 provider 的 headers 都到不了这里）。本插件按桌面端的
   做法，以 OpenAI SDK 的 `AsyncOpenAI/Python 2.8.0` 请求对话接口；环境变量
   `RACCOON_USER_AGENT` 可覆盖，设为空字符串则沿用 magpie 自己的。
+- **`raccoon` 请求的其余部分**：User-Agent 只是差异的一半。桌面端的对话请求
+  不是它的 JavaScript 发的——Electron 把配置写出去，由打包进应用的 CPython
+  侧车（`resources/box-agent-runtime/`）用 `openai` 2.8.0 SDK 经 httpx 发出。
+  也就是说请求形状由 PyInstaller 归档里的 Python 代码决定，而插件此前一直在
+  猜。现在这些实现在 `packages/raccoon/vendor-wire.mjs`：SDK 的六个
+  `X-Stainless-*`（其中架构一项没人猜得对——Windows x64 上 SDK 报
+  `other:amd64`，因为 `get_architecture()` 只映射 `arm64`/`aarch64`、`arm`、
+  `x86_64`，而 Windows 的 `platform.machine()` 说 `AMD64`）；五个
+  `x-client-*`（`@raccoon/office-desktop`、`official`、`v1.1.5`、系统版本、
+  `desktop-windows-x64`——同一台机器的第二种拼法，与紧邻的 SDK 不一样；不发
+  device id，因为应用没有；版本号不是严格三段式时只丢那一个头；非 ASCII 名字
+  回落 `raccoon`；且这些只发给 `xiaohuanxiong.com`，`RACCOON_CLIENT_HEADERS_HOSTS`
+  可为中继放行）；四个 `X-RACCOON-*` 轮次头（插件没有 session，会话 id 由对话
+  首条消息推导，同一对话每轮相同，与应用自己的 id 行为一致；`Call-Kind` 不发，
+  因为它的值来自应用的上游调用方，`box_agent` 里根本没有 `chat` 字面量，凭空
+  写一个就是猜，而调用方不传时应用也不发这个头）；`X-Org-Code`（取自 auth 记录
+  的 `office_identity`，团队席位发、个人席位不发，所以它缺席才是常态）；
+  `Accept-Encoding: gzip, deflate`（httpx 的默认值，Node 的 fetch 否则会换成
+  `br`/`zstd`）；**按模型分族的 thinking**——这是唯一一个真 bug：插件过去对所
+  有模型都写 `extra_body.thinking.type`，但只有 deepseek 和 doubao 读它；qwen
+  读 `enable_thinking`；kimi-k3 与 glm-5.3 那对收 `reasoning_effort`，且「关」
+  是 `low` 而不是 `none`；gemini 与 gpt-6 里有不能被告知「关」的模型
+  （`gemini-2.5-pro`、`gemini-3.1-pro`）；带 function 工具的 gpt-6 一律
+  `none`；sensenova 默认 `none`，只有一个实测模型默认 `low`。插件只看得到
+  agent 写在 body 里的意图，所以没有 thinking 意图的 body 原样放过，而不是替它
+  编一个；以及每个流式请求的 `stream_options: {include_usage: true}`。
+  这些值的来源不是读代码，而是跑应用自己的字节码：
+  `helper/raccoon-vendor-fixture.mjs` 解开 asar 与 PyInstaller 归档，
+  `helper/raccoon-vendor-fixture.py` 从里面执行 `platform_headers`、
+  `ClientInfo.headers_for_url`、`_agent_headers`、
+  `_apply_thinking_params` 并打印返回值，
+  `packages/raccoon/testdata/vendor-desktop-1.1.5.json` 就是那份输出，
+  `vendor-parity.test.mjs` 把模块钉在它上面。重新生成需要 CPython 3.12 与
+  应用的 zip，CI 两者都没有，所以 JSON 入库、`--check` 是本地工具。
+  无法对齐的两项记在 `KNOWN_DIVERGENCES`：`host` 与 `content-length` 不同，
+  因为中继不是应用、body 也不是逐字节相同；`Connection: keep-alive` 则按 httpx
+  的默认值照发，只是 fetch 会不会转发禁用头由传输层决定（Bun 会，Node 的
+  undici 不会），因此不算插件主动的偏差。
 - **`helper/` 里两个迁移脚本**：把 DurinDoor 的
   SQLite `providerConnections`、以及 xiaohuanxiong2api 的 `accounts.json`，
   转写成 magpie 的 `plugin-auth.json`，账号原样搬过来，不用重新登录、不碰

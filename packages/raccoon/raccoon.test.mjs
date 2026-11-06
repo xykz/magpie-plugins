@@ -32,6 +32,8 @@ afterEach(() => {
   delete process.env.RACCOON_BOX_AGENT_CONFIG_DIR
   _internal.renewed.clear()
   _internal.renewing.clear()
+  _internal.popupGrantReported.clear()
+  _internal.checkinInFlight.clear()
 })
 
 function startServer(routes) {
@@ -511,6 +513,44 @@ test("60s renewed cache persists tokens via save without calling /refresh twice"
   expect(refreshed?.access).toBe(freshTok)
   expect(refreshed?.refresh).toBe("RT-1")
   expect(savesB.at(-1)?.refresh).toBe("RT-1")
+})
+
+// A refresh token that answers for another account is the credential having
+// moved, not this seat's renewal: taking it would bill this seat to someone
+// else and show that account's credits (plugins #166). The old credential
+// stays exactly as it was — the seat is not marked expired either, because a
+// later attempt can still answer its own account.
+test("a renewal that answers another account does not overwrite the seat's credential", async () => {
+  const staleTok = fakeJwt({ iss: "74350b", name: "AccountA", exp: Math.floor(Date.now() / 1000) - 5 })
+  const otherTok = fakeJwt({ iss: "74350c", name: "AccountB", exp: Math.floor(Date.now() / 1000) + 3600 })
+  let refreshCalls = 0
+  startServer({
+    "POST /api/web/auth/v1/refresh": () => {
+      refreshCalls += 1
+      return Response.json({ code: 0, data: { access_token: otherTok, refresh_token: "X2" } })
+    },
+  })
+
+  const saves = []
+  const hooks = await RaccoonAuthPlugin({ client: { auth: { set: async ({ body }) => saves.push(body) } } })
+  const seat = {
+    type: "oauth",
+    access: staleTok,
+    refresh: "X1",
+    expires: Date.now() - 5000,
+    uid: "7615755",
+  }
+
+  let err = null
+  try {
+    await hooks.auth.refresh(seat)
+  } catch (e) {
+    err = e
+  }
+  expect(refreshCalls).toBe(1)
+  expect(err?.message).toContain("不同账号")
+  expect(err?.signIn).toBe("kept")
+  expect(saves).toEqual([])
 })
 
 test("loader refreshes on 401, strips x-api-key, rewrites split SSE stream, and passes 402 through", async () => {
@@ -1138,7 +1178,12 @@ test("checkin reports claimed onboarding grant when before-snapshot fails, and s
   expect(res3).toMatchObject({ outcome: "claimed", credit: 3300 })
 })
 
-test("setting_info popup without new bill reports done when before-snapshot succeeds", async () => {
+// The bills list is written behind the grant, so the day it lags the popup is
+// the only sign the grant fired. Reporting "done" on that answer said a paid
+// day was unpaid (Buddy reads the same two flags for the same reason,
+// providers/xiaohuanxiong/quota.py:181-214). It is counted once a day: the
+// flag stays in the answer, and a second call that day must not pay it twice.
+test("setting_info popup without a new bill reports claimed, once per day", async () => {
   const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
   startServer({
     "GET /api/web/office/v3/setting_info": () =>
@@ -1153,6 +1198,42 @@ test("setting_info popup without new bill reports done when before-snapshot succ
   })
 
   const hooks = await RaccoonAuthPlugin({ client: {} })
+  const authObj = {
+    type: "oauth",
+    access: validTok,
+    refresh: "R1",
+    expires: Date.now() + 3600_000,
+    onboardingSettled: true,
+  }
+  const res = await hooks.auth.checkin(async () => authObj)
+  expect(res).toMatchObject({ outcome: "claimed", credit: 300 })
+
+  // same day, same account: the flag is still there but already counted
+  const again = await hooks.auth.checkin(async () => authObj)
+  expect(again.outcome).toBe("done")
+})
+
+test("a bill that lands after the trigger wins over the popup, and the popup is not added to it", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const today = _internal.beijingTodayKey()
+  const billItems = []
+  startServer({
+    "GET /api/web/office/v3/setting_info": () => {
+      if (!billItems.length) {
+        billItems.push({
+          bill_id: "daily-1",
+          biz_type: "daily_grant",
+          event_name: "每日积分发放",
+          points: 300,
+          created_at: `${today}T08:00:00+08:00`,
+        })
+      }
+      return Response.json({ code: 0, data: { point_grant_popups: { points: 300 } } })
+    },
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: billItems } }),
+  })
+
+  const hooks = await RaccoonAuthPlugin({ client: {} })
   const res = await hooks.auth.checkin(async () => ({
     type: "oauth",
     access: validTok,
@@ -1160,7 +1241,76 @@ test("setting_info popup without new bill reports done when before-snapshot succ
     expires: Date.now() + 3600_000,
     onboardingSettled: true,
   }))
-  expect(res.outcome).toBe("done")
+  expect(res).toMatchObject({ outcome: "claimed", credit: 300 })
+})
+
+test("the check-in rechecks the bills when the first read shows nothing new", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const today = _internal.beijingTodayKey()
+  let reads = 0
+  startServer({
+    // popup absent: the only evidence is the bill, which lands a read late
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/points/v1/bills": () => {
+      reads += 1
+      // 1 = before-snapshot, 2 = first recheck (empty), 3 = recheck
+      const items =
+        reads >= 3
+          ? [
+              {
+                bill_id: "daily-1",
+                biz_type: "daily_grant",
+                event_name: "每日积分发放",
+                points: 300,
+                created_at: `${today}T08:00:00+08:00`,
+              },
+            ]
+          : []
+      return Response.json({ code: 0, data: { items } })
+    },
+  })
+
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const res = await hooks.auth.checkin(async () => ({
+    type: "oauth",
+    access: validTok,
+    refresh: "R1",
+    expires: Date.now() + 3600_000,
+    onboardingSettled: true,
+  }))
+  expect(res).toMatchObject({ outcome: "claimed", credit: 300 })
+  expect(reads).toBeGreaterThanOrEqual(3)
+})
+
+test("two check-ins for the same account at once claim the grant once", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  let grantCalls = 0
+  let settingCalls = 0
+  startServer({
+    "POST /api/web/desktop/v1/login/points/grant": () => {
+      grantCalls += 1
+      return Response.json({ code: 0, data: { granted: true, popup: { points: 3000 } } })
+    },
+    "GET /api/web/office/v3/setting_info": () => {
+      settingCalls += 1
+      return Response.json({ code: 0, data: {} })
+    },
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const authObj = {
+    type: "oauth",
+    access: validTok,
+    refresh: "R1",
+    expires: Date.now() + 3600_000,
+  }
+  // the host can deliver one user action twice: a body-cap refit, a token-field
+  // retry and any 404 are all re-sends (internal/gateway/fallback.go:1766)
+  const [a, b] = await Promise.all([hooks.auth.checkin(async () => authObj), hooks.auth.checkin(async () => authObj)])
+  expect(settingCalls).toBe(1)
+  expect(grantCalls).toBe(1)
+  expect(a).toEqual(b)
 })
 
 test("X-Client-Platform header derives desktop-mac on darwin and desktop-windows otherwise", async () => {
