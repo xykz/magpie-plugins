@@ -8,18 +8,20 @@
 //   - the eight onboarding tasks (one-time 10000 points, never claimed before)
 //   - the traceparent / loomy-version headers (chat)
 
-import { randomUUID } from "node:crypto"
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
+import { traceparent } from "./headers.mjs"
 
 const OK = "000000"
 const AUTH_CODES = new Set(["020002", "100002"])
 const REQUEST_TIMEOUT = 20_000
 
 // The client announces this version; the gateway has only ever been seen to
-// check that the header is present (loomy2api constants.py).
-export const LOOMY_VERSION = "0.9.38"
+// check that the header is present (loomy2api constants.py). Measured against
+// the 0.9.39 client's own traffic, which is the version the shapes here were
+// rebuilt from.
+export const LOOMY_VERSION = "0.9.39"
 
 const env = (name, fallback) => {
   const v = process.env[name]?.trim()
@@ -61,11 +63,14 @@ async function apiJson(path, session, { method = "GET", body, headers = {} } = {
   if (!session) throw new Expired("Loomy 账号缺少 session")
   const init = {
     method,
-    headers: { Accept: "application/json", token: session, Authorization: `Bearer ${session}`, ...headers },
+    // `token` only. The client's onboarding calls carry no Authorization, so
+    // neither does this; and its Accept on these is the runtime default
+    // (`*/*`), not an explicit application/json.
+    headers: { Accept: "*/*", token: session, ...headers },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT),
   }
   if (body !== undefined) {
-    init.headers["Content-Type"] = "application/json;charset=utf-8"
+    init.headers["Content-Type"] = "application/json"
     init.body = JSON.stringify(body)
   }
   const res = await fetch(gateway(path), init)
@@ -183,9 +188,7 @@ export async function claimOnboarding(session, a, opts = {}) {
 // cheap and idempotent, so they go out; whether the gateway needs them stays
 // an open A/B question rather than a claim either way.
 export function traceHeaders() {
-  const trace = randomUUID().replace(/-/g, "")
-  const span = randomUUID().replace(/-/g, "").slice(0, 16)
-  return { traceparent: `00-${trace}-${span}-01`, "loomy-version": LOOMY_VERSION }
+  return { traceparent: traceparent(), "loomy-version": LOOMY_VERSION }
 }
 
 // ── the plugin wrapper ─────────────────────────────────────────────────────

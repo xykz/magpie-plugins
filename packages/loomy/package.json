@@ -9,6 +9,7 @@
     "index.mjs",
     "renew.mjs",
     "extras.mjs",
+    "headers.mjs",
     "README.md"
   ],
   "keywords": [

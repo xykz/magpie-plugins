@@ -201,7 +201,7 @@ describe("trace headers", () => {
   test("the W3C shape the client sends", () => {
     const h = traceHeaders()
     expect(h.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/)
-    expect(h["loomy-version"]).toBe("0.9.38")
+    expect(h["loomy-version"]).toBe("0.9.39")
   })
 
   test("every call gets its own trace id", () => {
@@ -227,10 +227,105 @@ describe("trace headers", () => {
       globalThis.fetch = realFetch
     }
     expect(seen.get("traceparent")).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/)
-    expect(seen.get("loomy-version")).toBe("0.9.38")
-    // and the headers that were already load-bearing are still there
-    expect(seen.get("token")).toBe(session())
-    expect(seen.get("content-type")).toContain("charset=utf-8")
+    expect(seen.get("loomy-version")).toBe("0.9.39")
+  })
+
+  // The chat plane's header set, asserted against the client's own recorded
+  // traffic (.sandbox/loomy-captures/real-windows*/): Bearer auth, no token,
+  // bare application/json, */*, and the attribution headers.
+  test("the chat headers are the client's, not the plugin's old ones", async () => {
+    const plugin = await LoomyAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const loader = await plugin.auth.loader(async () => ({ type: "oauth", access: session(), expires: 0 }))
+    const realFetch = globalThis.fetch
+    let seen = null
+    globalThis.fetch = (input, init) => {
+      const url = String(typeof input === "string" ? input : input?.url)
+      if (url.includes("/chat/completions")) seen = new Headers(init?.headers)
+      return realFetch(input, init)
+    }
+    try {
+      await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-magpie-session": "ses_abc123" },
+        body: JSON.stringify({ model: "spark-x", stream: false, messages: [] }),
+      })
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    // auth: Bearer, and no `token` header on this plane
+    expect(seen.get("authorization")).toBe(`Bearer ${session()}`)
+    expect(seen.get("token")).toBeNull()
+    // content type: bare, no charset
+    expect(seen.get("content-type")).toBe("application/json")
+    // the same media range the client's opencode plane asks for
+    expect(seen.get("accept")).toBe("*/*")
+    // attribution. `ses_abc123` is not a shape opencode could have minted, so
+    // the affinity is derived from it (the opencode-shaped case is asserted in
+    // headers.test.mjs); what matters here is that a shape goes out at all
+    expect(seen.get("x-session-affinity")).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(seen.get("chatid")).toMatch(/^chat-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(seen.get("msgid")).toMatch(/^msg-[0-9a-f-]{36}$/)
+    expect(seen.get("turnid")).toBe(seen.get("msgid")) // the client's turn == its msg
+    expect(seen.get("invokeorigin")).toBe("user")
+    expect(seen.get("x-loomy-request-purpose")).toBe("chat.message")
+    // and no magpie-only header leaks upstream
+    expect(seen.get("x-magpie-session")).toBeNull()
+  })
+
+  test("the chatid is stable per session, the msgid is not", async () => {
+    const plugin = await LoomyAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const loader = await plugin.auth.loader(async () => ({ type: "oauth", access: session(), expires: 0 }))
+    const realFetch = globalThis.fetch
+    const seen = []
+    globalThis.fetch = (input, init) => {
+      const url = String(typeof input === "string" ? input : input?.url)
+      if (url.includes("/chat/completions")) seen.push(new Headers(init?.headers))
+      return realFetch(input, init)
+    }
+    try {
+      for (let i = 0; i < 2; i++)
+        await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-magpie-session": "ses_stable" },
+          body: JSON.stringify({ model: "spark-x", stream: false, messages: [] }),
+        })
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    expect(seen[0].get("chatid")).toBe(seen[1].get("chatid"))
+    expect(seen[0].get("msgid")).not.toBe(seen[1].get("msgid"))
+  })
+
+  test("a session id that is already sha-shaped still yields a chat-<uuid>", async () => {
+    // magpie's own conversationID is `magpie-<sha256[:24]>`, a shape no Loomy
+    // client ever sends; the chatid must not echo it
+    const { chatIdFor } = await import("./headers.mjs")
+    const id = chatIdFor("magpie-0123456789abcdef01234567")
+    expect(id).toMatch(/^chat-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(id).not.toContain("magpie")
+  })
+
+  test("no session header means no chatid/affinity, but the turn ids still go", async () => {
+    const plugin = await LoomyAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const loader = await plugin.auth.loader(async () => ({ type: "oauth", access: session(), expires: 0 }))
+    const realFetch = globalThis.fetch
+    let seen = null
+    globalThis.fetch = (input, init) => {
+      const url = String(typeof input === "string" ? input : input?.url)
+      if (url.includes("/chat/completions")) seen = new Headers(init?.headers)
+      return realFetch(input, init)
+    }
+    try {
+      await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({ model: "spark-x", stream: false, messages: [] }),
+      })
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    expect(seen.get("chatid")).toBeNull()
+    expect(seen.get("x-session-affinity")).toBeNull()
+    expect(seen.get("msgid")).toBeTruthy()
   })
 })
 
