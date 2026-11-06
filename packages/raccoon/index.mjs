@@ -251,7 +251,7 @@ function readDesktopAuth() {
 const renewing = new Map()
 const renewed = new Map()
 
-async function callRefreshApi(refreshToken) {
+async function callRefreshApi(refreshToken, expectedUid = "") {
   const res = await fetch(`${authBase()}/refresh`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -281,6 +281,20 @@ async function callRefreshApi(refreshToken) {
   const expires = jwtExpiryMs(access)
   const claims = decodeJwtClaims(access)
   const uid = extractUserId(claims)
+  // A renewal answers for the account the refresh token names. When the token
+  // it hands back belongs to someone else the stored credential is not the one
+  // this seat signed in with — a refresh token that moved between accounts (the
+  // desktop app signs in to one account at a time and rotates its own). Taking
+  // it would bill the seat to another account and report that account's
+  // credits, the failure plugins #166 was. The old credential stays exactly as
+  // it is, the seat is not marked expired, and the next attempt can still
+  // succeed if the vendor answers its own account again (rsfree
+  // internal/upstream/client.go:580-615 refuses the same way).
+  if (expectedUid && uid && String(uid) !== String(expectedUid)) {
+    const err = new Error("商汤小浣熊续期返回了不同账号，旧凭证未被覆盖")
+    err.signIn = "kept"
+    throw err
+  }
   const name = extractDisplayName(claims)
   return { access, refresh, expires, ...(uid ? { uid } : {}), ...(name ? { name } : {}) }
 }
@@ -296,7 +310,7 @@ async function renewToken(a, save) {
   let r = renewing.get(key)
   if (!r) {
     r = (async () => {
-      const next = await callRefreshApi(a.refresh)
+      const next = await callRefreshApi(a.refresh, a.uid)
       renewed.set(key, { next, at: Date.now() })
       return next
     })().finally(() => renewing.delete(key))
@@ -736,7 +750,66 @@ function isCheckinGrantBill(item, today) {
   return !biz || biz === "daily_grant" || biz === "reward_grant"
 }
 
+// The `setting_info` answer carries the vendor's own "you were just granted
+// this" flags. They are the only same-second evidence there is: the credits
+// endpoint that lists bills is written behind the grant, so an answer read
+// right after the trigger can be one to three minutes stale and show nothing
+// (rsfree's comment on the reconciliation page: 「流水本身滞后 1~3 分钟」).
+// Buddy reads the same two flags and treats them as the grant having fired
+// (providers/xiaohuanxiong/quota.py:181-214: the check-in is the GET of this
+// endpoint and the flags are its answer). Either field may hold the points.
+// Not an `export`: magpie's host takes every exported function as a plugin
+// factory (scripts/check.mjs:36-60), so this one stays reachable through
+// `_internal` only.
+function popupGrantPoints(payload) {
+  for (const key of ["point_grant_popups", "point_grant_toast"]) {
+    const node = payload?.[key]
+    const pts = Math.floor(Number(node?.points))
+    if (Number.isFinite(pts) && pts > 0) return pts
+  }
+  return 0
+}
+
+// The popup is a reading of "a grant fired", not a ledger entry: the same
+// answer carries it again on every call that day. Handing it to the card once
+// per account per Beijing day keeps both directions honest — the day the bills
+// lag is not reported as "done", and the second call that day does not count
+// the same grant again. Memory, like desktopOnboardingSettled: a restart can
+// report one grant twice, which is the cheaper error than reporting a paid day
+// as unpaid.
+const popupGrantReported = new Set()
+
+function popupCreditable(points, accountKey, today) {
+  const pts = Math.floor(Number(points) || 0)
+  if (pts <= 0) return 0
+  const key = `${today}|${accountKey ?? ""}`
+  if (popupGrantReported.has(key)) return 0
+  popupGrantReported.add(key)
+  return pts
+}
+
 const desktopOnboardingSettled = new Set()
+
+// One check-in per account at a time. The host can deliver what a user did
+// once more than once — magpie re-sends a request after a body-cap refit
+// (internal/gateway/body_cap.go:159), a token-field retry
+// (internal/gateway/token_field.go:45) and any 404, which it counts as
+// retryable (internal/gateway/fallback.go:1766) — and its check-in loop plus a
+// user pressing the button can overlap. Two runs of the same account's
+// check-in would each read the before-snapshot, each claim the onboarding grant
+// and each report the grant as new, so the card would count one grant twice.
+// The second run waits for the first and then reads its result instead of
+// repeating it.
+const checkinInFlight = new Map()
+
+async function serializeCheckin(a, run) {
+  const key = a?.uid || a?.accountId || a?.access || ""
+  const busy = checkinInFlight.get(key)
+  if (busy) return busy
+  const p = (async () => run())().finally(() => checkinInFlight.delete(key))
+  checkinInFlight.set(key, p)
+  return p
+}
 
 async function performCheckIn(a, save) {
   const token = a.access
@@ -751,10 +824,11 @@ async function performCheckIn(a, save) {
     beforeKeys = new Set(items.filter((x) => isCheckinGrantBill(x, today)).map(billKey))
   } catch {}
 
-  await apiGetJson("/api/web/office/v3/setting_info", token, {
+  const setting = await apiGetJson("/api/web/office/v3/setting_info", token, {
     ...desktopHeaders(),
     "X-Raccoon-Language": "zh",
   })
+  const popupPts = popupGrantPoints(setting)
 
   let onboardingPts = 0
   const accountKey = a?.uid || a?.accountId || a?.access
@@ -773,7 +847,9 @@ async function performCheckIn(a, save) {
 
   // If the before-snapshot of bills could not be read, avoid false positives
   // from historical bills or repeating popup grants, while still reporting an
-  // onboarding grant that this call just claimed.
+  // onboarding grant that this call just claimed. The snapshot is the only
+  // thing that tells a fresh popup from one left in the answer since an earlier
+  // call; without it, only the grant this call just claimed is reported.
   if (!beforeKeys) {
     if (onboardingPts > 0) {
       return {
@@ -788,20 +864,31 @@ async function performCheckIn(a, save) {
     }
   }
 
-  const bills = await apiGetJson("/api/web/points/v1/bills?paging.limit=20&paging.offset=0", token)
+  // Read the bills again, and once more if nothing new is there yet: this is
+  // the recheck the panel does after claiming (rsfree
+  // internal/scheduler/scheduler.go:586 — a code 0 from the grant endpoint does
+  // not mean the grant landed, so the status is read again). The window
+  // between the two reads is one round trip plus the onboarding-grant call
+  // above, which is enough for a grant that landed during those calls to show
+  // up; the credits list is written behind the grant, so a single immediate
+  // read reported "今日已签到" on a day that was actually paid.
   let newlyGranted = 0
   let hasNewRewardBill = false
   const names = []
-  const items = Array.isArray(bills?.items) ? bills.items : []
-  items.forEach((item) => {
-    if (!isCheckinGrantBill(item, today)) return
-    if (beforeKeys.has(billKey(item))) return
-    const pts = Math.floor(Number(item?.points) || 0)
-    newlyGranted += pts
-    if (String(item?.biz_type ?? "") === "reward_grant") hasNewRewardBill = true
-    const ev = String(item?.event_name || "积分发放")
-    if (!names.includes(ev)) names.push(ev)
-  })
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const bills = await apiGetJson("/api/web/points/v1/bills?paging.limit=20&paging.offset=0", token)
+    const items = Array.isArray(bills?.items) ? bills.items : []
+    items.forEach((item) => {
+      if (!isCheckinGrantBill(item, today)) return
+      if (beforeKeys.has(billKey(item))) return
+      const pts = Math.floor(Number(item?.points) || 0)
+      newlyGranted += pts
+      if (String(item?.biz_type ?? "") === "reward_grant") hasNewRewardBill = true
+      const ev = String(item?.event_name || "积分发放")
+      if (!names.includes(ev)) names.push(ev)
+    })
+    if (newlyGranted > 0) break
+  }
 
   // Sum daily check-in bills and the one-time onboarding grant when both land
   // in one call, unless the onboarding grant is already present as a new
@@ -809,6 +896,18 @@ async function performCheckIn(a, save) {
   if (onboardingPts > 0 && !hasNewRewardBill) {
     newlyGranted += onboardingPts
     if (!names.includes("桌面端首次登录奖励")) names.push("桌面端首次登录奖励")
+  }
+
+  if (newlyGranted <= 0 && onboardingPts <= 0) {
+    // The bills read is the one that lags; the vendor's own answer said a
+    // grant fired. Reporting "done" here is the quiet lie this replaces — but
+    // only the first time that day, or a popup that stays in the answer would
+    // be counted on every call.
+    const credit = popupCreditable(popupPts, accountKey, today)
+    if (credit > 0) {
+      newlyGranted = credit
+      names.push("今日签到")
+    }
   }
 
   const totalCredit = newlyGranted
@@ -1198,15 +1297,21 @@ const raccoonBase = async ({ client }) => {
         }
         try {
           let { a } = await currentAuth(client, auth)
-          try {
-            return await performCheckIn(a, saveAuth)
-          } catch (e) {
-            if (e?.status === 401 && a.refresh && a.source !== "desktop") {
-              ;({ a } = await currentAuth(client, a, true))
+          // serializeCheckin: the host may ask for the same account's check-in
+          // twice at once (its own loop and the button, or a retried request);
+          // the second call gets the first one's answer rather than a second
+          // claim and a second "new" bill.
+          return await serializeCheckin(a, async () => {
+            try {
               return await performCheckIn(a, saveAuth)
+            } catch (e) {
+              if (e?.status === 401 && a.refresh && a.source !== "desktop") {
+                ;({ a } = await currentAuth(client, a, true))
+                return await performCheckIn(a, saveAuth)
+              }
+              throw e
             }
-            throw e
-          }
+          })
         } catch (e) {
           return { outcome: "failed", message: e?.message ?? String(e) }
         }
@@ -1266,6 +1371,9 @@ export const _internal = {
   rewriteSseModel,
   beijingTodayKey,
   billKey,
+  popupGrantPoints,
+  popupGrantReported,
+  checkinInFlight,
   renewToken,
   desktopPlatform,
   desktopOnboardingSettled,

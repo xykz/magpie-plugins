@@ -95,17 +95,26 @@ export const FALLBACK_IMAGES_FIX = {
 // flag is not reliable enough to decide per model, so the floor goes on for
 // everyone (rsfree internal/upstream/bodyfix.go:5-15). 16 or 512 came back
 // empty with finish_reason=length (its AGENTS.md:46).
+// The three names a reply length is asked for under. `/chat/completions`
+// callers send the first two; a caller speaking the Responses API sends the
+// third, and it was the one this floor used to miss — the request went out at
+// 16 tokens and came back empty with finish_reason=length, which is the
+// failure the floor exists to prevent. All three are lifted when present.
+export const OUTPUT_LENGTH_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+
 export const MIN_OUTPUT_TOKENS = 2048
 
 export function liftMaxTokens(body, floor = MIN_OUTPUT_TOKENS) {
   if (!body || typeof body !== "object") return false
-  const field = "max_tokens" in body ? "max_tokens" : "max_completion_tokens" in body ? "max_completion_tokens" : null
-  if (!field) return false
-  const now = Number(body[field])
-  if (!Number.isFinite(now)) return false
-  if (now >= floor) return false
-  body[field] = floor
-  return true
+  let touched = false
+  for (const field of OUTPUT_LENGTH_FIELDS) {
+    if (!(field in body)) continue
+    const now = Number(body[field])
+    if (!Number.isFinite(now) || now >= floor) continue
+    body[field] = floor
+    touched = true
+  }
+  return touched
 }
 
 // ── refresh_conflict (200822) self-healing ─────────────────────────────────

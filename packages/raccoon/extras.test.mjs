@@ -290,6 +290,30 @@ test("a max_tokens already above the floor is left alone", () => {
   expect(b).toEqual({})
 })
 
+// The Responses API calls the same field max_output_tokens. Leaving it out of
+// the floor let a 16-token request through on that face: the vendor answers
+// with an empty message and finish_reason "length", and the caller reads it as
+// the model having nothing to say.
+test("a small max_output_tokens is lifted on the responses face too", () => {
+  const a = { max_output_tokens: 16 }
+  expect(liftMaxTokens(a)).toBe(true)
+  expect(a.max_output_tokens).toBe(MIN_OUTPUT_TOKENS)
+
+  const b = { max_output_tokens: 4096 }
+  expect(liftMaxTokens(b)).toBe(false)
+  expect(b.max_output_tokens).toBe(4096)
+})
+
+test("every output-length field present is lifted in one pass", () => {
+  const body = { max_tokens: 8, max_completion_tokens: 32, max_output_tokens: 64 }
+  expect(liftMaxTokens(body)).toBe(true)
+  expect(body).toEqual({
+    max_tokens: MIN_OUTPUT_TOKENS,
+    max_completion_tokens: MIN_OUTPUT_TOKENS,
+    max_output_tokens: MIN_OUTPUT_TOKENS,
+  })
+})
+
 test("the loader hands the patched body to the vendor", async () => {
   const plugin = {
     auth: {
