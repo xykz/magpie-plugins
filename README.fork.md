@@ -162,6 +162,65 @@ byte-identical. `Connection: keep-alive` is set the way httpx sets it; whether
 a transport forwards a forbidden header is the transport's business (Bun does,
 Node's undici does not), so it is not listed as a divergence.
 
+## `raccoon`: the day's points run out before the permanent ones
+
+The vendor keeps two kinds of points apart. `/api/web/points/v1/balance`
+answers `daily_points` and `reward_points` beside the total: the first is the
+day's grant (300 a check-in), worth nothing after Beijing midnight, and the
+second — with the monthly and top-up buckets — never lapses. The bills say the
+same thing from the other side: a `daily_grant` carries an `expire_at` of that
+day's 23:59:59+08:00, a `reward_grant` carries none.
+
+The plugin reported one `Credits` window over the total, so magpie saw a single
+number and could not put an account with a day left behind one without: the
+permanent points an account already holds would keep it in front while the
+grant nobody spent expired at midnight. It now reports the two apart, each at
+its own time.
+
+- **`每日积分`** carries the day. With an unexpired `daily_grant` to say what
+  the day was worth, it is a share (`used`, 0–100) plus its count, renewing at
+  `beijingMidnight()` and `span: 86400`. Without one — unreadable bills, or the
+  day before its first check-in — it is the balance alone: a made-up limit
+  would always read as full. A spent day with nothing to say of it is
+  `used: 100`, which is a known, used-up account where an empty window list
+  would be an unknown one.
+- **`每日积分` never steps aside**, because its share is the only reading
+  magpie can order an account by — an aside window never reaches
+  `allowanceOf`, and a day set aside would leave the account with no share at
+  all, which `usage` ranks *ahead* of a day nearly gone. The mark that ends the
+  day's priority is its last point, not magpie's own 98%: two points still pay,
+  so the account holding them still goes ahead of one whose day is gone.
+- **`永久积分`** is the wallet, the rest of `available_points` after the day's
+  bucket rather than the named buckets summed — a bucket the vendor adds later
+  is permanent by default instead of vanishing. It is `aside: true` while
+  anything of the day is left, and joins without the day's window stepping
+  aside once the day is gone.
+
+What that makes the pool do is the point. A window set aside never reaches
+`allowanceOf` (`routing.go`: `if w.Aside || w.Text { continue }`), so while any
+day in the pool is left, only the days are weighed and the wallets cannot drag
+an account forward; the pool spends the days first. Once a day is gone its
+share stays at 100, which files the account in the used-up tier
+(`tier`, `routes/strategies.go`) — behind every account whose day still has
+something in it, whatever its wallet holds — and `Allowance.For` takes the max
+share while `Allowance.Left` takes the min balance, each window on its own, so
+under `usage` the balance breaks the tie inside that tier. Stepping the day
+aside instead would read as an account with no share at all, which `usage`
+ranks *ahead* of a day nearly gone — the wrong end. An empty wallet is no
+window at all: magpie reads a lone `balance: 0` as used up, which would bench
+an account its day still pays for.
+
+The vendor's own buckets are read as the split's source, so `daily_points`
+absent is the old reading: one `Credits` share over every unexpired grant,
+else the balance as a wallet. That keeps a vendor reply without the buckets —
+or a relay that strips them — from having its split guessed at.
+
+Tested with `bun test packages/raccoon` (123 pass, 0 fail, 459 expect, across
+four files: the day's share and the permanent wallet from the vendor's own
+buckets, the wallet aside while the day pays and weighing once it does not,
+an empty wallet making no window, and the old single-window reading for a reply
+without `daily_points`) and `bun scripts/check.mjs` (every package ✓).
+
 ## `loomy`: password sign-in, and the session it keeps alive
 
 Loomy hands out no refresh token: a session lives 14 days and only signing in
@@ -453,6 +512,45 @@ later) and both take `--dry-run` and `--install`.
   转写成 magpie 的 `plugin-auth.json`，账号原样搬过来，不用重新登录、不碰
   厂商接口。两者都零依赖（`node:sqlite`、`node:crypto`，Node 22.5 起），
   都支持 `--dry-run` 与 `--install`。
+- **`raccoon` 的日积分先于永久积分用完**：厂商把两种积分分开——
+  `/api/web/points/v1/balance` 在总额之外还回 `daily_points` 与
+  `reward_points`：前者是当天赠送（签到 300），过了北京时间午夜作废；后者连同
+  包月、充值一起永不过期。流水从另一侧说同一件事：`daily_grant` 带
+  `expire_at`（当天 23:59:59+08:00），`reward_grant` 不带。插件原先只报一个
+  `Credits` 窗口（总额），magpie 因此只有一个数字，无法把「今天还有额度」的
+  账号排到「没有」的后面：已经有大量永久积分的账号会一直靠前，而没人花掉的
+  日赠送在午夜白白过期。现在拆成两个窗口，各按自己的时间说话：
+  - **`每日积分`** 代表当天。有未过期的 `daily_grant` 说明当天额度多少时，
+    它是一个 share（`used`，0–100）加计数，按 `beijingMidnight()` 重置、
+    `span: 86400`；没有时（流水读不到，或当天还没签到）只带余额——编一个上限
+    永远读成满格。当天用完又无据可依时是 `used: 100`：这是「已知用完」的账号，
+    而空窗口列表会被当成未知。
+  - **`每日积分` 永不 aside**，因为它的 share 是 magpie 唯一能用来排序的读数。
+    0% 就是 0%，而那最后两点也还能花，所以分界是当天的最后一点，不是 magpie
+    自己的 98%。
+  - **`永久积分`** 是钱包，取 `available_points` 减掉当天那桶，而不是把具名的
+    几桶加起来——厂商以后新增的桶默认永久，不会凭空消失。当天还有额度时它是
+    `aside: true`，当天用完后才不 aside 地并列进来。
+
+  这正是让选号行为正确的关键。被 aside 的窗口根本进不了 `allowanceOf`
+  （`routing.go`：`if w.Aside || w.Text { continue }`），所以只要池子里还有任何
+  一天的额度，参与排序的就只有日积分，钱包无法把某个账号往前拽；整个池子先把
+  日积分花光。某天的额度用完后 share 停在 100，把该账号归进已用尽档
+  （`tier`，`routes/strategies.go`）——排在所有当天还有额度的账号之后，无论它
+  钱包里有多少——而 `Allowance.For` 取最大 share、`Allowance.Left` 取最小余额，
+  两个窗口各算各的，所以 `usage` 排序下余额在这一档内决胜负。若反过来让日积分
+  aside，该账号会读成一个「完全没有 share」的账号，而 `usage` 把这种排在「快
+  用完」的账号**前面**——正好反了。空钱包不作为窗口：magpie 把单独的
+  `balance: 0` 读成用尽，会把当天还在付钱的账号 bench 掉。
+
+  拆分的数据源是厂商自己的分桶，所以 `daily_points` 缺席时即为旧读法：一个
+  `Credits` 窗口跨所有未过期发放，或者余额当钱包。这样厂商回复里没带分桶（或
+  中继把它剥掉）时，不会去猜一个拆分出来。
+
+  测试：`bun test packages/raccoon`（123 pass、0 fail、459 expect，四个文件：
+  按厂商分桶拆出日 share 与永久钱包、当天还有额度时钱包 aside 而用完时参与、
+  空钱包不生成窗口、没有 `daily_points` 时走旧的单窗口读法）与
+  `bun scripts/check.mjs`（每个包 ✓）。
 - **`loomy` 的密码登录与自动续登**：Loomy 没有 refresh token，session 只有
   14 天，唯一能续期的凭据是账号密码，所以本 fork 加了第三种登录方式
   「账号密码登录（Password sign-in）」，并用它让密码账号无人值守地活下去。

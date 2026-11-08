@@ -285,10 +285,55 @@ test("usage does not invent 300/9000 floors when bills do not cover balance", as
     refresh: "rt1",
     expires: Date.now() + 3600_000,
   }))
-  expect(u.balance).toBe("500 credits")
-  // no floors are invented, but the balance is still a reading: a wallet
-  // window carries it, so routing knows the account (#3950)
-  expect(u.windows).toEqual([{ name: "Credits", balance: 500, unit: "credits" }])
+  // no floors are invented: the day's bucket is 0 and the reward's 500 is
+  // permanent, each said as itself (#3950, and the day's own split)
+  expect(u.windows).toEqual([
+    { name: "每日积分", used: 100, unit: "credits", resetsAt: expect.any(String), span: 86400 },
+    { name: "永久积分", balance: 500, unit: "credits" },
+  ])
+})
+
+test("usage keeps the day's window aside while it pays, and lets the wallet weigh once it does not", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const reply = (daily, reward) => () =>
+    Response.json({
+      code: 0,
+      data: { available_points: daily + reward, daily_points: daily, reward_points: reward, monthly_points: 0, topup_points: 0 },
+    })
+  const bills = () =>
+    Response.json({
+      code: 0,
+      data: {
+        items: [
+          { bill_id: "d1", biz_type: "daily_grant", points: 300, expire_at: "2029-10-18T23:59:59+08:00" },
+          { bill_id: "r1", biz_type: "reward_grant", points: 9000 },
+        ],
+      },
+    })
+  const read = async (balanceRE, billsRE) => {
+    startServer({
+      "GET /api/web/points/v1/balance": balanceRE,
+      "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+      "GET /api/web/points/v1/bills": billsRE,
+    })
+    const hooks = await RaccoonAuthPlugin({ client: {} })
+    return hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000 }))
+  }
+  // the day still holds something: the wallet must not weigh at all, or the
+  // pool parks on whichever account keeps the most permanent points
+  const paying = await read(reply(300, 9000), bills)
+  expect(paying.windows[0]).toMatchObject({ name: "每日积分", used: 0, display: "0 / 300", amount: 0, limit: 300, span: 86400 })
+  expect(paying.windows[1]).toEqual({ name: "永久积分", balance: 9000, unit: "credits", aside: true })
+
+  // the day is spent: the wallet joins beside a share at 100, so it never
+  // outranks an account whose day still has something in it
+  const spent = await read(reply(0, 9000), bills)
+  expect(spent.windows[0]).toMatchObject({ name: "每日积分", used: 100 })
+  expect(spent.windows[1]).toEqual({ name: "永久积分", balance: 9000, unit: "credits" })
+
+  // an empty wallet is no window at all: a lone balance of 0 reads as used up
+  const none = await read(reply(0, 0), bills)
+  expect(none.windows.map((w) => w.name)).toEqual(["每日积分"])
 })
 
 test("a balance reply that names no balance makes no window, an unknown not a zero", async () => {
@@ -337,7 +382,7 @@ test("the name usage puts on the card is the phone, not the JWT's name (review #
   expect(u.user).toBe("138****8000")
 })
 
-test("usage reports Credits window when unexpired bills account for total granted", async () => {
+test("usage reports the day's share and the permanent wallet apart, from the vendor's own buckets", async () => {
   const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
   startServer({
     "GET /api/web/points/v1/balance": () =>
@@ -366,16 +411,26 @@ test("usage reports Credits window when unexpired bills account for total grante
     expires: Date.now() + 3600_000,
   }))
   expect(u.balance).toBeUndefined()
-  expect(u.windows.length).toBe(1)
-  expect(u.windows[0]).toMatchObject({
-    name: "Credits",
-    amount: 81,
-    limit: 9600,
-    display: "81 / 9600",
-    unit: "credits",
-    runsOutAt: "2029-10-17T15:59:59.000Z",
-    runsOut: 300,
-  })
+  // 519 of the day's 600 is still there, so the wallet is aside: draining the
+  // day across the pool comes before touching anyone's permanent points
+  expect(u.windows).toEqual([
+    {
+      name: "每日积分",
+      used: 13.5,
+      display: "81 / 600",
+      amount: 81,
+      limit: 600,
+      unit: "credits",
+      resetsAt: expect.any(String),
+      span: 86400,
+      runsOutAt: "2029-10-17T15:59:59.000Z",
+      runsOut: 300,
+    },
+    { name: "永久积分", balance: 9000, unit: "credits", aside: true },
+  ])
+  // the day's limit is the grants that lapse, not every grant: counting the
+  // 9000 reward into it would make the day read 9294 / 9600 used
+  expect(u.windows[0].limit).toBe(600)
 })
 
 test("usage reads bills past the newest 200 rows, where the large grants are (plugins #223)", async () => {

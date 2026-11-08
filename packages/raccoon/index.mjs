@@ -663,6 +663,16 @@ async function allBills(token) {
   return bills
 }
 
+// beijingMidnight is the next Beijing midnight, the boundary of the vendor's
+// own day: the daily grants lapse at 23:59:59+08:00 on the day they were
+// given (`expire_at` in the bills), so the pool holding them starts again
+// there.
+function beijingMidnight(nowMs = Date.now()) {
+  const shifted = nowMs + 8 * 3600_000
+  const dayStart = Math.floor(shifted / 86_400_000) * 86_400_000
+  return new Date(dayStart + 86_400_000 - 8 * 3600_000).toISOString()
+}
+
 async function queryUsage(token) {
   const [points, entitlement, bills] = await Promise.all([
     apiGetJson("/api/web/points/v1/balance", token),
@@ -679,7 +689,12 @@ async function queryUsage(token) {
 
   // Sum only what the vendor actually reports as granted in unexpired bills.
   // If bills don't account for the current balance, report the balance with no window.
+  // Two totals come out of it: every unexpired grant (the reading before the
+  // split), and the ones that lapse. `expire_at` is what tells them apart —
+  // `daily_grant` carries one, `reward_grant` does not — so the second is what
+  // the day's own bucket was worth, and the reward is never counted into it.
   let grantedFromBills = 0
+  let expiringGranted = 0
   let soonestExpMs = 0
   let expiringPts = 0
   const now = Date.now()
@@ -691,6 +706,7 @@ async function queryUsage(token) {
     if (expMs > 0 && expMs <= now) continue
     grantedFromBills += pts
     if (expMs > now) {
+      expiringGranted += pts
       if (!soonestExpMs || expMs < soonestExpMs) {
         soonestExpMs = expMs
         expiringPts = pts
@@ -700,41 +716,130 @@ async function queryUsage(token) {
     }
   }
   const runsOutAt = soonestExpMs ? new Date(soonestExpMs).toISOString() : null
-  const runsOut = soonestExpMs ? Math.min(avail, expiringPts) : 0
 
-  if (grantedFromBills > 0 && grantedFromBills >= avail) {
-    const used = grantedFromBills - avail
-    return {
-      plan,
-      ...(proEnable && expireAt ? { until: new Date(expireAt).toISOString() } : {}),
-      windows: [
-        {
-          name: "Credits",
-          used: (100 * used) / grantedFromBills,
-          display: `${used} / ${grantedFromBills}`,
-          amount: used,
-          limit: grantedFromBills,
-          unit: "credits",
-          ...(runsOutAt ? { runsOutAt, runsOut } : {}),
-        },
-      ],
-    }
-  }
-
-  // A balance the bills cannot account for tells no share, but it is still a
-  // reading: a wallet window carries it, so routing knows the account and
-  // sorts it by what it has left (#3950). A balance string alone is the
-  // card's, and routing would still say 剩余额度未知. A reply that names no
-  // number makes no window: 0 is what a missing figure reads as, and one at
-  // 0 is a spent-out account.
   const said = points?.available_points
   const told = said != null && said !== "" && Number.isFinite(Number(said))
-  return {
+  const saidDaily = points?.daily_points
+  const dailyKnown = saidDaily != null && saidDaily !== "" && Number.isFinite(Number(saidDaily))
+  const daily = dailyKnown ? Math.max(0, Math.floor(Number(saidDaily))) : null
+
+  const head = {
     plan,
     ...(proEnable && expireAt ? { until: new Date(expireAt).toISOString() } : {}),
-    balance: `${avail} credits`,
-    windows: told ? [{ name: "Credits", balance: avail, unit: "credits" }] : [],
   }
+
+  if (daily == null) {
+    // The reply names no day's bucket, so there is nothing to split by and a
+    // split would have to be guessed. Read it as before: one share over every
+    // grant the bills account for, else the balance as a wallet.
+    if (grantedFromBills > 0 && grantedFromBills >= avail) {
+      const used = grantedFromBills - avail
+      return {
+        ...head,
+        windows: [
+          {
+            name: "Credits",
+            used: (100 * used) / grantedFromBills,
+            display: `${used} / ${grantedFromBills}`,
+            amount: used,
+            limit: grantedFromBills,
+            unit: "credits",
+            ...(runsOutAt ? { runsOutAt, runsOut: Math.min(avail, expiringPts) } : {}),
+          },
+        ],
+      }
+    }
+    // A balance the bills cannot account for tells no share, but it is still a
+    // reading: a wallet window carries it, so routing knows the account and
+    // sorts it by what it has left (#3950). A reply that names no number makes
+    // no window: 0 is what a missing figure reads as, and one at 0 is a
+    // spent-out account.
+    return { ...head, balance: `${avail} credits`, windows: told ? [{ name: "Credits", balance: avail, unit: "credits" }] : [] }
+  }
+
+  // The vendor keeps two kinds of points apart, and separating them is the
+  // point: `daily_points` is the day's grant (300 a check-in), worth nothing
+  // after Beijing midnight; everything else — the onboarding reward, the
+  // monthly and the top-up buckets — never lapses. Reported as two windows,
+  // routing sends a request to an account whose day still holds something
+  // before one whose day is gone, so the grants are spent rather than lost at
+  // midnight.
+  //
+  // What is permanent is the rest of the total rather than the named buckets
+  // summed, so one the vendor adds later is permanent by default instead of
+  // vanishing; without a named total there is no figure to take it from, and
+  // a missing one must not read as 0.
+  const permanent = !told ? null : Math.max(0, avail - daily)
+
+  // The day's limit is what its own grants were worth. An `expire_at` is what
+  // tells them from the reward — `daily_grant` carries one, `reward_grant`
+  // does not — so counting every grant would put the 9000 reward into the day
+  // and read 9294 / 9600 used. A grant the vendor has written but the balance
+  // has not moved for yet would likewise read below nothing, so the day's own
+  // figure is the floor of its limit and the share is clamped to 0–100.
+  const pairPresent = expiringGranted > 0
+  const dayLimit = Math.max(daily, expiringGranted)
+  const daySpent = pairPresent ? dayLimit - daily : 0
+  const dayShare = pairPresent ? Math.max(0, Math.min(100, (100 * daySpent) / dayLimit)) : 0
+
+  const windows = []
+  if (pairPresent) {
+    // A share to order the account by, renewing at the vendor's own day and
+    // lapsing when its grants do. This is the window that decides who answers
+    // while any of the pool's days is left, which is what drains the days.
+    windows.push({
+      name: "每日积分",
+      used: dayShare,
+      display: `${daySpent} / ${dayLimit}`,
+      amount: daySpent,
+      limit: dayLimit,
+      unit: "credits",
+      resetsAt: beijingMidnight(now),
+      span: 86_400,
+      ...(runsOutAt ? { runsOutAt, runsOut: Math.min(daily, expiringPts) } : {}),
+    })
+  } else if (daily > 0) {
+    // No grant to give the day a limit — unreadable bills, or the day before
+    // its first check-in. A made-up limit would always read as full, so the
+    // balance is carried as itself; it still tells routing which account has
+    // more of the day left, which is what drains the days.
+    windows.push({ name: "每日积分", balance: daily, unit: "credits" })
+  } else {
+    // The day is spent and nothing says of what: a share at 100 is that, and
+    // no `balance: 0` is carried — a lone one would drag the account's `Left`
+    // to nothing beside the wallet below. A spent day with no wallet at all
+    // still carries, because a lone `used: 100` is a known, used-up account
+    // where an empty window list is an unknown one.
+    windows.push({ name: "每日积分", used: 100, unit: "credits", resetsAt: beijingMidnight(now), span: 86_400 })
+  }
+
+  // The permanent wallet weighs only once the day is gone. A wallet has no
+  // share and no renewal, so the one thing routing can order it by is the most
+  // left (#3950, `byLeft`) — and permanent points differ per account, so
+  // weighing them early parks the pool on whichever account holds the most
+  // while the day's grant nobody spent lapses at midnight.
+  //
+  // Once the day is gone the wallet joins *without* the day's window stepping
+  // aside, and the share stays at 100: that files the account in the used-up
+  // tier (`tier`, `routes/strategies.go`), behind every account whose day
+  // still has something in it, whatever its wallet holds — and `Allowance.For`
+  // takes the max share while `Allowance.Left` takes the min balance, each
+  // window on its own, so under `usage` the balance breaks the tie inside that
+  // tier. Stepping the day aside instead would read as an account with no
+  // share at all, which `usage` ranks *ahead* of a day nearly gone.
+  //
+  // A day's last point is the mark, not magpie's 98%: those two points still
+  // pay, so the account holding them still goes ahead of one whose day is
+  // gone. An empty wallet is no window at all — a lone `balance: 0` reads as
+  // used up, which would bench an account its day still pays for (loomy's
+  // rule, `loomy/daily-grant-carries`).
+  const wallet = permanent != null && permanent > 0 ? { name: "永久积分", balance: permanent, unit: "credits" } : null
+  if (wallet) {
+    if (daily > 0) wallet.aside = true
+    windows.push(wallet)
+  }
+
+  return { ...head, windows }
 }
 
 function billKey(item) {
