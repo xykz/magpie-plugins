@@ -179,11 +179,11 @@ its own time.
 
 - **`每日积分`** carries the day. With an unexpired `daily_grant` to say what
   the day was worth, it is a share (`used`, 0–100) plus its count, renewing at
-  `beijingMidnight()` and `span: 86400`. Without one — unreadable bills, or the
-  day before its first check-in — it is the balance alone: a made-up limit
-  would always read as full. A spent day with nothing to say of it is
-  `used: 100`, which is a known, used-up account where an empty window list
-  would be an unknown one.
+  Beijing midnight (`resetsAt`) and `span: 86400`. Without one — unreadable
+  bills, or the day before its first check-in — it is the balance alone: a
+  made-up limit would always read as full. A spent day with nothing to say of
+  it is `used: 100`, which is a known, used-up account where an empty window
+  list would be an unknown one.
 - **`每日积分` never steps aside**, because its share is the only reading
   magpie can order an account by — an aside window never reaches
   `allowanceOf`, and a day set aside would leave the account with no share at
@@ -668,7 +668,7 @@ later) and both take `--dry-run` and `--install`.
   账号排到「没有」的后面：已经有大量永久积分的账号会一直靠前，而没人花掉的
   日赠送在午夜白白过期。现在拆成两个窗口，各按自己的时间说话：
   - **`每日积分`** 代表当天。有未过期的 `daily_grant` 说明当天额度多少时，
-    它是一个 share（`used`，0–100）加计数，按 `beijingMidnight()` 重置、
+    它是一个 share（`used`，0–100）加计数，按北京午夜重置（`resetsAt`）、
     `span: 86400`；没有时（流水读不到，或当天还没签到）只带余额——编一个上限
     永远读成满格。当天用完又无据可依时是 `used: 100`：这是「已知用完」的账号，
     而空窗口列表会被当成未知。

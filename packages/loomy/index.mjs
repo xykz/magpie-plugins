@@ -107,8 +107,6 @@ const toNum = (v) => {
 const codeOf = (payload) => String(payload?.code ?? "").trim()
 const messageOf = (payload) => String(payload?.desc ?? payload?.message ?? "").trim()
 
-const beijingMidnight = () => Math.floor((Date.now() + 8 * 3600e3) / 86400e3) * 86400e3 + 86400e3 - 8 * 3600e3
-
 // The vendor's day is Beijing's, and a check-in answers for that day only.
 // magpie asks again every half hour while the answer says the grant has not
 // landed and it is before noon ("provisional", internal/provider/checkin.go) —
@@ -628,7 +626,7 @@ export async function LoomyAuthPlugin({ client } = {}) {
             // absolute spent count in `used` reads as "2000 percent used"
             const spent = pairPresent ? Math.max(0, dailyLimit - dailyRemaining) : null
             const dailyWallet = pairPresent
-              ? { name: "每日赠送积分", used: Math.min(100, (spent / dailyLimit) * 100), amount: spent, limit: dailyLimit, unit: "credits", resetsAt: beijingMidnight(), span: 86400 }
+              ? { name: "每日赠送积分", used: Math.min(100, (spent / dailyLimit) * 100), amount: spent, limit: dailyLimit, unit: "credits", resetsAt: nextBeijingMidnight(), span: 86400 }
               : daily != null
                 ? // no pair means no limit, and a made-up one always reads as
                   // full; a balance says what is left without inventing it
@@ -834,7 +832,6 @@ export const _internal = {
   normalizePhone,
   makeBase,
   toNum,
-  beijingMidnight,
   nextBeijingMidnight,
   accountKeyOf,
   usageCache,

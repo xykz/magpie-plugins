@@ -675,7 +675,11 @@ function nextBeijingMidnight(nowMs = Date.now()) {
   return Math.floor((nowMs + off) / day) * day + day - off
 }
 
-const untilAnswer = () => new Date(nextBeijingMidnight()).toISOString()
+// The vendor's midnight as an ISO string: when a check-in's answer stops being
+// true, and when the day's window resets. The daily grants lapse at
+// 23:59:59+08:00 on the day they were given (`expire_at` in the bills), so the
+// pool holding them starts again there.
+const beijingMidnightIso = (nowMs = Date.now()) => new Date(nextBeijingMidnight(nowMs)).toISOString()
 
 async function claimDesktopOnboardingGrant(token) {
   try {
@@ -714,17 +718,6 @@ const usageFailed = new Map() // key -> { at, error }
 const entitlementCache = new Map() // key -> { at, value }
 const billsCache = new Map() // key -> { at, value }
 const billsHealedAt = new Map() // key -> ms of the last forced bills read
-
-// beijingMidnight is the next Beijing midnight, the boundary of the vendor's
-// own day: the daily grants lapse at 23:59:59+08:00 on the day they were
-// given (`expire_at` in the bills), so the pool holding them starts again
-// there.
-function beijingMidnight(nowMs = Date.now()) {
-  const shifted = nowMs + 8 * 3600_000
-  const dayStart = Math.floor(shifted / 86_400_000) * 86_400_000
-  return new Date(dayStart + 86_400_000 - 8 * 3600_000).toISOString()
-}
-
 
 function accountKeyOf(a) {
   return String(a?.uid || a?.accountId || a?.access || "")
@@ -917,7 +910,7 @@ async function queryUsage(token, key) {
       amount: daySpent,
       limit: dayLimit,
       unit: "credits",
-      resetsAt: beijingMidnight(now),
+      resetsAt: beijingMidnightIso(now),
       span: 86_400,
       ...(runsOutAt ? { runsOutAt, runsOut: Math.min(daily, expiringPts) } : {}),
     })
@@ -933,7 +926,7 @@ async function queryUsage(token, key) {
     // to nothing beside the wallet below. A spent day with no wallet at all
     // still carries, because a lone `used: 100` is a known, used-up account
     // where an empty window list is an unknown one.
-    windows.push({ name: "每日积分", used: 100, unit: "credits", resetsAt: beijingMidnight(now), span: 86_400 })
+    windows.push({ name: "每日积分", used: 100, unit: "credits", resetsAt: beijingMidnightIso(now), span: 86_400 })
   }
 
   // The permanent wallet weighs only once the day is gone. A wallet has no
@@ -1084,13 +1077,13 @@ async function performCheckIn(a, save) {
         outcome: "claimed",
         credit: onboardingPts,
         message: `桌面端首次登录奖励 +${onboardingPts}`,
-        until: untilAnswer(),
+        until: beijingMidnightIso(),
       }
     }
     return {
       outcome: "done",
       message: "今日已签到",
-      until: untilAnswer(),
+      until: beijingMidnightIso(),
     }
   }
 
@@ -1146,7 +1139,7 @@ async function performCheckIn(a, save) {
       outcome: "claimed",
       credit: totalCredit,
       message: `${names.join(" + ") || "今日积分"} +${totalCredit}`,
-      until: untilAnswer(),
+      until: beijingMidnightIso(),
     }
   }
   return {
@@ -1155,7 +1148,7 @@ async function performCheckIn(a, save) {
     // The ledger lags the grant, so "done" here is "nothing new in the bills
     // yet", not "the vendor has not paid". Saying when to ask again keeps that
     // one re-ask instead of magpie's every-30-minutes-until-noon.
-    until: untilAnswer(),
+    until: beijingMidnightIso(),
   }
 }
 
