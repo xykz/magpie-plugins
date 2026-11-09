@@ -436,11 +436,16 @@ async function enrichCheckin(base, getAuth, deps) {
   // day the vendor has not paid yet. Only a done is re-read; claimed and the
   // other outcomes are the base file's verdict and stand.
   if (base?.outcome !== "done") return base
+  // The base file's `until` says when the vendor's day turns, and the triage
+  // below answers within the same day; the spread keeps it on either answer.
   const history = await readGrantHistory(a.access, deps)
   if (history === null) return base
   const verdict = triageCheckin({ credit: 0, beforeKnown: true, everGranted: history.everGranted, accountAgeDays: history.ageDays })
   if (verdict === "ineligible") {
     return {
+      // the base file's `until` rides along: this verdict is about the same
+      // day, and dropping it would put magpie back on its every-30-minutes ask
+      ...(base?.until ? { until: base.until } : {}),
       outcome: "ineligible",
       message: history.ageDays != null && history.ageDays <= 1
         ? "账号今天刚注册，首次登录奖励还没到账，稍后再试"

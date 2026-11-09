@@ -27,6 +27,16 @@ afterAll(() => {
 
 beforeEach(async () => {
   fake.state.reset()
+  // the readings and the catalog outlive a test (they are module state, keyed
+  // by account and by base), so each test starts with none of them — else the
+  // previous test's numbers answer this one's call
+  _internal.usageCache.clear()
+  _internal.usageInFlight.clear()
+  _internal.usageFailed.clear()
+  _internal.modelsCache.clear()
+  _internal.modelsInFlight.clear()
+  delete process.env.LOOMY_USAGE_TTL_MS
+  delete process.env.LOOMY_MODELS_TTL_MS
   saved = { type: "oauth", access: fake.state.session, expires: 0, accountId: "138****8000", name: "138****8000", source: "manual" }
   plugin = await LoomyAuthPlugin({ client })
 })
@@ -397,7 +407,10 @@ describe("usage", () => {
       // account and the grant only shows
       expect(daily.aside).toBe(true)
       // a reply with only the limit/remaining pair still shows the daily
-      // wallet (remaining IS its number), without dailyBalance
+      // wallet (remaining IS its number), without dailyBalance. A reading is
+      // reused for LOOMY_USAGE_TTL_MS, so the swap of upstream shape is
+      // paired with dropping the reading, as waiting the ttl out would do.
+      _internal.usageCache.clear()
       globalThis.fetch = (input, init) => {
         const url = typeof input === "string" ? input : String(input?.url ?? input)
         if (String(url).includes("/api/v2/points/records"))
@@ -417,6 +430,7 @@ describe("usage", () => {
         globalThis.fetch = realFetch
       }
       // a reply with neither balance field is an error, not a confident zero
+      _internal.usageCache.clear()
       globalThis.fetch = (input, init) => {
         const url = typeof input === "string" ? input : String(input?.url ?? input)
         if (String(url).includes("/api/v2/points/records"))
@@ -591,6 +605,9 @@ describe("renewal", () => {
   // its own store so saves can be counted: the shared one only keeps the record
   let store
   beforeEach(async () => {
+    _internal.usageCache.clear()
+    _internal.usageFailed.clear()
+    _internal.usageInFlight.clear()
     store = {
       auth: { type: "oauth", access: fake.state.session, expires: Date.now() + 14 * 86400e3, accountId: "138****8000", name: "138****8000" },
       saves: [],
@@ -761,3 +778,154 @@ describe("renewal", () => {
   })
 })
 
+
+describe("how often the vendor is read", () => {
+  const auth = () => saved
+
+  test("one reading answers every ask for LOOMY_USAGE_TTL_MS", async () => {
+    // magpie calls usage on clocks of its own: routing once a minute per agent
+    // while chat flows, the tray every few minutes, the Usage page while open.
+    // None of those says the user asked, so the same numbers answer them all.
+    const first = await plugin.auth.usage(auth)
+    const second = await plugin.auth.usage(auth)
+    const third = await plugin.auth.usage(auth)
+    expect(fake.state.recordsReads).toBe(1)
+    for (const u of [first, second, third]) expect(JSON.stringify(u)).toBe(JSON.stringify(first))
+    expect(first.windows.map((w) => w.name)).toContain("每日赠送积分")
+  })
+
+  test("LOOMY_USAGE_TTL_MS=0 turns the reading cache off", async () => {
+    process.env.LOOMY_USAGE_TTL_MS = "0"
+    await plugin.auth.usage(auth)
+    await plugin.auth.usage(auth)
+    expect(fake.state.recordsReads).toBe(2)
+  })
+
+  test("two asks at once share one read of the vendor", async () => {
+    // the tray and routing's allowance refresh can land in the same tick
+    const [a, b] = await Promise.all([plugin.auth.usage(auth), plugin.auth.usage(auth)])
+    expect(fake.state.recordsReads).toBe(1)
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b))
+  })
+
+  test("a reading taken before a renewal still answers, and a lapse is never kept", async () => {
+    await plugin.auth.usage(auth)
+    expect(fake.state.recordsReads).toBe(1)
+    // the vendor revokes the session; the kept reading is not a lie about the
+    // numbers, and a 401 only shows on the next real read
+    saved = { ...saved, access: "gone" }
+    const kept = await plugin.auth.usage(auth)
+    expect(kept.error).toBeUndefined()
+    expect(fake.state.recordsReads).toBe(1)
+    // now let the reading lapse: the lapse is reported, and it is not kept, so
+    // the next ask asks again rather than hiding a dead sign-in for three min
+    _internal.usageCache.clear()
+    const dead = await plugin.auth.usage(auth)
+    expect(dead.signIn).toBe("expired")
+    await plugin.auth.usage(auth)
+    expect(_internal.usageCache.size).toBe(0)
+  })
+
+  test("a failed read is kept for a moment, so an outage is not pressed once a minute", async () => {
+    const realFetch = globalThis.fetch
+    let calls = 0
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/api/v2/points/records")) {
+        calls++
+        return new Response("boom", { status: 502 })
+      }
+      return realFetch(input, init)
+    }
+    try {
+      const first = await plugin.auth.usage(auth)
+      const second = await plugin.auth.usage(auth)
+      expect(first.error).toBeTruthy()
+      expect(second.error).toBe(first.error)
+      expect(calls).toBe(1)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  test("a check-in drops the kept reading, so the press shows what it claimed", async () => {
+    const wallet = (u) => u.windows.find((w) => w.name === "每日赠送积分")
+    // 5000 granted, 3000 left: 2000 spent
+    expect(wallet(await plugin.auth.usage(auth)).amount).toBe(2000)
+    const readsBefore = fake.state.recordsReads
+    const check = await plugin.auth.checkin(auth)
+    expect(check.outcome).toBe("claimed")
+    const after = wallet(await plugin.auth.usage(auth))
+    // the check-in refilled the daily wallet 3000 → 5000, and the reading the
+    // press is looked at says so instead of three minutes of the old number
+    expect(fake.state.recordsReads).toBeGreaterThan(readsBefore)
+    expect(after.amount).toBe(0)
+  })
+
+  test("the catalog is read once for LOOMY_MODELS_TTL_MS, then answered from memory", async () => {
+    const p1 = { models: {} }
+    const first = await plugin.provider.models(p1, { auth: saved })
+    expect(fake.state.modelsReads).toBe(1)
+    expect(Object.keys(first)).toContain("spark-x")
+    const p2 = { models: {} }
+    const second = await plugin.provider.models(p2, { auth: saved })
+    expect(fake.state.modelsReads).toBe(1)
+    // each caller gets its own table, filled from the same reading
+    expect(Object.keys(second)).toEqual(Object.keys(first))
+  })
+
+  test("LOOMY_MODELS_TTL_MS=0 reads the catalog every time", async () => {
+    process.env.LOOMY_MODELS_TTL_MS = "0"
+    await plugin.provider.models({ models: {} }, { auth: saved })
+    await plugin.provider.models({ models: {} }, { auth: saved })
+    expect(fake.state.modelsReads).toBe(2)
+  })
+
+  test("two asks at once for the catalog share one read", async () => {
+    await Promise.all([plugin.provider.models({ models: {} }, { auth: saved }), plugin.provider.models({ models: {} }, { auth: saved })])
+    expect(fake.state.modelsReads).toBe(1)
+  })
+
+  test("a failed catalog read is not remembered, and the static table still answers", async () => {
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/api/v1/models")) return new Response("boom", { status: 502 })
+      return realFetch(input, init)
+    }
+    try {
+      const p = { models: { "DeepSeek-V4.1-Flash": { name: "DeepSeek V4.1 Flash (x2.0)" } } }
+      const list = await plugin.provider.models(p, { auth: saved })
+      expect(list["DeepSeek-V4.1-Flash"]).toBeTruthy()
+      expect(Object.keys(list)).toHaveLength(1)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    // nothing was kept, so the next ask reads again
+    await plugin.provider.models({ models: {} }, { auth: saved })
+    expect(fake.state.modelsReads).toBe(1)
+  })
+
+  test("the check-in says when its answer stops being true", async () => {
+    const claimed = await plugin.auth.checkin(auth)
+    expect(claimed.until).toBeTruthy()
+    const at = Date.parse(claimed.until)
+    expect(at).toBeGreaterThan(Date.now())
+    expect(at - Date.now()).toBeLessThanOrEqual(24 * 3600e3)
+    // Beijing midnight, whatever the process's own zone says
+    expect(new Date(at + 8 * 3600e3).toISOString().slice(11, 19)).toBe("00:00:00")
+    // a repeat (done) carries the same answer: magpie holds both
+    const again = await plugin.auth.checkin(auth)
+    expect(again.outcome).toBe("done")
+    expect(Date.parse(again.until)).toBe(at)
+  })
+
+  test("nextBeijingMidnight is the vendor's day turning, not ours", () => {
+    const day = 24 * 3600e3
+    expect(_internal.nextBeijingMidnight(Date.UTC(2026, 10, 6, 2, 0, 0))).toBe(Date.UTC(2026, 10, 6, 16, 0, 0))
+    // a second before: still the same midnight
+    expect(_internal.nextBeijingMidnight(Date.UTC(2026, 10, 6, 15, 59, 59))).toBe(Date.UTC(2026, 10, 6, 16, 0, 0))
+    // exactly at it: the next day's
+    expect(_internal.nextBeijingMidnight(Date.UTC(2026, 10, 6, 16, 0, 0))).toBe(Date.UTC(2026, 10, 6, 16, 0, 0) + day)
+  })
+})

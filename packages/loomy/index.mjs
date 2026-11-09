@@ -50,6 +50,26 @@ const AUTH_CODES = new Set(["020002", "100002"])
 
 const REQUEST_TIMEOUT = 20_000
 
+// ── how often the vendor's non-chat endpoints are read ─────────────────────
+// magpie asks for an account's allowance on clocks of its own — routing
+// re-reads one account once a minute while chat requests flow through it
+// (internal/provider/routing.go Allowances), the tray every few minutes
+// (TrayUsageEvery), the Usage page while it is open — and a hook is handed no
+// sign of which one asked. Magpie already caches a reading for a minute
+// (internal/provider/login_usage.go), so a shorter ttl here would cut nothing:
+// three minutes leaves routing's sort at most one read behind and a user
+// pressing 刷新 at most three minutes stale. 0 turns the cache off.
+const msEnv = (name, fallback) => {
+  const raw = process.env[name]
+  if (raw == null || String(raw).trim() === "") return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+const usageTtlMs = () => msEnv("LOOMY_USAGE_TTL_MS", 3 * 60 * 1000)
+const modelsTtlMs = () => msEnv("LOOMY_MODELS_TTL_MS", 10 * 60 * 1000)
+// a read that just failed is remembered for a moment: routing is back in a
+// minute, and an endpoint answering 500 should not be pressed on every pass
+const USAGE_FAIL_TTL_MS = 30 * 1000
 
 // the chat models the live /api/v1/models returned on 2026-10-16 (the image
 // models come from the live list only; the loader draws with them through
@@ -88,6 +108,40 @@ const codeOf = (payload) => String(payload?.code ?? "").trim()
 const messageOf = (payload) => String(payload?.desc ?? payload?.message ?? "").trim()
 
 const beijingMidnight = () => Math.floor((Date.now() + 8 * 3600e3) / 86400e3) * 86400e3 + 86400e3 - 8 * 3600e3
+
+// The vendor's day is Beijing's, and a check-in answers for that day only.
+// magpie asks again every half hour while the answer says the grant has not
+// landed and it is before noon ("provisional", internal/provider/checkin.go) —
+// up to 24 asks a day for an account checked in early. A reply that names when
+// it stops being true ends that (internal/provider/plugin_checkin.go turns
+// `until` into ValidUntil, and workbuddy_checkin.go's settled() holds it).
+// A press of 签到 still re-asks, so this costs the user nothing.
+const nextBeijingMidnight = (nowMs = Date.now()) => {
+  const day = 24 * 3600e3
+  const off = 8 * 3600e3
+  return Math.floor((nowMs + off) / day) * day + day - off
+}
+
+// ── what one reading answers for ───────────────────────────────────────────
+// The caches live on the account, not the token: a renewal swaps the access
+// string and must not buy a second read of the same numbers.
+
+const accountKeyOf = (a) => String(a?.accountId || a?.uid || a?.name || a?.access || "")
+
+const fresh = (entry, ttl) => !!entry && ttl > 0 && Date.now() - entry.at < ttl
+
+// the points record is one small GET; a failed one is worth remembering for
+// half a minute so a vendor outage is not asked once a minute per agent
+const usageCache = new Map()
+const usageInFlight = new Map()
+const usageFailed = new Map()
+// the catalogue changes when the vendor ships a model, not per request. Entry:
+// { at, value: entries }; keyed by base and account, because the endpoint is
+// asked with the account's token and nothing says two accounts see one list
+const modelsCache = new Map()
+const modelsInFlight = new Map()
+
+const untilAnswer = () => new Date(nextBeijingMidnight()).toISOString()
 
 class SignedOut extends Error {}
 const expired = (message) => Object.assign(new Error(message), { signIn: "expired" })
@@ -535,55 +589,81 @@ export async function LoomyAuthPlugin({ client } = {}) {
         try {
           const a = await getAuth()
           if (a?.type !== "oauth") return { error: "not signed in", signIn: "kept" }
-          const payload = await tokenRequest("GET", "/api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat", a.access, undefined, { accept: "*/*" })
-          const code = codeOf(payload)
-          if (AUTH_CODES.has(code)) return { error: "Loomy 登录态已失效，请重新登录", signIn: "expired" }
-          if (code !== OK) return { error: `积分查询失败：${messageOf(payload) || `code=${code}`}`, signIn: "kept" }
-          const data = payload?.data?.data ?? payload?.data ?? {}
-          const daily = toNum(data.dailyBalance)
-          const permanent = toNum(data.balance)
-          // this endpoint is a records list, so a reply without the balance
-          // fields is a realistic case — "unknown" must not read as a
-          // confident zero
-          const dailyLimit = toNum(data.dailyLimitPoints)
-          const dailyRemaining = toNum(data.dailyRemainingPoints)
-          // a zero limit is no share at all, so the pair only counts with one
-          const pairPresent = dailyLimit > 0 && dailyRemaining != null
-          if (daily == null && permanent == null && !pairPresent)
-            return { error: `积分响应没有返回余额字段（${JSON.stringify(data).slice(0, 120)}）`, signIn: "kept" }
-          // the daily wallet shows from whichever numbers came back: the
-          // limit/remaining pair alone is enough (remaining IS its number);
-          // with only dailyBalance it is an amount without a limit; with
-          // neither, no daily wallet at all — a missing one is not 0
-          //
-          // magpie reads `used` as a 0–100 share and `amount` as the share's
-          // count (host.js), so the pair goes in as a share plus a count: an
-          // absolute spent count in `used` reads as "2000 percent used"
-          const spent = pairPresent ? Math.max(0, dailyLimit - dailyRemaining) : null
-          const dailyWallet = pairPresent
-            ? { name: "每日赠送积分", used: Math.min(100, (spent / dailyLimit) * 100), amount: spent, limit: dailyLimit, unit: "credits", resetsAt: beijingMidnight(), span: 86400 }
-            : daily != null
-              ? // no pair means no limit, and a made-up one always reads as
-                // full; a balance says what is left without inventing it
-                { name: "每日赠送积分", balance: daily, unit: "credits" }
-              : null
-          // a prepaid wallet knows what is left and no share of what (#3950)
-          const permanentWallet = permanent != null ? { name: "永久积分", balance: permanent, unit: "credits" } : null
-          // magpie weighs an account by the windows it does not set aside
-          // (`routing.go`: `if w.Aside || w.Text { continue }`), and one with
-          // none of those reads 剩余额度未知 on the Routing page. So exactly
-          // one window has to stay un-aside: the wallet while it holds
-          // credits, the grant only when the wallet is empty — a lone
-          // balance of 0 is read as used up, and a spent day must not bench
-          // an account its wallet still pays for
-          const walletCarries = permanentWallet != null && (permanent > 0 || dailyWallet == null)
-          if (dailyWallet && walletCarries) dailyWallet.aside = true
-          if (permanentWallet && !walletCarries) permanentWallet.aside = true
-          const windows = [dailyWallet, permanentWallet].filter(Boolean)
-          // no `signIn` on a clean read: that absence is how magpie takes an
-          // expired mark back off the account (a "kept" here would leave a
-          // transient 401's lapse on forever)
-          return { plan: NAME, user: a.name || a.accountId, windows }
+          const key = accountKeyOf(a)
+          // routing asks once a minute per agent while chat flows; this reading
+          // answers every ask for LOOMY_USAGE_TTL_MS
+          const cached = usageCache.get(key)
+          if (fresh(cached, usageTtlMs())) return { ...cached.value }
+          // a read that just failed is not asked again at once. A lapse never
+          // lands here: magpie has to see it.
+          const failed = usageFailed.get(key)
+          if (fresh(failed, USAGE_FAIL_TTL_MS)) return { ...failed.value }
+          const busy = usageInFlight.get(key)
+          if (busy) return busy
+
+          const read = (async () => {
+            const payload = await tokenRequest("GET", "/api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat", a.access, undefined, { accept: "*/*" })
+            const code = codeOf(payload)
+            if (AUTH_CODES.has(code)) return { error: "Loomy 登录态已失效，请重新登录", signIn: "expired" }
+            if (code !== OK) return { error: `积分查询失败：${messageOf(payload) || `code=${code}`}`, signIn: "kept" }
+            const data = payload?.data?.data ?? payload?.data ?? {}
+            const daily = toNum(data.dailyBalance)
+            const permanent = toNum(data.balance)
+            // this endpoint is a records list, so a reply without the balance
+            // fields is a realistic case — "unknown" must not read as a
+            // confident zero
+            const dailyLimit = toNum(data.dailyLimitPoints)
+            const dailyRemaining = toNum(data.dailyRemainingPoints)
+            // a zero limit is no share at all, so the pair only counts with one
+            const pairPresent = dailyLimit > 0 && dailyRemaining != null
+            if (daily == null && permanent == null && !pairPresent)
+              return { error: `积分响应没有返回余额字段（${JSON.stringify(data).slice(0, 120)}）`, signIn: "kept" }
+            // the daily wallet shows from whichever numbers came back: the
+            // limit/remaining pair alone is enough (remaining IS its number);
+            // with only dailyBalance it is an amount without a limit; with
+            // neither, no daily wallet at all — a missing one is not 0
+            //
+            // magpie reads `used` as a 0–100 share and `amount` as the share's
+            // count (host.js), so the pair goes in as a share plus a count: an
+            // absolute spent count in `used` reads as "2000 percent used"
+            const spent = pairPresent ? Math.max(0, dailyLimit - dailyRemaining) : null
+            const dailyWallet = pairPresent
+              ? { name: "每日赠送积分", used: Math.min(100, (spent / dailyLimit) * 100), amount: spent, limit: dailyLimit, unit: "credits", resetsAt: beijingMidnight(), span: 86400 }
+              : daily != null
+                ? // no pair means no limit, and a made-up one always reads as
+                  // full; a balance says what is left without inventing it
+                  { name: "每日赠送积分", balance: daily, unit: "credits" }
+                : null
+            // a prepaid wallet knows what is left and no share of what (#3950)
+            const permanentWallet = permanent != null ? { name: "永久积分", balance: permanent, unit: "credits" } : null
+            // magpie weighs an account by the windows it does not set aside
+            // (`routing.go`: `if w.Aside || w.Text { continue }`), and one with
+            // none of those reads 剩余额度未知 on the Routing page. So exactly
+            // one window has to stay un-aside: the wallet while it holds
+            // credits, the grant only when the wallet is empty — a lone
+            // balance of 0 is read as used up, and a spent day must not bench
+            // an account its wallet still pays for
+            const walletCarries = permanentWallet != null && (permanent > 0 || dailyWallet == null)
+            if (dailyWallet && walletCarries) dailyWallet.aside = true
+            if (permanentWallet && !walletCarries) permanentWallet.aside = true
+            const windows = [dailyWallet, permanentWallet].filter(Boolean)
+            // no `signIn` on a clean read: that absence is how magpie takes an
+            // expired mark back off the account (a "kept" here would leave a
+            // transient 401's lapse on forever)
+            return { plan: NAME, user: a.name || a.accountId, windows }
+          })()
+            .catch((e) => ({ error: String(e?.message ?? e), signIn: e?.signIn === "expired" ? "expired" : "kept" }))
+            .then((answer) => {
+              // the reading — windows, plan, name — is what is reused. A lapse
+              // is returned straight through; it is magpie's to act on.
+              if (answer.signIn === "expired") return answer
+              if (answer.error) usageFailed.set(key, { at: Date.now(), value: answer })
+              else usageCache.set(key, { at: Date.now(), value: answer })
+              return answer
+            })
+            .finally(() => usageInFlight.delete(key))
+          usageInFlight.set(key, read)
+          return read
         } catch (e) {
           return { error: String(e?.message ?? e), signIn: e?.signIn === "expired" ? "expired" : "kept" }
         }
@@ -602,29 +682,37 @@ export async function LoomyAuthPlugin({ client } = {}) {
           const rec = await tokenRequest("GET", "/api/v2/points/records?pageNo=1&pageSize=1&direction=debit&granularity=chat", a.access, undefined, { accept: "*/*" })
           return toNum(rec?.data?.data?.dailyBalance ?? rec?.data?.dailyBalance)
         }
-        let before
         try {
-          before = await readDaily()
-        } catch (e) {
-          if (e?.signIn === "expired" || e instanceof SignedOut) throw expired("Loomy 登录态已失效，无法刷新每日积分（请重新登录）")
-          // without the pre-read there is no honest claimed/done verdict —
-          // say failed with the reason rather than "already done"
-          return { outcome: "failed", message: `无法读取签到前余额，未执行每日刷新：${e?.message ?? e}` }
+          let before
+          try {
+            before = await readDaily()
+          } catch (e) {
+            if (e?.signIn === "expired" || e instanceof SignedOut) throw expired("Loomy 登录态已失效，无法刷新每日积分（请重新登录）")
+            // without the pre-read there is no honest claimed/done verdict —
+            // say failed with the reason rather than "already done"
+            return { outcome: "failed", message: `无法读取签到前余额，未执行每日刷新：${e?.message ?? e}` }
+          }
+          let payload
+          try {
+            payload = await tokenRequest("POST", "/api/v1/points/first-login", a.access, {}, { accept: "*/*" })
+          } catch (e) {
+            if (e?.signIn === "expired" || e instanceof SignedOut) throw expired("Loomy 登录态已失效，无法刷新每日积分（请重新登录）")
+            return { outcome: "failed", message: `每日积分刷新失败：${e?.message ?? e}` }
+          }
+          const code = codeOf(payload)
+          if (AUTH_CODES.has(code)) throw expired("Loomy 登录态已失效，无法刷新每日积分（请重新登录）")
+          if (code !== OK) return { outcome: "failed", message: `每日积分刷新失败：${messageOf(payload) || `code=${code}`}` }
+          const after = toNum(payload?.data?.dailyBalance ?? payload?.data?.data?.dailyBalance) ?? (await readDaily().catch(() => null))
+          const dailyMsg = after != null ? `每日赠送积分已刷新（当前 ${after}）` : "每日赠送积分已刷新"
+          if (before != null && after != null && after > before) return { outcome: "claimed", credit: after - before, message: `${dailyMsg}；今日首登奖励 +${after - before}`, until: untilAnswer() }
+          return { outcome: "done", message: dailyMsg, until: untilAnswer() }
+        } finally {
+          // a check-in moves the daily balance this account's kept reading was
+          // taken from, and the press is about to be looked at
+          const key = accountKeyOf(a)
+          usageCache.delete(key)
+          usageFailed.delete(key)
         }
-        let payload
-        try {
-          payload = await tokenRequest("POST", "/api/v1/points/first-login", a.access, {}, { accept: "*/*" })
-        } catch (e) {
-          if (e?.signIn === "expired" || e instanceof SignedOut) throw expired("Loomy 登录态已失效，无法刷新每日积分（请重新登录）")
-          return { outcome: "failed", message: `每日积分刷新失败：${e?.message ?? e}` }
-        }
-        const code = codeOf(payload)
-        if (AUTH_CODES.has(code)) throw expired("Loomy 登录态已失效，无法刷新每日积分（请重新登录）")
-        if (code !== OK) return { outcome: "failed", message: `每日积分刷新失败：${messageOf(payload) || `code=${code}`}` }
-        const after = toNum(payload?.data?.dailyBalance ?? payload?.data?.data?.dailyBalance) ?? (await readDaily().catch(() => null))
-        const dailyMsg = after != null ? `每日赠送积分已刷新（当前 ${after}）` : "每日赠送积分已刷新"
-        if (before != null && after != null && after > before) return { outcome: "claimed", credit: after - before, message: `${dailyMsg}；今日首登奖励 +${after - before}` }
-        return { outcome: "done", message: dailyMsg }
       },
       methods,
     },
@@ -646,19 +734,42 @@ export async function LoomyAuthPlugin({ client } = {}) {
       id: ID,
       async models(p, { auth } = {}) {
         if (auth?.type !== "oauth" || !auth.access) return p.models
-        try {
-          const payload = await tokenRequest("GET", "/api/v1/models", auth.access, undefined, { accept: "application/json", json: true })
-          if (codeOf(payload) && codeOf(payload) !== OK) return p.models
-          const entries = Array.isArray(payload?.data) ? payload.data : []
-          for (const entry of entries) {
-            const m = catalogModel(entry)
-            if (!m) continue
-            p.models[m.id] = m.config
-          }
-          return p.models
-        } catch {
-          return p.models
+        // The catalogue changes when the vendor ships a model, not when a
+        // request is made. magpie asks for the list on every model picker and
+        // every agent loop's start, so one answer stands for
+        // LOOMY_MODELS_TTL_MS; a failed list is not remembered — the empty
+        // answer falls back to the static table and the next ask tries again.
+        // Keyed by account (plus base): the endpoint answers with the account's
+        // token, and nothing here has established that two accounts are shown
+        // the same list.
+        const key = `${modelBase()}|${accountKeyOf(auth)}`
+        const cached = modelsCache.get(key)
+        if (!fresh(cached, modelsTtlMs())) {
+          // one ask answers every caller waiting on it: the picker and the
+          // agent loop both ask at once on a fresh start
+          const read =
+            modelsInFlight.get(key) ??
+            (async () => {
+              try {
+                const payload = await tokenRequest("GET", "/api/v1/models", auth.access, undefined, { accept: "application/json", json: true })
+                const entries = codeOf(payload) && codeOf(payload) !== OK ? [] : Array.isArray(payload?.data) ? payload.data : []
+                if (entries.length) modelsCache.set(key, { at: Date.now(), value: entries })
+              } catch {
+                // the static table still answers; nothing is kept
+              } finally {
+                modelsInFlight.delete(key)
+              }
+            })()
+          modelsInFlight.set(key, read)
+          await read
         }
+        const entries = modelsCache.get(key)?.value ?? []
+        for (const entry of entries) {
+          const m = catalogModel(entry)
+          if (!m) continue
+          p.models[m.id] = m.config
+        }
+        return p.models
       },
     },
   }))
@@ -680,4 +791,11 @@ export const _internal = {
   makeBase,
   toNum,
   beijingMidnight,
+  nextBeijingMidnight,
+  accountKeyOf,
+  usageCache,
+  usageInFlight,
+  usageFailed,
+  modelsCache,
+  modelsInFlight,
 }

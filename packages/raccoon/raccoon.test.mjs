@@ -30,10 +30,22 @@ afterEach(() => {
   }
   delete process.env.RACCOON_MAIN_SITE_URL
   delete process.env.RACCOON_BOX_AGENT_CONFIG_DIR
+  delete process.env.RACCOON_USAGE_TTL_MS
+  delete process.env.RACCOON_BILLS_TTL_MS
+  delete process.env.RACCOON_ENTITLEMENT_TTL_MS
   _internal.renewed.clear()
   _internal.renewing.clear()
   _internal.popupGrantReported.clear()
   _internal.checkinInFlight.clear()
+  // usage answers from a young reading (RACCOON_USAGE_TTL_MS, minutes), so a
+  // reading taken by one test would answer the next one's call: each test
+  // starts from no readings at all.
+  _internal.usageCache.clear()
+  _internal.usageInFlight.clear()
+  _internal.usageFailed.clear()
+  _internal.entitlementCache.clear()
+  _internal.billsCache.clear()
+  _internal.billsHealedAt.clear()
 })
 
 function startServer(routes) {
@@ -1386,4 +1398,255 @@ test("a desktop seat's refresh gives nothing, even when user_info answers a phon
     expires: Date.now() + 1_000,
   })
   expect(got).toBeUndefined()
+})
+
+// ---- How often the vendor's non-chat endpoints are read ----------------------
+// magpie asks for an account's allowance on clocks of its own (routing once a
+// minute while chat flows, the tray every few minutes, the Usage page while it
+// is open) and hands the hook no sign of which one asked. These tests hold the
+// plugin to what it can do about that: answer from a young reading, keep a
+// failure for a moment, and tell magpie when its check-in stops being true.
+
+function countingServer() {
+  const hits = { balance: 0, entitlement: 0, bills: 0 }
+  startServer({
+    "GET /api/web/points/v1/balance": () => {
+      hits.balance += 1
+      return Response.json({ code: 0, data: { available_points: 300 } })
+    },
+    "GET /api/web/auth/v1/entitlement_info": () => {
+      hits.entitlement += 1
+      return Response.json({ code: 0, data: { office: { pro_enable: true, plan_type: "Pro" } } })
+    },
+    "GET /api/web/points/v1/bills": () => {
+      hits.bills += 1
+      return Response.json({ code: 0, data: { items: [] } })
+    },
+  })
+  return hits
+}
+
+const authRecord = (access) => ({
+  type: "oauth",
+  access,
+  refresh: "rt1",
+  expires: Date.now() + 3600_000,
+  accountId: "Raccoon-7615755",
+})
+
+test("usage answers from one reading for RACCOON_USAGE_TTL_MS instead of the vendor", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const hits = countingServer()
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+
+  const first = await hooks.auth.usage(async () => authRecord(tok))
+  expect(first.balance).toBe("300 credits")
+  expect(hits.balance).toBe(1)
+
+  // magpie's own clocks: routing's allowance refresh, the tray, the open Usage
+  // page — a minute apart, all inside the TTL
+  const second = await hooks.auth.usage(async () => authRecord(tok))
+  const third = await hooks.auth.usage(async () => authRecord(tok))
+  expect(second.balance).toBe("300 credits")
+  expect(third.balance).toBe("300 credits")
+  expect(hits.balance).toBe(1)
+  // the plan and the ledger are read on their own, longer clocks still
+  expect(hits.entitlement).toBe(1)
+  expect(hits.bills).toBe(1)
+})
+
+test("a kept reading says kept, so magpie never reads a reissue it did not make", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  countingServer()
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const first = await hooks.auth.usage(async () => authRecord(tok))
+  expect(first.signIn).toBe("kept")
+  const again = await hooks.auth.usage(async () => authRecord(tok))
+  expect(again.signIn).toBe("kept")
+  expect(again.user).toBe("Raccoon-7615755")
+})
+
+test("RACCOON_USAGE_TTL_MS=0 turns the reading cache off", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const hits = countingServer()
+  process.env.RACCOON_USAGE_TTL_MS = "0"
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  await hooks.auth.usage(async () => authRecord(tok))
+  await hooks.auth.usage(async () => authRecord(tok))
+  expect(hits.balance).toBe(2)
+})
+
+test("a renewal between two reads does not buy a second reading", async () => {
+  const staleTok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) - 5 })
+  const freshTok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  let refreshCalls = 0
+  startServer({
+    "POST /api/web/auth/v1/refresh": () => {
+      refreshCalls += 1
+      return Response.json({ code: 0, data: { access_token: freshTok, refresh_token: "RT-1" } })
+    },
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 300 } }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const first = await hooks.auth.usage(async () => ({
+    type: "oauth",
+    access: staleTok,
+    refresh: "RT-0",
+    expires: Date.now() - 5000,
+    accountId: "Raccoon-7615755",
+  }))
+  expect(first.signIn).toBe("renewed")
+  // the next call is handed the account as magpie has it — still the old token,
+  // because magpie's own record lags a renewal: the account's reading is the
+  // same reading, so the vendor is not asked again
+  const again = await hooks.auth.usage(async () => ({
+    type: "oauth",
+    access: staleTok,
+    refresh: "RT-0",
+    expires: Date.now() - 5000,
+    accountId: "Raccoon-7615755",
+  }))
+  expect(again.balance).toBe("300 credits")
+  expect(refreshCalls).toBe(1)
+})
+
+test("two calls at once share one read of the vendor", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const hits = countingServer()
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const [a, b] = await Promise.all([
+    hooks.auth.usage(async () => authRecord(tok)),
+    hooks.auth.usage(async () => authRecord(tok)),
+  ])
+  expect(a.balance).toBe("300 credits")
+  expect(b.balance).toBe("300 credits")
+  expect(hits.balance).toBe(1)
+})
+
+test("a failed read is kept for a moment, a lapse is not", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  let calls = 0
+  startServer({
+    "GET /api/web/points/v1/balance": () => {
+      calls += 1
+      return new Response("upstream is down", { status: 500 })
+    },
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const auth = { type: "oauth", access: tok, refresh: "", accountId: "Raccoon-1" }
+  const first = await hooks.auth.usage(async () => auth)
+  expect(first.error).toContain("HTTP 500")
+  const second = await hooks.auth.usage(async () => auth)
+  expect(second.error).toBe(first.error)
+  // one read, not two: the second call was answered from the kept failure
+  expect(calls).toBe(1)
+})
+
+test("a check-in drops the kept reading, so the press shows what it claimed", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  let avail = 300
+  let hits = 0
+  startServer({
+    "GET /api/web/points/v1/balance": () => {
+      hits += 1
+      return Response.json({ code: 0, data: { available_points: avail } })
+    },
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, data: {} }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const before = await hooks.auth.usage(async () => authRecord(tok))
+  expect(before.balance).toBe("300 credits")
+  // the check-in pays 2000: the card the user is looking at must not keep
+  // saying 300 for the next three minutes
+  avail = 2300
+  await hooks.auth.checkin(async () => ({ ...authRecord(tok), onboardingSettled: true }))
+  const after = await hooks.auth.usage(async () => authRecord(tok))
+  expect(after.balance).toBe("2300 credits")
+  expect(hits).toBe(2)
+})
+
+test("a balance the cached ledger cannot account for reads the ledger again", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  let granted = 300
+  let bills = 0
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 3300 } }),
+    "GET /api/web/points/v1/bills": () => {
+      bills += 1
+      return Response.json({
+        code: 0,
+        data: { items: [{ bill_id: `g${bills}`, biz_type: "daily_grant", points: granted, expire_at: "2029-10-18T23:59:59+08:00" }] },
+      })
+    },
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  // the ledger is young but says 300 while the wallet holds 3300: that is a
+  // grant the ledger has not caught up with, not a negative `used`
+  const first = await hooks.auth.usage(async () => authRecord(tok))
+  expect(first.windows[0]?.amount ?? first.balance).toBe("3300 credits")
+  expect(bills).toBe(2)
+  // and the self-heal is itself held to the bills TTL: a second call inside it
+  // does not read the ledger twice more
+  await hooks.auth.usage(async () => authRecord(tok))
+  expect(bills).toBe(2)
+})
+
+test("the check-in says when its answer stops being true", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  startServer({
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, data: {} }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const r = await hooks.auth.checkin(async () => ({ ...authRecord(tok), onboardingSettled: true }))
+  expect(r.outcome).toBe("done")
+  // magpie re-asks a "done" every 30 minutes until noon unless the answer names
+  // an `until` (internal/provider/checkin.go, workbuddy_checkin.go settled())
+  expect(r.until).toBeTruthy()
+  const until = Date.parse(r.until)
+  expect(Number.isFinite(until)).toBe(true)
+  expect(until).toBeGreaterThan(Date.now())
+  // the next Beijing midnight, and nothing later than a day away
+  expect(until - Date.now()).toBeLessThanOrEqual(24 * 3600_000)
+  expect(new Date(until + 8 * 3600_000).toISOString().slice(11, 19)).toBe("00:00:00")
+})
+
+test("a claimed check-in carries the same until", async () => {
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  // the before-snapshot is the first read and has no grant in it; the re-read
+  // right after does — a grant that landed between the two calls
+  let reads = 0
+  startServer({
+    "GET /api/web/points/v1/bills": () => {
+      reads += 1
+      const granted = reads > 1
+      return Response.json({
+        code: 0,
+        data: {
+          items: granted
+            ? [{ bill_id: "today", biz_type: "daily_grant", points: 300, created_at: _internal.beijingTodayKey() + "T00:00:01" }]
+            : [],
+        },
+      })
+    },
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, data: {} }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const r = await hooks.auth.checkin(async () => ({ ...authRecord(tok), onboardingSettled: true }))
+  expect(r.outcome).toBe("claimed")
+  expect(r.until).toBeTruthy()
+})
+
+test("nextBeijingMidnight is the vendor's day turning, not ours", async () => {
+  // 2026-11-06T10:00:00+08:00
+  const at = Date.UTC(2026, 10, 6, 2, 0, 0)
+  expect(_internal.nextBeijingMidnight(at)).toBe(Date.UTC(2026, 10, 6, 16, 0, 0))
+  // the last second of a Beijing day still points at the next one
+  const late = Date.UTC(2026, 10, 6, 15, 59, 59)
+  expect(_internal.nextBeijingMidnight(late)).toBe(Date.UTC(2026, 10, 6, 16, 0, 0))
+  // and the first second after it points a day further
+  const early = Date.UTC(2026, 10, 6, 16, 0, 0)
+  expect(_internal.nextBeijingMidnight(early)).toBe(Date.UTC(2026, 10, 7, 16, 0, 0))
 })

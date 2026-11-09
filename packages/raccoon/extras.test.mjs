@@ -764,3 +764,38 @@ test("extendRaccoon returns a plugin that has no auth untouched", () => {
   const plugin = { config: async () => {} }
   expect(extendRaccoon(plugin, {})).toBe(plugin)
 })
+
+// The triage below the check-in wraps the base file's answer, and magpie stops
+// re-asking a check-in at the `until` it carries (internal/provider/checkin.go).
+// An answer that drops it puts magpie back on its every-30-minutes ask for the
+// rest of the morning, so both triage verdicts keep it.
+test("the triage keeps the base check-in's until when it says ineligible", async () => {
+  const until = "2026-11-06T16:00:00.000Z"
+  const out = extendRaccoon(stubPlugin({ outcome: "done", message: "今日已签到", until }), {
+    apiGetJson: async (path) => {
+      if (path.includes("/mobile/v1/")) return { granted: false }
+      // no grant bill has ever landed and the account is hours old: the grant
+      // has not been paid yet, which is the one case the triage renames
+      return { items: [{ bill_id: "new", biz_type: "consume", points: -1, created_at: new Date().toISOString() }] }
+    },
+    saveAuth: async () => {},
+  })
+  const got = await out.auth.checkin(async () => authWith({ mobileOnboardingSettled: true }))
+  expect(got.outcome).toBe("ineligible")
+  expect(got.until).toBe(until)
+})
+
+test("a done the triage lets stand keeps its until", async () => {
+  const until = "2026-11-06T16:00:00.000Z"
+  const out = extendRaccoon(stubPlugin({ outcome: "done", message: "今日已签到", until }), {
+    apiGetJson: async (path) => {
+      if (path.includes("/mobile/v1/")) return { granted: false }
+      // a grant has landed before: the vendor simply has not paid today yet
+      return { items: [{ bill_id: "g", biz_type: "daily_grant", points: 300, created_at: "2026-11-05T00:00:00Z" }] }
+    },
+    saveAuth: async () => {},
+  })
+  const got = await out.auth.checkin(async () => authWith({ mobileOnboardingSettled: true }))
+  expect(got.outcome).toBe("done")
+  expect(got.until).toBe(until)
+})
