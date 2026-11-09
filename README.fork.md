@@ -433,6 +433,55 @@ read a user's own action makes necessary. `RACCOON_*_TTL_MS` /
 `LOOMY_*_TTL_MS` set to `0` turns the corresponding cache off, which is what
 the tests use.
 
+### The two point wallets: which one carries the account
+
+Loomy reports two balances and they are not alike: a **daily grant** of 5000
+points per account, refreshed by the vendor on the day's first login and worth
+nothing after Beijing midnight, and **permanent points**, which differ per
+account and never expire. The vendor spends the grant first and the wallet only
+once the day is gone — so the grant decides who answers, and the wallet decides
+only among accounts whose grant is already gone.
+
+magpie weighs an account only by the windows a plugin does *not* set aside
+(`allowanceOf`: `if w.Aside || w.Text { continue }`), and an account with no
+window left carries no allowance at all — the Routing page reads 剩余额度未知.
+So the grant always carries, and the wallet joins it once the day is spent:
+
+- **The grant carries at every share, 0% to 100%.** It is the one with a share
+  (`used`, 0–100) and an expiry, and that share is the only reading magpie can
+  order an account by: `usage` compares it directly, `pace` divides what is left
+  by the hours until it renews, and `smart` — the default — sorts on it for
+  nothing more than its tier (fine below 90%, low, spent past 98%), which is
+  enough to keep a nearly-spent day behind a fresh one.
+- **The mark is the day's last point, not magpie's 98%.** Those last two points
+  of grant still pay, so they are still spent first; the wallet must not weigh
+  while anything in the grant is left, or a wallet-heavy account would jump
+  ahead of one still holding 10% of its day.
+- **Once the day is gone the wallet weighs *beside* the grant, and the grant
+  does not step aside.** `used: 100` keeps the account in the used-up tier, so
+  it stays behind every account whose day still has something in it, however
+  large its wallet; and `Allowance.For` takes the max share while
+  `Allowance.Left` takes the min balance from separate windows, so the balance
+  breaks the tie *inside* that tier. The grant stepping aside instead would read
+  as an account with no share at all, which `usage` keeps ahead of a day nearly
+  gone — the wrong side entirely.
+- **The wallet ranks the spent accounts under `usage`**, which compares the
+  share first and the balance after it (`LeastUsed`). `smart` and `pace` order
+  the used-up tier by the share alone, so there the balance decides nothing —
+  it is never weighed early, which is the part that matters.
+- **An empty wallet never weighs**, because magpie reads a lone `balance: 0` as
+  used up and would say a spent account has nothing at all. Nor does a wallet
+  with no limit/remaining pair to rank against: there the day's own
+  `dailyBalance` carries.
+- **A spent grant with no wallet at all keeps carrying**, because a lone
+  `used: 100` is a *known*, used-up account where an empty window list is an
+  unknown one and the Routing page would say nothing.
+
+Nothing is added up anywhere, either: `Allowance.For` takes the max share across
+windows and `Allowance.Left` the min balance, and the one place balances are
+summed is the Usage page's cross-account summary (`mergeQuotas`), which routing
+never reads.
+
 ## `helper/`: carrying sign-ins in from other tools
 
 Both scripts read another tool's store and write magpie's
@@ -668,3 +717,32 @@ later) and both take `--dry-run` and `--install`.
   而插件读的是目录里从不出现的 `max_tokens`，因此线上发现的模型**输出上限一直
   是空的**，只有 `STATIC_MODELS` 里写死的数字会显示。已修，并让 fake 改用目录
   真实的字段拼写。
+- **`loomy` 两个积分窗口由谁承载账号**：Loomy 报两个余额，性质完全不同——
+  每日赠送 5000 分，厂商在当天首次登录时刷新，过了北京零点就作废；永久积分则
+  每个号不一样、永不过期。厂商先扣每日、用完才动永久，所以**由每日积分决定谁
+  应答，永久积分只在整个池子的当日都花完之后才参与决定**。magpie 只按没被
+  `aside` 的窗口称量账号（`allowanceOf`：`if w.Aside || w.Text { continue }`），
+  一个窗口都不剩的账号等于没有额度信息（Routing 页显示「剩余额度未知」），所以
+  **每日赠送始终承载，永久积分在当日花完后加入一起承载**：
+  - **0% 到 100% 都由每日赠送承载**。它有份额（`used` 0–100）也有过期时间，而
+    这个份额是 magpie 唯一能拿来做账号排序的读数：`usage` 直接比它，`pace` 用它
+    除以距续期的小时数，`smart`（默认）则只拿它分桶（90% 以下 fine、98% 以上
+    spent），也足以让快用完的当日排在新鲜的当日之后。
+  - **分界点是当日的最后一点，不是 magpie 的 98%**。那两点额度照样能用，所以还得
+    先花掉；只要每日还剩任何额度，永久积分就不参与称量，否则钱包余额大的号会插到
+    一个当日还剩 10% 的号前面。
+  - **当日花完之后永久积分与每日一同承载，而不是顶替每日**。`used: 100` 保留账号
+    在「已用完」这一档，因此它排在所有当日还有额度的账号之后——不管永久余额多大；
+    而 `Allowance.For` 取最大份额、`Allowance.Left` 取最小余额，来自各自的窗口，
+    于是永久余额只在**这一档内部**打破平手。若反而让每日 `aside` 掉，账号就成了
+    「没有份额」，而 `usage` 把这种排在「份额快用完」的**前面**——方向正好反了。
+  - **钱包在这一档里的排序由 `usage` 体现**：`LeastUsed` 先比份额、再比余额。
+    `smart`/`pace` 在「已用完」档只比份额，所以那里永久余额不决定任何东西——但它
+    永远不会被提前称量，这才是关键。
+  - **空钱包不参与称量**：magpie 把孤零零的 `balance: 0` 读成已用尽，写进「已用完」
+    档等于宣布这个号什么都没了。没有 limit/remaining 这对数字时也一样不参与——那
+    时由每日自己的 `dailyBalance` 承载。
+  - **每日用完而根本没有永久窗口时，仍然让每日承载**：孤零零的 `used: 100` 是
+    「已知、已用完」的账号，而一个窗口都没有是「未知」，Routing 页会什么都不说。
+  另外，任何地方都不做加法：`Allowance.For` 在各窗口间取最大份额、`Allowance.Left`
+  取最小余额，唯一相加的地方是 Usage 页的跨账号汇总（`mergeQuotas`），路由从不读它。

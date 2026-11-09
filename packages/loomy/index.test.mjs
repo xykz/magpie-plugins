@@ -323,13 +323,135 @@ describe("usage", () => {
     // i.e. a spent-out account
     expect(daily.used).toBeCloseTo((100 * (5000 - fake.state.dailyBalance)) / 5000, 5)
     expect(daily.resetsAt).toBeGreaterThan(Date.now())
-    // the prepaid wallet holds credits, so it is the window that carries the
-    // account and the grant only shows
-    expect(daily.aside).toBe(true)
+    // the grant expires at Beijing midnight, so it is the window that carries
+    // the account and the wallet only shows
+    expect(daily.aside).toBeUndefined()
     const permanent = usage.windows.find((w) => w.name === "永久积分")
     expect(permanent.balance).toBe(5000)
     expect(permanent.unit).toBe("credits")
-    expect(permanent.aside).toBeUndefined()
+    expect(permanent.aside).toBe(true)
+  })
+
+  test("a spent day lets the wallet weigh in, and keeps the grant weighing too", async () => {
+    const realFetch = globalThis.fetch
+    // both windows weigh once the day is gone: the grant's `used: 100` keeps
+    // the account in the used-up tier — behind every account whose day still
+    // has something in it — and the wallet's balance breaks the tie inside
+    // that tier. Stepping the grant aside instead would read as "no share at
+    // all", which `usage` ranks ahead of a day nearly gone
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/api/v2/points/records"))
+        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 5000, dailyBalance: 0, dailyLimitPoints: 5000, dailyRemainingPoints: 0, list: [], total: 0 } }), { status: 200 })
+      return realFetch(input, init)
+    }
+    try {
+      const usage = await plugin.auth.usage(getAuth)
+      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
+      const permanent = usage.windows.find((w) => w.name === "永久积分")
+      expect(daily.used).toBe(100)
+      expect(daily.aside).toBeUndefined()
+      expect(permanent.aside).toBeUndefined()
+      expect(permanent.balance).toBe(5000)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  test("a spent day with no wallet still carries, so the account stays known", async () => {
+    const realFetch = globalThis.fetch
+    // nothing to fall back to: a lone `used: 100` reads as used up, where no
+    // window at all reads as 剩余额度未知 and the Routing page says nothing
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/api/v2/points/records"))
+        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { dailyLimitPoints: 5000, dailyRemainingPoints: 0, list: [] } }), { status: 200 })
+      return realFetch(input, init)
+    }
+    try {
+      const usage = await plugin.auth.usage(getAuth)
+      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
+      expect(daily.used).toBe(100)
+      expect(daily.aside).toBeUndefined()
+      expect(usage.windows.find((w) => w.name === "永久积分")).toBeUndefined()
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  test("a full wallet still shows, and no share of the day is invented", async () => {
+    const realFetch = globalThis.fetch
+    // a wallet is a reading, not a share: `used` stays out, so magpie orders
+    // nothing by it. The day is untouched, so the wallet must not weigh yet —
+    // it would rank the pool by permanent points
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/api/v2/points/records"))
+        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 900000, dailyLimitPoints: 5000, dailyRemainingPoints: 5000, list: [], total: 0 } }), { status: 200 })
+      return realFetch(input, init)
+    }
+    try {
+      const usage = await plugin.auth.usage(getAuth)
+      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
+      const permanent = usage.windows.find((w) => w.name === "永久积分")
+      expect(daily.used).toBe(0)
+      expect(daily.aside).toBeUndefined()
+      expect(permanent.balance).toBe(900000)
+      expect(permanent.used).toBeUndefined()
+      expect(permanent.aside).toBe(true)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  test("the wallet stays out while the day has anything in it", async () => {
+    const realFetch = globalThis.fetch
+    // the mark is the day's last point, not magpie's own 98%: a grant with two
+    // points left still pays, so it still ranks first and the wallet is silent
+    const at = async (remaining) => {
+      globalThis.fetch = (input, init) => {
+        const url = typeof input === "string" ? input : String(input?.url ?? input)
+        if (String(url).includes("/api/v2/points/records"))
+          return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 5000, dailyLimitPoints: 5000, dailyRemainingPoints: remaining, list: [], total: 0 } }), { status: 200 })
+        return realFetch(input, init)
+      }
+      const usage = await plugin.auth.usage(getAuth)
+      return {
+        daily: usage.windows.find((w) => w.name === "每日赠送积分"),
+        permanent: usage.windows.find((w) => w.name === "永久积分"),
+      }
+    }
+    try {
+      for (const remaining of [100, 400, 2500, 5000]) {
+        const { daily, permanent } = await at(remaining)
+        expect(daily.aside).toBeUndefined()
+        expect(permanent.aside).toBe(true)
+      }
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  test("an empty wallet stays out even on a spent day, rather than bench the account", async () => {
+    const realFetch = globalThis.fetch
+    // magpie reads a lone `balance: 0` as used up: weighing it beside a spent
+    // grant would say the account has nothing, and it would be passed over
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/api/v2/points/records"))
+        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 0, dailyLimitPoints: 5000, dailyRemainingPoints: 0, list: [], total: 0 } }), { status: 200 })
+      return realFetch(input, init)
+    }
+    try {
+      const usage = await plugin.auth.usage(getAuth)
+      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
+      const permanent = usage.windows.find((w) => w.name === "永久积分")
+      expect(daily.used).toBe(100)
+      expect(daily.aside).toBeUndefined()
+      expect(permanent.aside).toBe(true)
+    } finally {
+      globalThis.fetch = realFetch
+    }
   })
 
   test("one window carries the account, so the Routing page knows the allowance", async () => {
@@ -403,9 +525,9 @@ describe("usage", () => {
       expect(daily.limit).toBeUndefined()
       expect(daily.used).toBeUndefined()
       expect(daily.balance).toBe(3000)
-      // the prepaid wallet holds credits, so it is the one carrying the
-      // account and the grant only shows
-      expect(daily.aside).toBe(true)
+      // the grant still has a balance to spend today, so it carries and the
+      // wallet only shows
+      expect(daily.aside).toBeUndefined()
       // a reply with only the limit/remaining pair still shows the daily
       // wallet (remaining IS its number), without dailyBalance. A reading is
       // reused for LOOMY_USAGE_TTL_MS, so the swap of upstream shape is
