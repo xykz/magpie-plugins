@@ -808,18 +808,29 @@ async function queryUsage(token, key) {
   const avail = Math.floor(Number(points?.available_points) || 0)
   const now = Date.now()
 
+  const said = points?.available_points
+  const told = said != null && said !== "" && Number.isFinite(Number(said))
+  const saidDaily = points?.daily_points
+  const dailyKnown = saidDaily != null && saidDaily !== "" && Number.isFinite(Number(saidDaily))
+  const daily = dailyKnown ? Math.max(0, Math.floor(Number(saidDaily))) : null
+
   // Sum only what the vendor actually reports as granted in unexpired bills.
   // If bills don't account for the current balance, report the balance with no window.
   let bills = firstBills
   let { granted: grantedFromBills, expiringGranted, soonestExpMs, expiringPts } = sumBills(bills, now)
 
   // The balance is read every time and the ledger is not, so a grant that
-  // landed a moment ago shows up in the balance first: the ledger then says
-  // less than the wallet holds, and `used` would read negative. That answer is
-  // the cache being stale, not the vendor disagreeing — read the ledger again,
-  // at most once per bills TTL so an account whose balance the ledger never
+  // landed a moment ago shows up in the balance first. Two shapes of that
+  // staleness matter. When the ledger still accounts for something, it says
+  // less than the wallet holds and `used` would read negative. When the ledger
+  // accounts for nothing while the reply names a day's bucket, the day's own
+  // window is derived from the ledger, so the grant the reply just reported
+  // would render as a bare balance with no share. Either way the answer is the
+  // cache being stale, not the vendor disagreeing — read the ledger again, at
+  // most once per bills TTL so an account whose balance the ledger never
   // accounts for does not turn this into two reads every time.
-  if (grantedFromBills > 0 && grantedFromBills < avail) {
+  const dayMissing = expiringGranted === 0 && daily != null && daily > 0
+  if (dayMissing || (grantedFromBills > 0 && grantedFromBills < avail)) {
     const healed = billsHealedAt.get(key) ?? 0
     if (now - healed >= billsTtlMs()) {
       billsHealedAt.set(key, now)
@@ -834,12 +845,6 @@ async function queryUsage(token, key) {
   const plan = proEnable ? (planType && planType !== "none" ? planType : "Pro") : "Free"
   const expireAt = office?.pro_expired_time || office?.active_plan?.subscription_expired_at || null
   const runsOutAt = soonestExpMs ? new Date(soonestExpMs).toISOString() : null
-
-  const said = points?.available_points
-  const told = said != null && said !== "" && Number.isFinite(Number(said))
-  const saidDaily = points?.daily_points
-  const dailyKnown = saidDaily != null && saidDaily !== "" && Number.isFinite(Number(saidDaily))
-  const daily = dailyKnown ? Math.max(0, Math.floor(Number(saidDaily))) : null
 
   const head = {
     plan,

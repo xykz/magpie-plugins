@@ -1534,6 +1534,50 @@ test("RACCOON_USAGE_TTL_MS=0 turns the reading cache off", async () => {
   expect(hits.balance).toBe(2)
 })
 
+test("a grant the ledger has not caught up with still gets its day's share", async () => {
+  // The balance is read every time, the ledger on its own longer clock — so
+  // for up to RACCOON_BILLS_TTL_MS the balance can name a day's bucket the
+  // cached ledger does not account for. The day's window is derived from that
+  // ledger: served stale, the grant reads as a bare balance with no share, and
+  // routing then weighs the account by a window that says it has nothing.
+  const tok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const today = _internal.beijingTodayKey()
+  let paid = false
+  let billReads = 0
+  startServer({
+    "GET /api/web/points/v1/balance": () =>
+      Response.json({ code: 0, data: paid ? { available_points: 9300, daily_points: 300 } : { available_points: 9000, daily_points: 0 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: { office: { pro_enable: true, plan_type: "Pro" } } }),
+    "GET /api/web/points/v1/bills": () => {
+      billReads += 1
+      const items = paid
+        ? [{ bill_id: "daily-1", biz_type: "daily_grant", event_name: "每日积分发放", points: 300, expire_at: "2029-10-18T23:59:59+08:00" }]
+        : []
+      return Response.json({ code: 0, data: { items } })
+    },
+  })
+  // the ledger's own clock is what is under test here, not the reading's
+  process.env.RACCOON_USAGE_TTL_MS = "0"
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const read = () => hooks.auth.usage(async () => authRecord(tok))
+
+  const before = await read()
+  // the ledger accounts for nothing, so the day reads as spent and the wallet
+  // carries the account
+  expect(before.windows[0]).toMatchObject({ name: "每日积分", used: 100, span: 86_400 })
+  expect(before.windows[1]).toMatchObject({ name: "永久积分", balance: 9000 })
+  expect(before.windows[1].aside).toBeUndefined()
+
+  paid = true
+  const after = await read()
+  // the cached ledger predates the grant, so a stale answer here would be the
+  // bare balance again, with the wallet carrying
+  expect(after.windows[0]).toMatchObject({ name: "每日积分", used: 0, limit: 300, span: 86_400 })
+  expect(after.windows[0].balance).toBeUndefined()
+  // the wallet now weighs, because the day's share carries the spending
+  expect(after.windows[1]).toMatchObject({ name: "永久积分", aside: true })
+})
+
 test("a renewal between two reads does not buy a second reading", async () => {
   const staleTok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) - 5 })
   const freshTok = fakeJwt({ iss: "74350b", exp: Math.floor(Date.now() / 1000) + 3600 })

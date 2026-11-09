@@ -215,11 +215,12 @@ absent is the old reading: one `Credits` share over every unexpired grant,
 else the balance as a wallet. That keeps a vendor reply without the buckets —
 or a relay that strips them — from having its split guessed at.
 
-Tested with `bun test packages/raccoon` (123 pass, 0 fail, 459 expect, across
+Tested with `bun test packages/raccoon` (137 pass, 0 fail, 506 expect, across
 four files: the day's share and the permanent wallet from the vendor's own
 buckets, the wallet aside while the day pays and weighing once it does not,
-an empty wallet making no window, and the old single-window reading for a reply
-without `daily_points`) and `bun scripts/check.mjs` (every package ✓).
+an empty wallet making no window, the old single-window reading for a reply
+without `daily_points`, and a grant the cached ledger has not caught up with)
+and `bun scripts/check.mjs` (every package ✓).
 
 ## `loomy`: password sign-in, and the session it keeps alive
 
@@ -693,9 +694,10 @@ later) and both take `--dry-run` and `--install`.
   `Credits` 窗口跨所有未过期发放，或者余额当钱包。这样厂商回复里没带分桶（或
   中继把它剥掉）时，不会去猜一个拆分出来。
 
-  测试：`bun test packages/raccoon`（123 pass、0 fail、459 expect，四个文件：
+  测试：`bun test packages/raccoon`（137 pass、0 fail、506 expect，四个文件：
   按厂商分桶拆出日 share 与永久钱包、当天还有额度时钱包 aside 而用完时参与、
-  空钱包不生成窗口、没有 `daily_points` 时走旧的单窗口读法）与
+  空钱包不生成窗口、没有 `daily_points` 时走旧的单窗口读法、账单缓存尚未
+  跟上的一次发放）与
   `bun scripts/check.mjs`（每个包 ✓）。
 - **`loomy` 的密码登录与自动续登**：Loomy 没有 refresh token，session 只有
   14 天，唯一能续期的凭据是账号密码，所以本 fork 加了第三种登录方式
