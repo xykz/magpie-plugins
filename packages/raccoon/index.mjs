@@ -1584,9 +1584,16 @@ const raccoonBase = async ({ client }) => {
         } finally {
           // A check-in moves the balance this account's kept reading was taken
           // from, and whoever pressed 签到 is about to look at that card: drop
-          // the reading rather than serve three minutes of the old one.
-          usageCache.delete(accountKeyOf(auth))
-          usageFailed.delete(accountKeyOf(auth))
+          // the reading rather than serve three minutes of the old one. The
+          // ledger is dropped with it, because the day's own window is derived
+          // from it: a stale ledger would leave the grant the press just
+          // claimed reading as a bare balance with no share until the bills
+          // TTL lapsed (10 min).
+          const k = accountKeyOf(auth)
+          usageCache.delete(k)
+          usageFailed.delete(k)
+          billsCache.delete(k)
+          billsHealedAt.delete(k)
         }
       },
       methods: [
