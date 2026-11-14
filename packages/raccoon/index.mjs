@@ -662,11 +662,17 @@ async function claimDesktopOnboardingGrant(token) {
   return { points: 0, settled: false }
 }
 
-// allBills is the account's whole bill history, newest first. The bills
-// endpoint ignores paging.offset and always says total 0, so it can only be
-// asked for the newest N rows; 200 covered under a day of an active account
-// and left out the large grants a balance is made of (plugins #223).
+// allBills is the account's grant (income) bills. The endpoint caps a page
+// at 100 rows and ignores paging.offset; on a busy account the newest rows
+// are all spends, so the grants a balance is made of fall out of view and
+// the Credits window disappears. "type=income" asks the vendor for grants
+// only (daily/reward/topup), which is what the window is built from. A
+// vendor that refuses the filter keeps the old paged read.
 async function allBills(token) {
+  try {
+    const income = await apiGetJson(`/api/web/points/v1/bills?type=income&paging.limit=200&paging.offset=0`, token)
+    if (Array.isArray(income?.items)) return income
+  } catch {}
   let bills = null
   for (const limit of [1000, 5000]) {
     bills = await apiGetJson(`/api/web/points/v1/bills?paging.limit=${limit}&paging.offset=0`, token)
@@ -675,37 +681,105 @@ async function allBills(token) {
   return bills
 }
 
-async function queryUsage(token) {
-  const [points, entitlement, bills] = await Promise.all([
-    apiGetJson("/api/web/points/v1/balance", token),
+// balanceOf is the balance endpoint's answer, once: its `points` are what
+// `daily_points` is read from, and its failure is what `availablePoints` falls
+// back from. An expired sign-in is thrown, not handed on as a failure — there
+// is nothing setting_info could add to it.
+async function balanceOf(token) {
+  try {
+    return { points: await apiGetJson("/api/web/points/v1/balance", token) }
+  } catch (e) {
+    if (e?.signIn === "expired") throw e
+    return { points: null, error: e }
+  }
+}
+
+// availablePoints is the account's balance. /points/v1/balance answers 403,
+// to the vendor's own web page too (plugins #520), so a failure there reads
+// the same number from /office/v3/setting_info. Balance stays first while it
+// may come back: setting_info is the call the clients make on opening, and it
+// can hand out the day's credits. An expired sign-in is said as such, not
+// read again.
+async function availablePoints(token, read) {
+  const { points, error } = read ?? (await balanceOf(token))
+  const n = Number(points?.available_points)
+  if (Number.isFinite(n)) return Math.floor(n)
+  const first = error ?? new Error("balance has no available_points")
+  let info
+  try {
+    info = await apiGetJson("/api/web/office/v3/setting_info", token)
+  } catch (e) {
+    if (e?.signIn === "expired") throw e
+    throw first
+  }
+  const m = Number(info?.available_points)
+  if (!Number.isFinite(m)) throw first
+  return Math.floor(m)
+}
+
+// topBalance holds, per account and per set of grants, the highest balance a
+// read has seen. A balance over every listed grant (plugins #936) has no
+// grant total to measure spending against, so the window's total is that
+// highest balance and what was spent since is what it has gone down by
+// (plugins #1030: 9,965 then 9,964 read 0 / 9,965 then 0 / 9,964). A new or
+// expired grant changes the set and starts it again. Kept in memory: a
+// restarted host starts from the balance it reads.
+const topBalance = new Map()
+
+// queryUsage reads the account's credits, splitting the day's grant from the
+// permanent balance (the vendor's own `daily_points` bucket). The reading of
+// the balance and of the bills is upstream's since 0.1.11: the balance may
+// answer 403 and be read from setting_info instead, the bills are asked for
+// as income, a grant past its expire_at that the balance still holds is
+// counted back, and a balance a little over every listed grant is measured
+// against the highest balance seen. The split is this fork's own: an unknown
+// `daily_points` leaves the one-Credits reading, which is what upstream's
+// version does throughout.
+async function queryUsage(token, account = "") {
+  const read = await balanceOf(token)
+  const [avail, entitlement, bills] = await Promise.all([
+    availablePoints(token, read),
     apiGetJson("/api/web/auth/v1/entitlement_info", token).catch(() => null),
     allBills(token).catch(() => null),
   ])
-  const avail = Math.floor(Number(points?.available_points) || 0)
-  const now = Date.now()
-
-  const said = points?.available_points
-  const told = said != null && said !== "" && Number.isFinite(Number(said))
-  const saidDaily = points?.daily_points
+  const entrance = read.points
+  const saidDaily = entrance?.daily_points
   const dailyKnown = saidDaily != null && saidDaily !== "" && Number.isFinite(Number(saidDaily))
   const daily = dailyKnown ? Math.max(0, Math.floor(Number(saidDaily))) : null
+  const now = Date.now()
+
+  // entitlement_info answers 403 too (plugins #520): an unread plan is left
+  // unsaid, not read as Free.
+  const office = entitlement?.office ?? entitlement?.code ?? {}
+  const proEnable = office?.pro_enable === true || entitlement?.code?.pro_enable === true
+  const planType = office?.active_plan?.type || office?.plan_type || ""
+  const plan = !entitlement ? undefined : proEnable ? (planType && planType !== "none" ? planType : "Pro") : "Free"
+  const expireAt = office?.pro_expired_time || office?.active_plan?.subscription_expired_at || null
+  const head = {
+    ...(plan ? { plan } : {}),
+    ...(proEnable && expireAt ? { until: new Date(expireAt).toISOString() } : {}),
+  }
 
   // Sum only what the vendor actually reports as granted in unexpired bills.
-  // If bills don't account for the current balance, report the balance with no window.
-  //
   // The grants that lapse (a `daily_grant` carries an `expire_at`, a
   // `reward_grant` does not) are the day's own bucket; `grantedFromBills` is
-  // every unexpired grant, which is what the one-share reading uses.
+  // every unexpired grant.
   let grantedFromBills = 0
   let expiringGranted = 0
   let soonestExpMs = 0
   let expiringPts = 0
+  const expired = []
+  const grantKeys = []
   for (const item of Array.isArray(bills?.items) ? bills.items : []) {
     const pts = Math.floor(Number(item?.points) || 0)
     if (pts <= 0) continue
+    grantKeys.push(billKey(item))
     const expStr = typeof item?.expire_at === "string" ? item.expire_at : ""
     const expMs = expStr ? Date.parse(expStr) : 0
-    if (expMs > 0 && expMs <= now) continue
+    if (expMs > 0 && expMs <= now) {
+      expired.push({ pts, expMs })
+      continue
+    }
     grantedFromBills += pts
     if (expMs > now) {
       expiringGranted += pts
@@ -717,18 +791,28 @@ async function queryUsage(token) {
       }
     }
   }
-
-  const office = entitlement?.office ?? entitlement?.code ?? {}
-  const proEnable = office?.pro_enable === true || entitlement?.code?.pro_enable === true
-  const planType = office?.active_plan?.type || office?.plan_type || ""
-  const plan = proEnable ? (planType && planType !== "none" ? planType : "Pro") : "Free"
-  const expireAt = office?.pro_expired_time || office?.active_plan?.subscription_expired_at || null
-  const runsOutAt = soonestExpMs ? new Date(soonestExpMs).toISOString() : null
-
-  const head = {
-    plan,
-    ...(proEnable && expireAt ? { until: new Date(expireAt).toISOString() } : {}),
+  // A grant past its expire_at can still be in the balance: the vendor takes
+  // what is left of it some time later, not at expire_at (plugins #936: a
+  // 9,623 balance against 9,600 of unexpired grants). Until then the balance
+  // is made of it too, so the latest expired grants are counted back in, the
+  // newest first, only as far as the balance needs them.
+  expired.sort((a, b) => b.expMs - a.expMs)
+  for (const g of expired) {
+    if (grantedFromBills >= avail) break
+    grantedFromBills += g.pts
   }
+  // A balance a little over every grant the bills list (plugins #936: 9,623
+  // against 9,600 of grants, none expired) holds credits that come back
+  // outside income bills. That remainder is counted into the window, so the
+  // card still shows one. A balance far over the bills is left balance-only:
+  // the bills don't explain it.
+  if (grantedFromBills > 0 && avail > grantedFromBills && avail - grantedFromBills <= avail / 10) {
+    const key = `${account}\n${grantKeys.sort().join("\n")}`
+    const top = Math.max(avail, topBalance.get(key) ?? 0)
+    topBalance.set(key, top)
+    grantedFromBills = top
+  }
+  const runsOutAt = soonestExpMs ? new Date(soonestExpMs).toISOString() : null
 
   if (daily == null) {
     // The reply names no day's bucket, so there is nothing to split by and a
@@ -753,25 +837,16 @@ async function queryUsage(token) {
     }
     // A balance the bills cannot account for tells no share, but it is still a
     // reading: a wallet window carries it, so routing knows the account and
-    // sorts it by what it has left (#3950). A reply that names no number makes
-    // no window: 0 is what a missing figure reads as, and one at 0 is a
-    // spent-out account.
-    return { ...head, balance: `${avail} credits`, windows: told ? [{ name: "Credits", balance: avail, unit: "credits" }] : [] }
+    // sorts it by what it has left (#3950). `avail` is a number by this point —
+    // a reply that names none at all is an error, not a zero.
+    return { ...head, balance: `${avail} credits`, windows: [{ name: "Credits", balance: avail, unit: "credits" }] }
   }
 
-  // The vendor keeps two kinds of points apart, and separating them is the
-  // point: `daily_points` is the day's grant (300 a check-in), worth nothing
-  // after Beijing midnight; everything else — the onboarding reward, the
-  // monthly and the top-up buckets — never lapses. Reported as two windows,
-  // routing sends a request to an account whose day still holds something
-  // before one whose day is gone, so the grants are spent rather than lost at
-  // midnight.
-  //
   // What is permanent is the rest of the total rather than the named buckets
   // summed, so one the vendor adds later is permanent by default instead of
-  // vanishing; without a named total there is no figure to take it from, and
-  // a missing one must not read as 0.
-  const permanent = !told ? null : Math.max(0, avail - daily)
+  // vanishing. `avail` is the balance availablePoints read, which is the
+  // setting_info number when the balance endpoint refused (plugins #520).
+  const permanent = Math.max(0, avail - daily)
 
   // The day's limit is what its own grants were worth. An `expire_at` is what
   // tells them from the reward — `daily_grant` carries one, `reward_grant`
@@ -863,6 +938,10 @@ async function queryUsage(token) {
   }
 
   return { ...head, windows }
+}
+
+function usageAccount(a) {
+  return String(a?.accountId || a?.uid || a?.phone || a?.name || "")
 }
 
 function billKey(item) {
@@ -1391,13 +1470,13 @@ const raccoonBase = async ({ client }) => {
           let { a, didRenew } = await currentAuth(client, auth)
           let result
           try {
-            result = await queryUsage(a.access)
+            result = await queryUsage(a.access, usageAccount(a))
           } catch (e) {
             if (e?.status === 401 && a.refresh && a.source !== "desktop") {
               const retryAuth = await currentAuth(client, a, true)
               a = retryAuth.a
               didRenew = true
-              result = await queryUsage(a.access)
+              result = await queryUsage(a.access, usageAccount(a))
             } else {
               throw e
             }
@@ -1503,6 +1582,12 @@ export const _internal = {
   beijingMidnightIso,
   beijingDayEndIso,
   billKey,
+  usageAccount,
+  balanceOf,
+  availablePoints,
+  allBills,
+  topBalance,
+  queryUsage,
   popupGrantPoints,
   popupGrantReported,
   checkinInFlight,

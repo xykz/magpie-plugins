@@ -195,7 +195,7 @@ rather than send a different client.
 it to an empty string to leave magpie's own alone.
 
 The one thing it does not change is the version it reports of itself:
-`packages/raccoon/package.json` is `0.1.5-fork.2`, upstream's number with this
+`packages/raccoon/package.json` is `0.1.5-fork.3`, upstream's number with this
 fork's suffix (above) — the package is not renamed, so what a vendor sees is
 still upstream's own name.
 
@@ -359,11 +359,36 @@ absent is the old reading: one `Credits` share over every unexpired grant,
 else the balance as a wallet. That keeps a vendor reply without the buckets —
 or a relay that strips them — from having its split guessed at.
 
-Tested with `bun test packages/raccoon` (131 tests, 446 assertions, across four
+**How the balance and the bills are read is upstream's since 0.1.11**, taken
+whole except for the split on top of it (`queryUsage`, `packages/raccoon/index.mjs`):
+
+- **The balance may answer 403** (plugins#520). It does so to the vendor's own
+  web page too, and until upstream 0.1.7 this plugin read the failure as no
+  balance at all — `Math.floor(Number(points?.available_points) || 0)` is a
+  number whatever came back, so a 403 read the account as zero credit and
+  routing skipped it. The same number is now read from
+  `/api/web/office/v3/setting_info`, the call the clients make on opening. A
+  readable balance is not asked twice.
+- **The bills are asked for as income** (`?type=income`, plugins#223): the
+  endpoint caps a page at 100 rows and ignores `paging.offset`, so on a busy
+  account the newest rows are all spends and the grants a window is built from
+  fall out of view. A vendor that refuses the filter keeps the old paged read.
+- **A grant past its `expire_at` that the balance still holds is counted back**
+  (plugins#936): lapsed grants are walked newest-first until they cover the
+  balance.
+- **A balance a little over every listed grant keeps the window**
+  (plugins#1030): within a tenth over, the total becomes the highest balance
+  seen for that account and set of grants (in memory, `topBalance`), and what
+  was spent is what it has gone down by since.
+- **`entitlement_info` answers 403 too**, so an unread plan is left unsaid
+  rather than read as Free.
+
+Tested with `bun test packages/raccoon` (137 tests, 465 assertions, across four
 files: the day's share and the permanent wallet from the vendor's own buckets,
 the wallet aside while the day pays and weighing once it does not, an empty
-wallet making no window, and the old single-window reading for a reply without
-`daily_points`) and `bun scripts/check.mjs` (every package ✓).
+wallet making no window, the old single-window reading for a reply without
+`daily_points`, and the four readings above) and `bun scripts/check.mjs`
+(every package ✓).
 
 ## `loomy`: password sign-in, and the session it keeps alive
 
@@ -514,18 +539,22 @@ choose one), and the UA is a pinned literal rather than something discovered,
 because magpie does not tell a plugin which opencode it runs under.
 `LOOMY_CLIENT_UA` and `LOOMY_ACCOUNT_UA` override both.
 
-The same captures killed a body rewrite. The plugin used to turn a DeepSeek
-image part into a `<image_base64>…</image_base64>` text marker; the client sends
-a plain `image_url` part and the model reads it (measured: four parts in one
-user message, vendor 200, the model describing the screenshot). Replaying all
-eight captured bodies through the loader now returns each one byte for byte —
-`tools/replay-real.mjs` checks it, `tools/gen-table.mjs` reports it.
+The same captures narrowed a body rewrite. The plugin turned *every* DeepSeek
+image part into an `<image_base64>…</image_base64>` text marker; the client
+sends a plain `image_url` part to the current models and they read it (measured:
+four parts in one user message, vendor 200, the model describing the
+screenshot). This fork first dropped the rewrite entirely; upstream kept it for
+the old line only, and that is what is here now (plugins#811, plugins#1139):
+`deepseek-v4-flash` and `deepseek-v4-flash-0731` still get the marker, while
+`DeepSeek-V4.1-Flash` and `deepseek-v4-flash-1017` keep their parts as sent. The
+rule is `prefersTagFormat`, `packages/loomy/index.mjs`.
 
 One consequence worth stating plainly: `packages/loomy/README.md` is left as
 upstream wrote it, so its chat bullet still claims the old shape — that
 `charset=utf-8` is required ("without it the upstream reads GBK") and that
-DeepSeek images become `<image_base64>` markers. Both are now false. The rule at
-the top of this file is what keeps it that way; this paragraph is where the
+DeepSeek images *become* `<image_base64>` markers. The first is false; the
+second is true only of the old deepseek line. The rule at the top of this file
+is what keeps the package README untouched; this paragraph is where the
 correction lives instead.
 
 One thing this does *not* establish. `packages/loomy/fake.mjs` now enforces the
@@ -592,7 +621,7 @@ for every model discovered live and only the hard-coded `STATIC_MODELS` numbers
 ever showed. `Buddy2api`'s `capacity_fields()` is a fourth independent reading of
 the same names. Fixed, with the fake serving the catalogue's real spelling.
 
-### The two point wallets: which one carries the account
+### The two point wallets, added up
 
 Loomy reports two balances and they are not alike: a **daily grant** of 5000
 points per account, refreshed by the vendor on the day's first login and worth
@@ -601,60 +630,34 @@ account and never expire. The vendor spends the grant first and the wallet only
 once the day is gone — so the grant decides who answers, and the wallet decides
 only among accounts whose grant is already gone.
 
-magpie weighs an account only by the windows a plugin does *not* set aside
-(`allowanceOf`: `if w.Aside || w.Text { continue }`), and an account with no
-window left carries no allowance at all — the Routing page reads 剩余额度未知.
-So the grant always carries, and the wallet joins it once the day is spent:
+Upstream solved this in 0.1.6 by adding the two up into one window, so that is
+what this fork does now too (`totalOf`, `packages/loomy/index.mjs`), and the
+fork's own non-aside day window is gone:
 
-- **The grant carries at every share, 0% to 100%.** It is the one with a share
-  (`used`, 0–100) and an expiry, and that share is the only reading magpie can
-  order an account by: `usage` compares it directly, `pace` divides what is left
-  by the hours until it renews, and `smart` — the default — sorts on it for
-  nothing more than its tier (fine below 90%, low, spent past 98%), which is
-  enough to keep a nearly-spent day behind a fresh one.
-- **The mark is the day's last point, not magpie's 98%.** Those last two points
-  of grant still pay, so they are still spent first; the wallet must not weigh
-  while anything in the grant is left, or a wallet-heavy account would jump
-  ahead of one still holding 10% of its day.
-- **Once the day is gone the wallet weighs *beside* the grant, and the grant
-  does not step aside.** `used: 100` keeps the account in the used-up tier, so
-  it stays behind every account whose day still has something in it, however
-  large its wallet; and `Allowance.For` takes the max share while
-  `Allowance.Left` takes the min balance from separate windows, so the balance
-  breaks the tie *inside* that tier. The grant stepping aside instead would read
-  as an account with no share at all, which `usage` keeps ahead of a day nearly
-  gone — the wrong side entirely.
-- **The wallet ranks the spent accounts under `usage`**, which compares the
-  share first and the balance after it (`LeastUsed`). `smart` and `pace` order
-  the used-up tier by the share alone, so there the balance decides nothing —
-  it is never weighed early, which is the part that matters.
-- **An empty wallet never weighs**, because magpie reads a lone `balance: 0` as
-  used up and would say a spent account has nothing at all. Nor does a wallet
-  with no limit/remaining pair to rank against: there the day's own
-  `dailyBalance` carries.
-- **Both readings of the grant carry `balance`**, so the card says the same
-  thing whether or not the limit pair came back: magpie's `quotaText` reads a
-  balance before a share (`app.js`: `if (w.balance != null) return t("{n}
-  left", ...)`), so an account whose pair arrived and one whose did not both
-  read 剩余 3000 积分.
-- **Both name when the day ends** — `resetsAt`, `span`, `runsOutAt` — and that
-  is a routing fix. A window naming neither a reset nor a span leaves
-  `Seat.Soon` at its zero value, and Smart files a seat whose renewal is unknown
-  *behind every seat that told one* (`strategies.go`: "not known: after those
-  known"), for good: never picked while any other account in the pool has
-  credit. `resetsAt`/`span` alone do not settle it — the grant lapses at
-  23:59:59+08, one second before the midnight it resets at, and
-  `Allowance.Renewal` folds a lapse that comes before the reset into it — so
-  `runsOutAt` is what ties with an account whose pair *was* read. A window that
-  read no pair names `nextBeijingMidnight() - 1000` itself.
-- **A spent grant with no wallet at all keeps carrying**, because a lone
-  `used: 100` is a *known*, used-up account where an empty window list is an
-  unknown one and the Routing page would say nothing.
+- **`积分合计`** is what routing reads — spent of spent + left, renewing at
+  Beijing midnight with `resetsAt`/`span`, and naming what is lost at midnight
+  (`runsOutAt`/`runsOut`) when any daily credits are left. An account is used
+  up only when both wallets are, which is the point: a spent day no longer
+  benches an account its permanent points would still pay for (gocccy0 on X).
+- **Both wallets are `aside: true`**, beside it, so nothing else carries a
+  share and `Allowance.For` sees exactly one window.
+- **The daily wallet's `used` is a share, and its `amount` what was spent**
+  (plugins#889): sent as a count and as what was left, a cap read 800 spent as
+  800% and an amount read compared the credits left with the cap. Upstream
+  0.1.5 fixed the same two fields the same way, so that change of this fork's
+  is now upstream's.
+- **Without the limit pair the daily wallet is an amount, not a share** — a
+  made-up limit would always read as full.
 
-Nothing is added up anywhere, either: `Allowance.For` takes the max share across
-windows and `Allowance.Left` the min balance, and the one place balances are
-summed is the Usage page's cross-account summary (`mergeQuotas`), which routing
-never reads.
+`display` is `${left} credits left` — the number the card shows, which is also
+what m02926 asked for ("显示剩余多少即可"), and it comes from upstream's own
+`totalOf`.
+
+Checked with `bun test packages/loomy` (102 tests, 364 assertions): the total
+carries and both wallets step aside, a spent day with permanent points left is
+not used up, a fresh day reads 0% and an empty one 100%, spending under a
+balance over every grant counts as used, and a reply without the pair is an
+amount without a limit.
 
 ## `helper/`: carrying sign-ins in from other tools
 
@@ -856,9 +859,26 @@ magpie 把选项的 label 截到 60 字符、description 截到 300（`host.js` 
   `Credits` 窗口跨所有未过期发放，或者余额当钱包。这样厂商回复里没带分桶（或
   中继把它剥掉）时，不会去猜一个拆分出来。
 
-  测试：`bun test packages/raccoon`（131 条、446 个断言，四个文件：按厂商分桶
+  **余额与流水怎么读，自 0.1.11 起是上游的**，整段照搬，只在它上面多加拆分
+  （`queryUsage`，`packages/raccoon/index.mjs`）：
+  - **余额接口会返 403**（plugins#520），厂商自己的网页也一样。上游 0.1.7 之前
+    这个插件把失败读成「没有余额」——`Math.floor(Number(points?.available_points) || 0)`
+    对任何输入都给出数字，所以 403 被读成 0 分，路由随即跳过该账号。现在同一个
+    数字改从 `/api/web/office/v3/setting_info` 读，那是客户端打开时本来就要打的
+    接口。余额读得到时不重复问。
+  - **流水按收入问**（`?type=income`，plugins#223）：该接口一页最多 100 行，
+    且忽略 `paging.offset`，忙账号最新几百行全是消费，窗口赖以构建的发放被挤出
+    视野。厂商若拒绝这个过滤，退回原来的翻页读法。
+  - **过了 `expire_at` 但余额里还在的发放倒着计回**（plugins#936）：已作废的
+    发放按到期时间从新到旧累加，直到盖住余额。
+  - **余额比所有列出的发放高一点点时仍出窗口**（plugins#1030）：在一成以内时，
+    总额取该账号该发放集见过的最高余额（进程内 `topBalance`），花掉的就是它此后
+    下降的差额。
+  - **`entitlement_info` 也返 403**，所以读不到的计划留空不说，而不是读成 Free。
+
+  测试：`bun test packages/raccoon`（137 条、465 个断言，四个文件：按厂商分桶
   拆出日 share 与永久钱包、当天还有额度时钱包 aside 而用完时参与、空钱包不
-  生成窗口、没有 `daily_points` 时走旧的单窗口读法）与
+  生成窗口、没有 `daily_points` 时走旧的单窗口读法，以及上面四种读法）与
   `bun scripts/check.mjs`（每个包 ✓）。
 - **`loomy` 的密码登录与自动续登**：Loomy 没有 refresh token，session 只有
   14 天，唯一能续期的凭据是账号密码，所以本 fork 加了第三种登录方式
@@ -937,14 +957,18 @@ magpie 把选项的 label 截到 60 字符、description 截到 300（`host.js` 
   因为插件没有任何一处能择优），UA 是写死的
   字面量而非探测出来的（magpie 不告诉插件它跑在哪个 opencode 版本下）；
   `LOOMY_CLIENT_UA` / `LOOMY_ACCOUNT_UA` 可覆盖。同一批抓包还否掉了一处 body
-  改写：插件原先把 DeepSeek 的图片段改写成 `<image_base64>…</image_base64>`
-  文本标记，而客户端发的就是普通 `image_url`、模型能看图（实测 4 段、厂商 200、
-  模型完整描述了截图）。现在把 8 份真机 body 原样回放，逐字节相同，由
-  `tools/replay-real.mjs` 验证、`tools/gen-table.mjs` 报告。
+  改写：插件原先把**所有** DeepSeek 的图片段改写成
+  `<image_base64>…</image_base64>` 文本标记，而现在的模型收到的就是普通
+  `image_url`、能看图（实测 4 段、厂商 200、模型完整描述了截图）。本 fork 起初
+  把这个改写整个删掉；上游只对老的那条线保留，现在用的是上游的范围
+  （plugins#811、plugins#1139）：`deepseek-v4-flash` 与 `deepseek-v4-flash-0731`
+  仍转标记，`DeepSeek-V4.1-Flash` 与 `deepseek-v4-flash-1017` 保持原样。判定在
+  `prefersTagFormat`（`packages/loomy/index.mjs`）。
   有一件后果要说清：`packages/loomy/README.md` 保持上游原样，所以它「聊天」那条
   仍然写着旧形态——「请求头必须带 `charset=utf-8`（上游对无 charset 的 body 按
-  GBK 解码）」和「DeepSeek 系模型的图片转 `<image_base64>` 标记」。这两句现在都不
-  成立。本文件第 4 行的规矩就是让它保持原样，更正写在这里而不是那里。
+  GBK 解码）」和「DeepSeek 系模型的图片转 `<image_base64>` 标记」。前者不成立，
+  后者只对老的那条线成立。本文件第 4 行的规矩就是让它保持原样，更正写在这里
+  而不是那里。
   这里还要说清一件它**没有**证明的事：`packages/loomy/fake.mjs` 现在强制上述
   按面分发，所以插件若退回「处处都发两个头」测试会红。但测试全绿的含义是
   **插件与抓包一致**，不是**网关要求如此**——客户端证明了新形态被接受，
@@ -984,44 +1008,29 @@ magpie 把选项的 label 截到 60 字符、description 截到 300（`host.js` 
   而插件读的是目录里从不出现的 `max_tokens`，因此线上发现的模型**输出上限一直
   是空的**，只有 `STATIC_MODELS` 里写死的数字会显示。已修，并让 fake 改用目录
   真实的字段拼写。
-- **`loomy` 两个积分窗口由谁承载账号**：Loomy 报两个余额，性质完全不同——
-  每日赠送 5000 分，厂商在当天首次登录时刷新，过了北京零点就作废；永久积分则
-  每个号不一样、永不过期。厂商先扣每日、用完才动永久，所以**由每日积分决定谁
-  应答，永久积分只在整个池子的当日都花完之后才参与决定**。magpie 只按没被
-  `aside` 的窗口称量账号（`allowanceOf`：`if w.Aside || w.Text { continue }`），
-  一个窗口都不剩的账号等于没有额度信息（Routing 页显示「剩余额度未知」），所以
-  **每日赠送始终承载，永久积分在当日花完后加入一起承载**：
-  - **0% 到 100% 都由每日赠送承载**。它有份额（`used` 0–100）也有过期时间，而
-    这个份额是 magpie 唯一能拿来做账号排序的读数：`usage` 直接比它，`pace` 用它
-    除以距续期的小时数，`smart`（默认）则只拿它分桶（90% 以下 fine、98% 以上
-    spent），也足以让快用完的当日排在新鲜的当日之后。
-  - **分界点是当日的最后一点，不是 magpie 的 98%**。那两点额度照样能用，所以还得
-    先花掉；只要每日还剩任何额度，永久积分就不参与称量，否则钱包余额大的号会插到
-    一个当日还剩 10% 的号前面。
-  - **当日花完之后永久积分与每日一同承载，而不是顶替每日**。`used: 100` 保留账号
-    在「已用完」这一档，因此它排在所有当日还有额度的账号之后——不管永久余额多大；
-    而 `Allowance.For` 取最大份额、`Allowance.Left` 取最小余额，来自各自的窗口，
-    于是永久余额只在**这一档内部**打破平手。若反而让每日 `aside` 掉，账号就成了
-    「没有份额」，而 `usage` 把这种排在「份额快用完」的**前面**——方向正好反了。
-  - **钱包在这一档里的排序由 `usage` 体现**：`LeastUsed` 先比份额、再比余额。
-    `smart`/`pace` 在「已用完」档只比份额，所以那里永久余额不决定任何东西——但它
-    永远不会被提前称量，这才是关键。
-  - **空钱包不参与称量**：magpie 把孤零零的 `balance: 0` 读成已用尽，写进「已用完」
-    档等于宣布这个号什么都没了。没有 limit/remaining 这对数字时也一样不参与——那
-    时由每日自己的 `dailyBalance` 承载。
-  - **每日用完而根本没有永久窗口时，仍然让每日承载**：孤零零的 `used: 100` 是
-    「已知、已用完」的账号，而一个窗口都没有是「未知」，Routing 页会什么都不说。
-  - **两种读法都带 `balance`**，所以 limit/remaining 这对数字回没回来，卡片说的话
-    都一样：magpie 的 `quotaText` 先看余额再看份额（`app.js`：
-    `if (w.balance != null) return t("{n} left", ...)`），于是拿到了对的号和没拿到
-    的都显示「剩余 3000 积分」。
-  - **两种读法都说明当天何时结束**：`resetsAt`、`span`、`runsOutAt`。这是路由
-    修复：窗口既不报重置也不报 span，`Seat.Soon` 就停在零值，而 Smart 把「续期
-    未知」的座位永久排在所有报出续期的座位之后（`strategies.go`：「not known:
-    after those known」），于是池子里还有别的账号有额度时它永远不会被选中。只有
-    `resetsAt`/`span` 也不够——当天额度在 23:59:59+08 就作废，比午夜早一秒，而
-    `Allowance.Renewal` 会把早于重置的作废折进重置，所以能和「读到了这对数字」
-    的账号打平的是 `runsOutAt`。没读到这对数字的窗口自己写
-    `nextBeijingMidnight() - 1000`。
-  另外，任何地方都不做加法：`Allowance.For` 在各窗口间取最大份额、`Allowance.Left`
-  取最小余额，唯一相加的地方是 Usage 页的跨账号汇总（`mergeQuotas`），路由从不读它。
+- **`loomy` 两个钱包加起来算**：Loomy 报两个余额，性质不同——每日赠送 5000
+  分，厂商在当天首次登录时刷新，过了北京零点作废；永久积分每个号不一样、
+  永不过期。厂商先扣每日、用完才动永久，所以本该是每日决定谁应答。
+  上游 0.1.6 的做法是把两个余额加成一个窗口交给路由，本 fork 现在也用它
+  （`totalOf`，`packages/loomy/index.mjs`），自己原先那套「日窗不 aside、
+  钱包 aside」的方案已经删掉：
+  - **`积分合计`** 是路由唯一读的窗口：份额是「已花 / 已花+剩余」，按北京午夜
+    重置（`resetsAt`、`span`）；当天还有额度时同时说明午夜会丢掉什么
+    （`runsOutAt`、`runsOut`）。两个钱包都空了才算这个号用完——这正是要点：
+    当日花光不再把一个还有永久积分的号按掉（gocccy0 on X）。
+  - **两个钱包都是 `aside: true`**，并列在它旁边，所以没有别的窗口承载份额，
+    `Allowance.For` 只会看到一个窗口。
+  - **日钱包的 `used` 是份额、`amount` 是已花数**（plugins#889）：原来把计数
+    当份额、把剩余当已花，上限 800 会读成 800%，已花数则被拿去和上限比。
+    上游 0.1.5 把同样两个字段按同样方式修了，所以本 fork 这条改动现在已经
+    是上游的了。
+  - **没有 limit/remaining 这对数字时，日钱包是金额而不是份额**——编一个上限
+    永远读成满格。
+
+  `display` 是 `${left} credits left`，也就是卡片上那个数字，正好是
+  m02926 要的「显示剩余多少即可」，同样来自上游的 `totalOf`。
+
+  测试：`bun test packages/loomy`（102 条、364 个断言）：合计承载而两个钱包
+  都让开、当日花光但还有永久积分不算用完、新的一天读成 0% 而空的一天读成
+  100%、余额高于所有发放时花掉的算作已用、回复里没有那对数字时是只有金额没有
+  上限。

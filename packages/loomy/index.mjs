@@ -94,6 +94,35 @@ const nextBeijingMidnight = (nowMs = Date.now()) => {
   return Math.floor((nowMs + off) / day) * day + day - off
 }
 
+// totalOf is the account's whole credits as the window routing reads: the
+// daily wallet (spent of its limit when the vendor tells the pair, else only
+// what is left) and the permanent balance added up. Spent is what the daily
+// wallet has spent; the permanent balance has nothing spent to tell, so the
+// total is spent of spent + left, and with nothing left it is all used. It
+// renews with the daily wallet at Beijing midnight, when the daily credits
+// left are lost (runsOutAt, runsOut), so routing spends those first. null
+// with neither wallet told.
+function totalOf(dailyWallet, dailyLeft, permanent) {
+  if (dailyLeft == null && permanent == null) return null
+  const spent = dailyWallet?.amount ?? 0
+  const left = Math.max(0, dailyLeft ?? 0) + Math.max(0, permanent ?? 0)
+  const limit = spent + left
+  const w = {
+    name: "积分合计",
+    used: limit > 0 ? (100 * spent) / limit : 100,
+    display: `${left} credits left`,
+    amount: spent,
+    limit,
+    unit: "credits",
+  }
+  if (dailyWallet) {
+    w.resetsAt = nextBeijingMidnight()
+    if (dailyWallet.span) w.span = dailyWallet.span
+    if (dailyLeft > 0) Object.assign(w, { runsOutAt: w.resetsAt, runsOut: dailyLeft })
+  }
+  return w
+}
+
 class SignedOut extends Error {}
 const expired = (message) => Object.assign(new Error(message), { signIn: "expired" })
 
@@ -284,6 +313,43 @@ function foldReasoning(body) {
     }
   }
   return changed
+}
+
+// the older deepseek models on Loomy (deepseek-v4-flash-0731) read
+// images only as <image_base64> markers, not OpenAI image_url parts; their
+// data-URI images are turned into the marker and merged into the text before
+// them (agent2api images.rs). DeepSeek-V4.1-Flash takes image_url parts and
+// reads the marker as plain text (10k prompt tokens, an empty reply), so it
+// keeps the parts as sent (plugins#811), and so does deepseek-v4-flash-1017
+// (plugins#1139). Loomy renames these freely, so only the old line the marker
+// was made for gets it; any other DeepSeek id keeps OpenAI's shape.
+function prefersTagFormat(model) {
+  const m = String(model ?? "").toLowerCase().replace(/^.*\//, "")
+  return /^deepseek-v4-flash(?:-0731)?$/.test(m)
+}
+function toTagText(part) {
+  const kind = String(part?.type ?? "").trim().toLowerCase()
+  if (kind !== "image_url" && kind !== "input_image") return null
+  const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url
+  if (typeof url !== "string" || !url.startsWith("data:")) return null
+  return `<image_base64>${url}</image_base64>`
+}
+function rewriteImagesToTags(body) {
+  let converted = 0
+  for (const message of body.messages ?? []) {
+    if (!Array.isArray(message.content)) continue
+    for (let i = message.content.length - 1; i >= 0; i--) {
+      const tag = toTagText(message.content[i])
+      if (!tag) continue
+      message.content.splice(i, 1)
+      const prev = i > 0 && message.content[i - 1]?.type === "text" ? message.content[i - 1] : null
+      if (prev) prev.text += `\n${tag}`
+      else if (message.content[i]?.type === "text") message.content[i].text = `${tag}\n${message.content[i].text}`
+      else message.content.splice(i, 0, { type: "text", text: tag })
+      converted++
+    }
+  }
+  return converted
 }
 
 // the vendor's /models: OpenAI-shaped entries whose capabilities say what a
@@ -512,14 +578,12 @@ export async function LoomyAuthPlugin({ client, magpie } = {}) {
             const session = (await getAuth())?.access ?? a.access
             if (!session) return errorResponse(401, "Loomy 登录态缺失，请重新登录")
 
-            // Only the reasoning fold remains. The client's own traffic shows
-            // images going to a deepseek model as plain image_url parts — the
-            // <image_base64> marker this used to emit is in neither the client
-            // nor the vendor's answer, and rewriting it dropped the image part
-            // the client had just sent (measured: 623,871 -> 623,858 bytes,
-            // image_url 2 -> 0). A body that arrives correct is left alone.
+            // the body as Loomy's own client writes it: reasoning folded to
+            // its three levels, and the old deepseek line's images as base64
+            // markers (V4.1-Flash keeps its image_url parts, plugins#811)
             try {
               foldReasoning(chat)
+              if (prefersTagFormat(chat.model)) rewriteImagesToTags(chat)
             } catch {}
             let res
             try {
@@ -580,105 +644,41 @@ export async function LoomyAuthPlugin({ client, magpie } = {}) {
           // confident zero
           const dailyLimit = toNum(data.dailyLimitPoints)
           const dailyRemaining = toNum(data.dailyRemainingPoints)
-          // a zero limit is no share at all, so the pair only counts with one
-          const pairPresent = dailyLimit > 0 && dailyRemaining != null
+          const pairPresent = dailyLimit != null && dailyRemaining != null
           if (daily == null && permanent == null && !pairPresent)
             return { error: `积分响应没有返回余额字段（${JSON.stringify(data).slice(0, 120)}）`, signIn: "kept" }
-          // the daily wallet shows from whichever numbers came back: the
-          // limit/remaining pair alone is enough (remaining IS its number);
-          // with only dailyBalance it is an amount without a limit; with
-          // neither, no daily wallet at all — a missing one is not 0
+          // the daily wallet from the vendor's own numbers: spent is
+          // dailyLimitPoints - dailyRemainingPoints. When the pair is absent
+          // the wallet is an amount with no limit — a made-up limit would
+          // always read as full
           //
-          // magpie reads `used` as a 0–100 share and `amount` as the share's
-          // count (host.js), so the pair goes in as a share plus a count: an
-          // absolute spent count in `used` reads as "2000 percent used"
-          const spent = pairPresent ? Math.max(0, dailyLimit - dailyRemaining) : null
-          // Both readings of the day's window carry a `balance`, and both name
-          // when the day ends. The balance is what the card shows either way —
-          // magpie's `quotaText` reads a balance before it reads a share
-          // ("{n} left"), so an account whose limit pair came back and one
-          // whose did not say the same thing, "剩余 3000 积分", instead of one
-          // showing a share the other cannot.
-          //
-          // The reset and the lapse are not decoration: a window that names
-          // neither leaves `Seat.Soon` at its zero value, and Smart files a
-          // seat whose renewal is unknown *behind every seat that told one*
-          // ("not known: after those known", `routes/strategies.go`), for good
-          // — such an account is never picked while any other in the pool has
-          // credit left. The day lapses at 23:59:59+08 whatever the reply
-          // said, so a window that read no limit still names it.
-          const dayEnd = {
-            resetsAt: nextBeijingMidnight(),
-            span: 86400,
-            runsOutAt: nextBeijingMidnight() - 1000,
-          }
+          // In magpie's window, `used` is the share spent (0–100) and
+          // `amount` the credits spent of `limit` (plugins#889): sent as a
+          // count and as what was left, a percentage cap read 800 spent as
+          // 800% and an amount cap compared the credits left with the cap
+          const dailySpent = pairPresent ? Math.min(dailyLimit, Math.max(0, dailyLimit - dailyRemaining)) : null
           const dailyWallet = pairPresent
-            ? // a balance of 0 is left out: `Allowance.Left` takes the least
-              // balance in the unit, and a window saying 0 while its day is
-              // merely spent would drag the account's `Left` to nothing
-              { name: "每日赠送积分", ...(dailyRemaining > 0 ? { balance: dailyRemaining } : {}), used: Math.min(100, (spent / dailyLimit) * 100), amount: spent, limit: dailyLimit, unit: "credits", ...dayEnd, runsOut: dailyRemaining }
+            ? { name: "每日赠送积分", used: dailyLimit > 0 ? (100 * dailySpent) / dailyLimit : 0, amount: dailySpent, limit: dailyLimit, unit: "credits", resetsAt: nextBeijingMidnight(), span: 86400 }
             : daily != null
-              ? // no pair means no limit, and a made-up one always reads as
-                // full; a balance says what is left without inventing it
-                { name: "每日赠送积分", ...(daily > 0 ? { balance: daily } : {}), unit: "credits", ...dayEnd, runsOut: daily }
+              ? { name: "每日赠送积分", used: 0, display: `${daily} credits` }
               : null
-          // a prepaid wallet knows what is left and no share of what (#3950)
-          const permanentWallet = permanent != null ? { name: "永久积分", balance: permanent, unit: "credits" } : null
-          // magpie weighs an account by the windows it does not set aside
-          // (`routing.go`: `if w.Aside || w.Text { continue }`), and an
-          // account with none of those reads 剩余额度未知 on the Routing page.
-          //
-          // The day's grant carries always: its share (`used`, 0–100) is the
-          // only reading magpie can order an account by, and it is what expires
-          // at Beijing midnight. The wallet carries only once the day is gone,
-          // because until then nothing may rank by it: a wallet has no share and
-          // no expiry, so the one thing magpie can order wallets by is the most
-          // left (#3950, `byLeft`) — and since permanent points differ per
-          // account, weighing them early parks the pool on whichever account
-          // holds the most, while the 5000 a day that nobody spent expires at
-          // midnight.
-          //
-          // Once the day is gone the wallet joins *without* the grant stepping
-          // aside, and that is what keeps the order the pool's rather than this
-          // account's. The share stays at 100, which files the account in the
-          // used-up tier (`tier`, routes/strategies.go): behind every account
-          // whose day still has something in it, whatever its wallet holds. And
-          // the balance is read beside the share (`Allowance.For` takes the max
-          // share, `Allowance.Left` the min balance, each window on its own), so
-          // among the accounts whose days are all gone `usage` breaks the tie by
-          // the wallet — the balance with the most left first (LeastUsed, after
-          // the share). Under `smart` and `pace` the used-up tier is ordered by
-          // the share alone, so the balance decides nothing there: it never
-          // outranks a day still in hand, which is the point, but ranking the
-          // spent accounts by their wallets takes `usage`.
-          //
-          // Had the grant stepped aside instead, the account would read as one
-          // with no share at all — `usage` keeps those ahead of a share nearly
-          // gone and `smart` files them as fresh — so a wallet-heavy account
-          // would jump ahead of one still holding 10% of its day.
-          //
-          // A day's last point is the mark, not magpie's own 98%: those two
-          // points still pay, so they are still spent first.
-          //
-          // No limit/remaining pair means no share at all, so there is nothing
-          // to rank the account by: the wallet carries as it did before, and a
-          // lone balance of 0 steps aside rather than read as used up.
-          if (pairPresent) {
-            // the wallet weighs only behind a day already gone, and never one
-            // with nothing in it: a lone `balance: 0` reads as used up
-            if (permanentWallet && (dailyRemaining > 0 || permanent <= 0)) permanentWallet.aside = true
-          } else if (dailyWallet && daily != null && daily > 0) {
-            // no share to rank by, so a balance is all there is: the day's own
-            // figure carries, since that is what expires
-            if (permanentWallet) permanentWallet.aside = true
-          } else if (permanentWallet) {
-            // the day's figure is spent or unknown: the wallet carries while it
-            // holds something (a lone balance of 0 is read as used up, and a
-            // spent day must not bench an account its wallet still pays for)
-            if (dailyWallet) dailyWallet.aside = true
-            if (permanent <= 0) permanentWallet.aside = true
+          // the permanent wallet comes back as a balance alone, with no
+          // total and nothing spent, so on its own there is no share or
+          // spent amount a cap could read
+          const permanentWallet = permanent != null ? { name: "永久积分", used: 0, display: `${permanent} credits` } : null
+          const windows = [...(dailyWallet ? [dailyWallet] : []), ...(permanentWallet ? [permanentWallet] : [])]
+          // A request draws the daily credits first and the permanent ones
+          // after, so the account stops only when both are gone (gocccy0 on
+          // X): the daily wallet as the window that stops it held an account
+          // with permanent credits left, and the permanent one as text alone
+          // left routing nothing to read. So routing reads one window, the two
+          // added up (totalOf), and the two wallets are shown beside it, set
+          // aside, as WorkBuddy's plan and extra credits are.
+          const total = totalOf(dailyWallet, pairPresent ? dailyRemaining : daily, permanent)
+          if (total) {
+            for (const w of windows) w.aside = true
+            windows.unshift(total)
           }
-          const windows = [dailyWallet, permanentWallet].filter(Boolean)
           // no `signIn` on a clean read: that absence is how magpie takes an
           // expired mark back off the account (a "kept" here would leave a
           // transient 401's lapse on forever)
@@ -776,6 +776,9 @@ export const _internal = {
   escapedPath,
   contentMD5,
   foldReasoning,
+  prefersTagFormat,
+  rewriteImagesToTags,
+  totalOf,
   splitRateSuffix,
   catalogModel,
   normalizePhone,

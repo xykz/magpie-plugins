@@ -391,9 +391,11 @@ test("usage keeps the day's window aside while it pays, and lets the wallet weig
 test("a balance reply that names no balance makes no window, an unknown not a zero", async () => {
   const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
   startServer({
-    // the reply is a success with no number in it: 0 would claim the
-    // account is spent out, and routing would bench it
+    // a success with no number in it: 0 would claim the account is spent out,
+    // and routing would bench it. Both reads are asked (plugins #520), and
+    // neither names one, so usage says the error rather than a zero.
     "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, data: { theme: "light" } }),
     "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
     "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
   })
@@ -404,7 +406,8 @@ test("a balance reply that names no balance makes no window, an unknown not a ze
     refresh: "rt1",
     expires: Date.now() + 3600_000,
   }))
-  expect(u.windows).toEqual([])
+  expect(u.windows).toBeUndefined()
+  expect(u.error).toBe("balance has no available_points")
 })
 
 test("the name usage puts on the card is the phone, not the JWT's name (review #486)", async () => {
@@ -489,7 +492,42 @@ test("usage reports the day's share and the permanent wallet apart, from the ven
   expect(u.windows[0].limit).toBe(600)
 })
 
-test("usage reads bills past the newest 200 rows, where the large grants are (plugins #223)", async () => {
+// plugins #223: a page holds the newest 100 rows and offset is ignored, so
+// on a busy account the grants a balance is made of fall out of view. Asking
+// for "type=income" is what keeps the window (upstream 0.2.x, plugins #223).
+test("usage asks for income bills so a busy account keeps its Credits window", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  // newest first, as the endpoint answers: 1200 spends, then the grants
+  const items = []
+  for (let i = 0; i < 1200; i++) items.push({ bill_id: `s${i}`, biz_type: "consume", points: -1 })
+  items.push({ bill_id: "g1", biz_type: "daily_grant", points: 300, expire_at: "2029-10-24T23:59:59+08:00" })
+  items.push({ bill_id: "g2", biz_type: "reward_grant", points: 3000 })
+  items.push({ bill_id: "g3", biz_type: "reward_grant", points: 3000 })
+  const grantees = [
+    { bill_id: "g1", biz_type: "daily_grant", points: 300, expire_at: "2029-10-24T23:59:59+08:00" },
+    { bill_id: "g2", biz_type: "reward_grant", points: 3000 },
+    { bill_id: "g3", biz_type: "reward_grant", points: 3000 },
+  ]
+  const asked = []
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 5100 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/points/v1/bills": (req, u) => {
+      // offset is ignored and total is always 0, as plugins #223 found
+      const type = u.searchParams.get("type")
+      const limit = Number(u.searchParams.get("paging.limit"))
+      asked.push({ type, limit })
+      return Response.json({ code: 0, data: { items: type === "income" ? grantees : items.slice(0, limit), paging: { offset: 0, limit, total: 0 } } })
+    },
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const u = await hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000 }))
+  expect(u.balance).toBeUndefined()
+  expect(u.windows[0]).toMatchObject({ name: "Credits", amount: 1200, limit: 6300, display: "1200 / 6300" })
+  expect(asked).toEqual([{ type: "income", limit: 200 }])
+})
+
+test("usage falls back to paged bills when the vendor refuses type=income (plugins #223)", async () => {
   const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
   // newest first, as the endpoint answers: 1200 spends, then the grants
   const items = []
@@ -502,7 +540,9 @@ test("usage reads bills past the newest 200 rows, where the large grants are (pl
     "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 5100 } }),
     "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
     "GET /api/web/points/v1/bills": (req, u) => {
-      // offset is ignored and total is always 0, as plugins #223 found
+      if (u.searchParams.get("type")) {
+        return new Response(JSON.stringify({ code: 100002, message: "params_invalid_error" }), { status: 400 })
+      }
       const limit = Number(u.searchParams.get("paging.limit"))
       asked.push(limit)
       return Response.json({ code: 0, data: { items: items.slice(0, limit), paging: { offset: 0, limit, total: 0 } } })
@@ -513,6 +553,141 @@ test("usage reads bills past the newest 200 rows, where the large grants are (pl
   expect(u.balance).toBeUndefined()
   expect(u.windows[0]).toMatchObject({ name: "Credits", amount: 1200, limit: 6300, display: "1200 / 6300" })
   expect(asked).toEqual([1000, 5000])
+})
+
+// plugins #520: balance and entitlement_info answer 403 to every account,
+// the vendor's own web page too; setting_info still carries the balance.
+function forbidden() {
+  return new Response(JSON.stringify({ code: 403, message: "Forbidden" }), { status: 403 })
+}
+
+test("usage reads the balance from setting_info when balance answers 403 (plugins #520)", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  startServer({
+    "GET /api/web/points/v1/balance": forbidden,
+    "GET /api/web/auth/v1/entitlement_info": forbidden,
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, message: "success", data: { available_points: 9599 } }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const u = await hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000 }))
+  expect(u.error).toBeUndefined()
+  // the buckets cannot be split with neither bucket told: one wallet window
+  // carries the balance, so routing still knows the account (#3950)
+  expect(u.windows).toEqual([{ name: "Credits", balance: 9599, unit: "credits" }])
+  // entitlement_info was not read, so the plan is not known to be Free
+  expect(u.plan).toBeUndefined()
+})
+
+test("with neither balance read, usage says the error, not 0 credits (plugins #520)", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  startServer({
+    "GET /api/web/points/v1/balance": forbidden,
+    "GET /api/web/auth/v1/entitlement_info": forbidden,
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, data: { theme: "light" } }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const u = await hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000 }))
+  expect(u.balance).toBeUndefined()
+  expect(u.windows).toBeUndefined()
+  expect(u.error).toBe("Forbidden")
+})
+
+test("a readable balance asks setting_info nothing (plugins #520)", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  let asked = 0
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 500 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/office/v3/setting_info": () => {
+      asked++
+      return Response.json({ code: 0, data: { available_points: 1 } })
+    },
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const u = await hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000 }))
+  expect(u.windows).toEqual([{ name: "Credits", balance: 500, unit: "credits" }])
+  expect(asked).toBe(0)
+})
+
+// plugins #936: a grant past its expire_at can still be in the balance — the
+// vendor takes what is left of it some time later, not at expire_at. With no
+// day's bucket to split by, the reading is upstream's own: the newest expired
+// grants are counted back in, only as far as the balance needs them.
+test("a grant past expire_at the balance still holds is counted back (plugins #936)", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const now = Date.now()
+  const iso = (ms) => new Date(ms).toISOString()
+  const day = 86_400_000
+  startServer({
+    "GET /api/web/points/v1/balance": forbidden,
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: { office: { pro_enable: false } } }),
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, data: { available_points: 9623 } }),
+    "GET /api/web/points/v1/bills": () =>
+      Response.json({
+        code: 0,
+        data: {
+          items: [
+            { bill_id: "d4", biz_type: "daily_grant", points: 300, expire_at: iso(now + 5 * day) },
+            { bill_id: "d3", biz_type: "daily_grant", points: 300, expire_at: iso(now + 4 * day) },
+            { bill_id: "d2", biz_type: "daily_grant", points: 300, expire_at: iso(now - 3_600_000) },
+            { bill_id: "d1", biz_type: "daily_grant", points: 300, expire_at: iso(now - 2 * day) },
+            { bill_id: "r1", biz_type: "reward_grant", points: 9000 },
+          ],
+        },
+      }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const u = await hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000 }))
+  expect(u.plan).toBe("Free")
+  // d2 (expired an hour ago) is counted back; d1 is not needed and stays out
+  expect(u.windows[0]).toMatchObject({
+    name: "Credits",
+    amount: 277,
+    limit: 9900,
+    display: "277 / 9900",
+    runsOutAt: iso(Date.parse(iso(now + 4 * day))),
+    runsOut: 300,
+  })
+})
+
+// plugins #1030: a balance over every listed grant has no grant total to
+// measure spending against, so the highest balance seen is the total, per
+// account and per set of grants.
+test("a balance a little over every listed grant keeps the Credits window (plugins #936, #1030)", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  let avail = 9965
+  const grants = [
+    { bill_id: "g6", biz_type: "daily_grant", points: 300, expire_at: "2099-11-17T23:59:59+08:00" },
+    { bill_id: "g5", biz_type: "reward_grant", points: 3000 },
+    { bill_id: "g4", biz_type: "daily_grant", points: 300, expire_at: "2099-11-15T23:59:59+08:00" },
+    { bill_id: "g3", biz_type: "reward_grant", points: 3000 },
+    { bill_id: "g2", biz_type: "daily_grant", points: 300, expire_at: "2099-11-14T23:59:59+08:00" },
+    { bill_id: "g1", biz_type: "reward_grant", points: 3000 },
+  ]
+  startServer({
+    "GET /api/web/points/v1/balance": forbidden,
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/office/v3/setting_info": () => Response.json({ code: 0, data: { available_points: avail } }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: grants } }),
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const read = () =>
+    hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000, accountId: "Raccoon-1030" }))
+  expect((await read()).windows[0]).toMatchObject({ name: "Credits", amount: 0, limit: 9965, display: "0 / 9965" })
+  avail = 9964
+  expect((await read()).windows[0]).toMatchObject({ amount: 1, limit: 9965, display: "1 / 9965" })
+  avail = 9940
+  expect((await read()).windows[0]).toMatchObject({ amount: 25, limit: 9965, display: "25 / 9965" })
+  // another account with the same grants is counted on its own
+  const other = await hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000, accountId: "Raccoon-other" }))
+  expect(other.windows[0]).toMatchObject({ amount: 0, limit: 9940 })
+  // the next day's grant starts the count again
+  grants.unshift({ bill_id: "g7", biz_type: "daily_grant", points: 300, expire_at: "2099-11-18T23:59:59+08:00" })
+  avail = 10240
+  expect((await read()).windows[0]).toMatchObject({ amount: 0, limit: 10240 })
 })
 
 test("checkin preserves renewed tokens, claims once, and returns done on second call", async () => {

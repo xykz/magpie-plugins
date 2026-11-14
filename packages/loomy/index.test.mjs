@@ -174,38 +174,58 @@ describe("chat", () => {
     expect(fake.state.chatCalls[3].body.reasoning_effort).toBeUndefined()
   })
 
-  // The client sends images to a deepseek model as plain image_url parts and
-  // the model reads them: measured in its own traffic, 4 parts in one user
-  // message, `image_url` twice, `<image_base64>` never, vendor 200 with a
-  // description of the screenshot. This plugin used to rewrite that into a
-  // text marker, which dropped the part the client had just sent. So the
-  // assertion is that the body arrives as it was handed over.
-  test("images reach the upstream as image_url, deepseek or not", async () => {
+  test("deepseek images become base64 markers merged into the text", async () => {
     const loader = await plugin.auth.loader(getAuth)
-    const messages = [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "看这张图" },
-          { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
-          { type: "image_url", image_url: { url: "https://example.com/x.png" } },
+    await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        stream: false,
+        messages: [
+          { role: "user", content: [
+            { type: "text", text: "看这张图" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
+            { type: "image_url", image_url: { url: "https://example.com/x.png" } },
+          ] },
         ],
-      },
+      }),
+    })
+    const content = fake.state.chatCalls[0].body.messages[0].content
+    expect(content).toHaveLength(2)
+    expect(content[0].text).toContain("看这张图")
+    expect(content[0].text).toContain("<image_base64>data:image/png;base64,QUJD</image_base64>")
+    // an http(s) URL stays as it was (no evidence the marker accepts URLs)
+    expect(content[1].type).toBe("image_url")
+  })
+
+  test("DeepSeek-V4.1-Flash keeps its image_url parts (plugins#811)", async () => {
+    const loader = await plugin.auth.loader(getAuth)
+    const parts = [
+      { type: "text", text: "图里写的数字是多少" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
     ]
-    for (const model of ["deepseek-v4-flash", "spark-x"]) {
-      await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
-        method: "POST",
-        body: JSON.stringify({ model, stream: false, messages }),
-      })
-    }
-    for (const call of fake.state.chatCalls) {
-      const content = call.body.messages[0].content
-      expect(content).toHaveLength(3)
-      expect(content[0]).toEqual({ type: "text", text: "看这张图" })
-      expect(content[1].type).toBe("image_url")
-      expect(content[2].type).toBe("image_url")
-      expect(JSON.stringify(call.body)).not.toContain("<image_base64>")
-    }
+    await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "DeepSeek-V4.1-Flash", stream: false, messages: [{ role: "user", content: parts }] }),
+    })
+    const content = fake.state.chatCalls[0].body.messages[0].content
+    expect(content).toEqual(parts)
+    expect(JSON.stringify(content)).not.toContain("<image_base64>")
+  })
+
+  test("which models get the base64 marker", () => {
+    // the reporter's ids: V4.1 reads image_url parts, 0731 is the model the
+    // marker was added for
+    expect(_internal.prefersTagFormat("DeepSeek-V4.1-Flash")).toBe(false)
+    expect(_internal.prefersTagFormat("deepseek-v4.1-flash")).toBe(false)
+    expect(_internal.prefersTagFormat("deepseek-v4-flash-0731")).toBe(true)
+    expect(_internal.prefersTagFormat("deepseek-v4-flash")).toBe(true)
+    expect(_internal.prefersTagFormat("loomy/deepseek-v4-flash-0731")).toBe(true)
+    // plugins#1139: 1017 reads image_url parts (232 vs 7,368 prompt tokens)
+    expect(_internal.prefersTagFormat("deepseek-v4-flash-1017")).toBe(false)
+    expect(_internal.prefersTagFormat("DeepSeek-V4-Flash-1017")).toBe(false)
+    expect(_internal.prefersTagFormat("GLM-5.3-Flash")).toBe(false)
+    expect(_internal.prefersTagFormat(undefined)).toBe(false)
   })
 
   test("a refused session says 401", async () => {
@@ -358,207 +378,101 @@ describe("usage", () => {
     expect(usage.signIn).toBeUndefined()
     const daily = usage.windows.find((w) => w.name === "每日赠送积分")
     // the vendor's own numbers: spent = dailyLimitPoints - dailyRemainingPoints
+    // magpie reads `used` as the share spent (0–100) and `amount` as the
+    // credits spent of `limit` (plugins#889)
     expect(daily.limit).toBe(5000)
     expect(daily.amount).toBe(5000 - fake.state.dailyBalance)
-    // `used` is a share, not a count: an absolute 2000 would read as 2000%,
-    // i.e. a spent-out account
-    expect(daily.used).toBeCloseTo((100 * (5000 - fake.state.dailyBalance)) / 5000, 5)
+    expect(daily.used).toBe((100 * (5000 - fake.state.dailyBalance)) / 5000)
+    expect(daily.unit).toBe("credits")
     expect(daily.resetsAt).toBeGreaterThan(Date.now())
-    // the grant expires at Beijing midnight, so it is the window that carries
-    // the account and the wallet only shows
-    expect(daily.aside).toBeUndefined()
     const permanent = usage.windows.find((w) => w.name === "永久积分")
-    expect(permanent.balance).toBe(5000)
-    expect(permanent.unit).toBe("credits")
-    expect(permanent.aside).toBe(true)
+    expect(permanent.display).toBe("5000 credits")
   })
 
-  test("a spent day lets the wallet weigh in, and keeps the grant weighing too", async () => {
+  test("routing reads the two wallets added up, so permanent credits keep an account going after the daily ones run out (gocccy0 on X)", async () => {
     const realFetch = globalThis.fetch
-    // both windows weigh once the day is gone: the grant's `used: 100` keeps
-    // the account in the used-up tier — behind every account whose day still
-    // has something in it — and the wallet's balance breaks the tie inside
-    // that tier. Stepping the grant aside instead would read as "no share at
-    // all", which `usage` ranks ahead of a day nearly gone
-    globalThis.fetch = (input, init) => {
+    const reply = (data) => (input, init) => {
       const url = typeof input === "string" ? input : String(input?.url ?? input)
       if (String(url).includes("/api/v2/points/records"))
-        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 5000, dailyBalance: 0, dailyLimitPoints: 5000, dailyRemainingPoints: 0, list: [], total: 0 } }), { status: 200 })
+        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { ...data, list: [], total: 0 } }), { status: 200 })
       return realFetch(input, init)
     }
+    const read = async (data) => {
+      globalThis.fetch = reply(data)
+      return (await plugin.auth.usage(getAuth)).windows
+    }
+    // routing skips a window set aside: exactly one may stop the account
+    const counted = (ws) => ws.filter((w) => !w.aside)
     try {
-      const usage = await plugin.auth.usage(getAuth)
-      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
-      const permanent = usage.windows.find((w) => w.name === "永久积分")
-      expect(daily.used).toBe(100)
-      expect(daily.aside).toBeUndefined()
-      expect(permanent.aside).toBeUndefined()
-      expect(permanent.balance).toBe(5000)
+      // the daily credits all spent, 1,200 permanent left: not used up
+      let ws = await read({ balance: 1200, dailyBalance: 0, dailyLimitPoints: 5000, dailyRemainingPoints: 0 })
+      expect(counted(ws)).toHaveLength(1)
+      let total = counted(ws)[0]
+      expect(total).toMatchObject({ name: "积分合计", amount: 5000, limit: 6200, unit: "credits" })
+      expect(total.used).toBeCloseTo((100 * 5000) / 6200)
+      expect(total.used).toBeLessThan(100)
+      // the daily wallet at 100% is shown, set aside
+      expect(ws.find((w) => w.name === "每日赠送积分")).toMatchObject({ used: 100, aside: true })
+      expect(ws.find((w) => w.name === "永久积分")).toMatchObject({ display: "1200 credits", aside: true })
+      // nothing of the daily wallet left: nothing lapses at midnight
+      expect(total.runsOutAt).toBeUndefined()
+      expect(total.resetsAt).toBe(_internal.nextBeijingMidnight())
+
+      // both gone: used up, back at Beijing midnight
+      ws = await read({ balance: 0, dailyBalance: 0, dailyLimitPoints: 5000, dailyRemainingPoints: 0 })
+      expect(counted(ws)[0]).toMatchObject({ used: 100, amount: 5000, limit: 5000 })
+
+      // 3,000 daily credits left are lost at midnight: runsOutAt / runsOut
+      ws = await read({ balance: 1200, dailyBalance: 3000, dailyLimitPoints: 5000, dailyRemainingPoints: 3000 })
+      total = counted(ws)[0]
+      expect(total).toMatchObject({ amount: 2000, limit: 6200, runsOut: 3000, span: 86400 })
+      expect(total.runsOutAt).toBe(_internal.nextBeijingMidnight())
+
+      // without the limit pair the daily wallet is what is left: the total
+      // is a balance, used up only when both are 0
+      ws = await read({ balance: 1200, dailyBalance: 0 })
+      expect(counted(ws)).toHaveLength(1)
+      expect(counted(ws)[0]).toMatchObject({ name: "积分合计", used: 0, amount: 0, limit: 1200 })
+      ws = await read({ balance: 0, dailyBalance: 0 })
+      expect(counted(ws)[0]).toMatchObject({ used: 100, limit: 0 })
+      ws = await read({ balance: 1200, dailyBalance: 800 })
+      expect(counted(ws)[0]).toMatchObject({ used: 0, limit: 2000, runsOut: 800 })
+
+      // only the permanent balance told: it alone is the total, no reset
+      ws = await read({ balance: 1200 })
+      total = counted(ws)[0]
+      expect(total).toMatchObject({ used: 0, limit: 1200 })
+      expect(total.resetsAt).toBeUndefined()
+      expect(total.runsOutAt).toBeUndefined()
     } finally {
       globalThis.fetch = realFetch
     }
   })
 
-  test("a spent day with no wallet still carries, so the account stays known", async () => {
+  test("a fresh daily wallet reads as nothing spent, and an empty one as all of it (plugins#889)", async () => {
     const realFetch = globalThis.fetch
-    // nothing to fall back to: a lone `used: 100` reads as used up, where no
-    // window at all reads as 剩余额度未知 and the Routing page says nothing
-    globalThis.fetch = (input, init) => {
+    const reply = (limit, remaining) => (input, init) => {
       const url = typeof input === "string" ? input : String(input?.url ?? input)
       if (String(url).includes("/api/v2/points/records"))
-        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { dailyLimitPoints: 5000, dailyRemainingPoints: 0, list: [] } }), { status: 200 })
+        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 5000, dailyBalance: remaining, dailyLimitPoints: limit, dailyRemainingPoints: remaining, list: [], total: 0 } }), { status: 200 })
       return realFetch(input, init)
     }
+    const daily = async (limit, remaining) => {
+      globalThis.fetch = reply(limit, remaining)
+      return (await plugin.auth.usage(getAuth)).windows.find((w) => w.name === "每日赠送积分")
+    }
     try {
-      const usage = await plugin.auth.usage(getAuth)
-      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
-      expect(daily.used).toBe(100)
-      expect(daily.aside).toBeUndefined()
-      expect(usage.windows.find((w) => w.name === "永久积分")).toBeUndefined()
+      // a cap of 4 credits must not hold an account that has spent none
+      expect(await daily(5000, 5000)).toMatchObject({ used: 0, amount: 0, limit: 5000 })
+      expect(await daily(5000, 0)).toMatchObject({ used: 100, amount: 5000, limit: 5000 })
+      // a zero allowance is no share spent, never NaN
+      expect(await daily(0, 0)).toMatchObject({ used: 0, amount: 0, limit: 0 })
     } finally {
       globalThis.fetch = realFetch
     }
   })
 
-  test("a full wallet still shows, and no share of the day is invented", async () => {
-    const realFetch = globalThis.fetch
-    // a wallet is a reading, not a share: `used` stays out, so magpie orders
-    // nothing by it. The day is untouched, so the wallet must not weigh yet —
-    // it would rank the pool by permanent points
-    globalThis.fetch = (input, init) => {
-      const url = typeof input === "string" ? input : String(input?.url ?? input)
-      if (String(url).includes("/api/v2/points/records"))
-        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 900000, dailyLimitPoints: 5000, dailyRemainingPoints: 5000, list: [], total: 0 } }), { status: 200 })
-      return realFetch(input, init)
-    }
-    try {
-      const usage = await plugin.auth.usage(getAuth)
-      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
-      const permanent = usage.windows.find((w) => w.name === "永久积分")
-      expect(daily.used).toBe(0)
-      expect(daily.aside).toBeUndefined()
-      expect(permanent.balance).toBe(900000)
-      expect(permanent.used).toBeUndefined()
-      expect(permanent.aside).toBe(true)
-    } finally {
-      globalThis.fetch = realFetch
-    }
-  })
-
-  test("the wallet stays out while the day has anything in it", async () => {
-    const realFetch = globalThis.fetch
-    // the mark is the day's last point, not magpie's own 98%: a grant with two
-    // points left still pays, so it still ranks first and the wallet is silent
-    const at = async (remaining) => {
-      globalThis.fetch = (input, init) => {
-        const url = typeof input === "string" ? input : String(input?.url ?? input)
-        if (String(url).includes("/api/v2/points/records"))
-          return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 5000, dailyLimitPoints: 5000, dailyRemainingPoints: remaining, list: [], total: 0 } }), { status: 200 })
-        return realFetch(input, init)
-      }
-      const usage = await plugin.auth.usage(getAuth)
-      return {
-        daily: usage.windows.find((w) => w.name === "每日赠送积分"),
-        permanent: usage.windows.find((w) => w.name === "永久积分"),
-      }
-    }
-    try {
-      for (const remaining of [100, 400, 2500, 5000]) {
-        const { daily, permanent } = await at(remaining)
-        expect(daily.aside).toBeUndefined()
-        expect(permanent.aside).toBe(true)
-      }
-    } finally {
-      globalThis.fetch = realFetch
-    }
-  })
-
-  test("an empty wallet stays out even on a spent day, rather than bench the account", async () => {
-    const realFetch = globalThis.fetch
-    // magpie reads a lone `balance: 0` as used up: weighing it beside a spent
-    // grant would say the account has nothing, and it would be passed over
-    globalThis.fetch = (input, init) => {
-      const url = typeof input === "string" ? input : String(input?.url ?? input)
-      if (String(url).includes("/api/v2/points/records"))
-        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 0, dailyLimitPoints: 5000, dailyRemainingPoints: 0, list: [], total: 0 } }), { status: 200 })
-      return realFetch(input, init)
-    }
-    try {
-      const usage = await plugin.auth.usage(getAuth)
-      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
-      const permanent = usage.windows.find((w) => w.name === "永久积分")
-      expect(daily.used).toBe(100)
-      expect(daily.aside).toBeUndefined()
-      expect(permanent.aside).toBe(true)
-    } finally {
-      globalThis.fetch = realFetch
-    }
-  })
-
-  test("one window carries the account, so the Routing page knows the allowance", async () => {
-    // magpie weighs an account only by the windows it does not set aside
-    // (`allowanceOf`: `if w.Aside || w.Text { continue }`), and an account
-    // with none of those reads 剩余额度未知 on the Routing page. Every window
-    // needs a reading, and at least one must not be set aside.
-    const usage = await plugin.auth.usage(getAuth)
-    expect(usage.windows.length).toBeGreaterThan(0)
-    for (const w of usage.windows) expect(w.used != null || w.balance != null).toBe(true)
-    expect(usage.windows.filter((w) => !w.aside).length).toBe(1)
-    // a wallet's `used` must stay undefined: magpie invents no share for one
-    const wallet = usage.windows.find((w) => w.name === "永久积分")
-    expect(typeof wallet.balance).toBe("number")
-    expect(wallet.used).toBeUndefined()
-  })
-
-  test("an empty wallet hands the account to the grant", async () => {
-    const realFetch = globalThis.fetch
-    // magpie reads a balance of 0 as used up, so a wallet with nothing left
-    // must not be the one carrying an account the day's grant still pays for
-    globalThis.fetch = (input, init) => {
-      const url = typeof input === "string" ? input : String(input?.url ?? input)
-      if (String(url).includes("/api/v2/points/records"))
-        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 0, dailyLimitPoints: 5000, dailyRemainingPoints: 5000, list: [], total: 0 } }), { status: 200 })
-      return realFetch(input, init)
-    }
-    try {
-      const usage = await plugin.auth.usage(getAuth)
-      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
-      const permanent = usage.windows.find((w) => w.name === "永久积分")
-      expect(daily.aside).toBeUndefined()
-      expect(permanent.aside).toBe(true)
-    } finally {
-      globalThis.fetch = realFetch
-    }
-  })
-
-  test("a pair of zeros is no reading at all, an error not an empty list", async () => {
-    const realFetch = globalThis.fetch
-    // a zero limit makes the pair tell no share, and there is no permanent
-    // balance either: an empty window list would read as an account magpie
-    // cannot weigh, so it says why instead
-    globalThis.fetch = (input, init) => {
-      const url = typeof input === "string" ? input : String(input?.url ?? input)
-      if (String(url).includes("/api/v2/points/records"))
-        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { dailyLimitPoints: 0, dailyRemainingPoints: 0, list: [], total: 0 } }), { status: 200 })
-      return realFetch(input, init)
-    }
-    try {
-      const usage = await plugin.auth.usage(getAuth)
-      expect(usage.windows).toBeUndefined()
-      expect(usage.error).toContain("没有返回余额字段")
-    } finally {
-      globalThis.fetch = realFetch
-    }
-  })
-
-  test("a day read without the limit pair still says when the day ends", async () => {
-    // The same trap raccoon's day has: magpie's Smart files a seat whose
-    // renewal is unknown behind every seat that told one (routes/strategies.go,
-    // "not known: after those known"), and such an account is then never picked
-    // while any other in the pool has credit left. `resetsAt` and `span` alone
-    // do not settle it either — the day lapses at 23:59:59+08, one second
-    // before the midnight it resets at, so `runsOutAt` is what ties with an
-    // account whose limit pair was read.
+  test("a daily wallet without the limit pair is an amount without a limit", async () => {
     const realFetch = globalThis.fetch
     globalThis.fetch = (input, init) => {
       const url = typeof input === "string" ? input : String(input?.url ?? input)
@@ -569,36 +483,10 @@ describe("usage", () => {
     try {
       const usage = await plugin.auth.usage(getAuth)
       const daily = usage.windows.find((w) => w.name === "每日赠送积分")
-      // the balance is what the card shows, whether or not the pair came back
-      expect(daily.balance).toBe(3000)
-      expect(daily.resetsAt).toBe(_internal.nextBeijingMidnight())
-      expect(daily.span).toBe(86400)
-      expect(daily.runsOutAt).toBe(_internal.nextBeijingMidnight() - 1000)
-    } finally {
-      globalThis.fetch = realFetch
-    }
-  })
-
-  test("a daily wallet without the limit pair is a balance with no limit", async () => {
-    const realFetch = globalThis.fetch
-    globalThis.fetch = (input, init) => {
-      const url = typeof input === "string" ? input : String(input?.url ?? input)
-      if (String(url).includes("/api/v2/points/records"))
-        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 5000, dailyBalance: 3000, list: [], total: 0 } }), { status: 200 })
-      return realFetch(input, init)
-    }
-    try {
-      const usage = await plugin.auth.usage(getAuth)
-      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
-      // no pair means no limit, and a made-up one always reads as full
       expect(daily.limit).toBeUndefined()
-      expect(daily.used).toBeUndefined()
-      expect(daily.balance).toBe(3000)
-      // the grant still has a balance to spend today, so it carries and the
-      // wallet only shows
-      expect(daily.aside).toBeUndefined()
+      expect(daily.display).toBe("3000 credits")
       // a reply with only the limit/remaining pair still shows the daily
-      // wallet (remaining IS its number), without dailyBalance.
+      // wallet (remaining IS its number), without dailyBalance
       globalThis.fetch = (input, init) => {
         const url = typeof input === "string" ? input : String(input?.url ?? input)
         if (String(url).includes("/api/v2/points/records"))
@@ -609,7 +497,8 @@ describe("usage", () => {
         const pairOnly = await plugin.auth.usage(getAuth)
         const dw = pairOnly.windows.find((w) => w.name === "每日赠送积分")
         expect(dw).toBeTruthy()
-        // spent 800 of 5000: `used` is the share, `amount` the count
+        // 800 spent of 5,000: 16% used, 800 credits spent (plugins#889) —
+        // not 800% and not the 4,200 left
         expect(dw.used).toBe(16)
         expect(dw.amount).toBe(800)
         expect(dw.limit).toBe(5000)
@@ -635,6 +524,7 @@ describe("usage", () => {
     }
   })
 })
+
 
 describe("signature", () => {
   test("the 9-part HMAC string matches the client's shape", () => {
