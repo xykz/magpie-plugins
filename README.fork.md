@@ -8,10 +8,33 @@ this fork leaves all of them exactly as upstream wrote them, so that a merge
 from upstream never has to merge past a fork edit. What this fork adds on top
 of them is written down here, in a file of its own.
 
-Package versions are upstream's, too: this fork doesn't bump a `version` in
-`packages/*/package.json`, so a package's number in this fork is always the
-number upstream gave it. A fork-only change sits on the version upstream last
-released, and the next upstream release carries it.
+Package versions are upstream's three numbers, plus one of this fork's: a fork
+release is `<upstream version>-fork.<n>`, so `0.2.16-fork.1` is the first fork
+release of the version upstream published as `0.2.16`, and `0.2.16-fork.2` is
+that same release with one more fork change on it. `n` counts fork releases
+only; it starts at 1 and goes up by one each time. When upstream publishes a
+new version, the base — upstream's three numbers — moves, and `n` starts again
+at 1 (`0.2.17-fork.1`), which semver already orders after every
+`0.2.16-fork.*`.
+
+The suffix earns its keep: semver has no fourth number, and the three-number
+form a fork reused would read to magpie as an older version than the upstream
+release it is based on. `-fork.<n>` is a pre-release, so `0.2.16-fork.1` sorts
+*before* `0.2.16` — right, because upstream's release is the one without this
+fork's changes — and before `0.2.17`, so upstream moving on is still seen as an
+update. For the same reason this fork does not use build metadata
+(`0.2.16+1`): semver compares `0.2.16+1` and `0.2.16+2` as equal, so the second
+fork release would look like the first.
+
+A consequence to know: a version with a suffix is a *pinned* spec to magpie
+(`Pinned`), so a fork release never auto-updates — the Plugins page notes a
+newer version and the reader installs it. That suits a fork, whose numbers
+upstream has never published.
+
+The base is the version upstream had when the fork change went in, not
+whatever `packages/*/package.json` said last: this fork merges upstream's
+releases and re-reads them, and a merge that brings upstream's own version
+bump in must be followed by moving the base up (and `n` back to 1).
 
 ## `workbuddy`: the `requestFormat` option
 
@@ -94,9 +117,9 @@ app does. `RACCOON_USER_AGENT` overrides it; set it to an empty string to
 leave magpie's own alone.
 
 The one thing it does not change is the version it reports of itself:
-`packages/raccoon/package.json` stays at upstream's `0.1.5`, because npm has
-no published version of this package to compare it with and the fork doesn't
-rename it.
+`packages/raccoon/package.json` is `0.1.5-fork.1`, upstream's number with this
+fork's suffix (above) — the package is not renamed, so what a vendor sees is
+still upstream's own name.
 
 ## `raccoon`: the rest of the app's request
 
@@ -563,9 +586,26 @@ later) and both take `--dry-run` and `--install`.
 不做改动，这样从上游合并下来时不会撞上 fork 的编辑。fork 自己的增补只写在
 这个文件里。
 
-版本号同样是上游的：fork 不改 `packages/*/package.json` 里的 `version`，
-所以这里的版本号永远等于上游发的那一个；fork 独有的改动挂在上游最后发布的
-版本上，由下一个上游发布带走。
+版本号是上游那三段加上 fork 自己的一位：一次 fork 发版写成
+`<上游版本>-fork.<n>`，`0.2.16-fork.1` 就是上游发的 `0.2.16` 之上的第一次
+fork 发版，`0.2.16-fork.2` 是同一版上又多了一处 fork 改动。`n` 只数 fork
+自己的发版，从 1 开始，每改一次加一。上游发了新版本，base 跟着走、`n` 重回
+1（`0.2.17-fork.1`）—— semver 本来就把它排在所有 `0.2.16-fork.*` 之后。
+
+这个后缀是有用的：semver 没有第四段，而 fork 若沿用三段式自己加号，magpie
+会把那个号读成比它基于的上游版本更旧的版本。`-fork.<n>` 是预发布，因此
+`0.2.16-fork.1` 排在 `0.2.16` **之前** —— 这是对的，不带 fork 改动的才是上游
+那一版 —— 又排在 `0.2.17` 之前，所以上游一旦前进仍然算更新。同理本 fork
+不用 build metadata（`0.2.16+1`）：semver 认为 `0.2.16+1` 与 `0.2.16+2`
+相等，第二次 fork 发版会看起来和第一次是同一个。
+
+有个后果要知道：带后缀的版本对 magpie 是**固定**（`Pinned`）的 spec，所以
+fork 发版从不自动更新 —— Plugins 页会提示有更新，由人来装。这对 fork 正合适，
+因为这些版本号上游从来没发过。
+
+base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.json` 上次写的
+那个：本 fork 会合并上游发布再重读它们，若某次合并带进了上游自己的版本号提升，
+就必须顺手把 base 抬上去（并把 `n` 归 1）。
 
 - **`workbuddy` 的 `requestFormat` 选项**：可以按官方 CodeBuddy CLI
   （`@tencent-ai/codebuddy-code` 2.108.1）的形状，而不是桌面客户端的形状，
