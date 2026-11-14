@@ -36,21 +36,42 @@ whatever `packages/*/package.json` said last: this fork merges upstream's
 releases and re-reads them, and a merge that brings upstream's own version
 bump in must be followed by moving the base up (and `n` back to 1).
 
-## `workbuddy`: the `requestFormat` option
+## `workbuddy`: the CodeBuddy CLI 2.108.1 request shape
 
 A chat to the China build can go out in the shape of the official CodeBuddy
 CLI, `@tencent-ai/codebuddy-code` 2.108.1, instead of WorkBuddy's own desktop
-app. Its option is `requestFormat`:
+app.
 
-    { "requestFormat": "codebuddy-2108" }
+**In magpie** it is a switch (`auth.options`), drawn with the plugin's other
+switches in the provider's editor — WorkBuddy › Edit › **Plugin options**, under
+the models:
 
-In magpie it is set from the plugin's row on the Plugins page (Installed ›
-Options, which starts from the package's `magpie.options`), or in its
-`plugins.json` entry; in OpenCode,
-`["@magpie-community/opencode-workbuddy-auth", { "requestFormat": "codebuddy-2108" }]`.
-The default, `"magpie"`, is the format every request used before the option
-existed, and a value naming neither is read as `"magpie"`, so a typo sends
-what every request sent before rather than failing a chat.
+| Switch | On means |
+|---|---|
+| `request_format_2108` — *Send as CodeBuddy CLI 2.108.1* | chats go out in the CLI's shape |
+| off | chats go out in WorkBuddy's desktop app's shape |
+
+A switch takes effect on the next request (magpie keeps it, then reads it as it
+works); nothing restarts. The AI build declares no such switch: it has the one
+format.
+
+**In OpenCode** there are no switches, so the format comes from the plugin
+tuple's second entry:
+
+```json
+["@magpie-community/opencode-workbuddy-auth", { "requestFormat": "codebuddy-2108" }]
+```
+
+A switch wins over the tuple (a host with switches is one whose user set them
+and can't see the tuple), and with no switch on the tuple's value stands.
+`"magpie"`, the default, is the format every request used before the option
+existed, and a value naming neither is read as `"magpie"`, so a typo sends what
+every request sent before rather than failing a chat.
+
+A third format is one more boolean switch beside this one, and the newest one on
+sends: magpie hands a plugin nothing when a switch changes, so no switch can
+tell whether another was turned on after it, and the plugin fixes the order
+instead of letting the last one clicked win.
 
 What changes — a 2.108.1 chat is nine headers and no more, which is what
 DurinDoor v3.18.0's own `codebuddy-cn` executor puts on the wire (and that
@@ -607,14 +628,22 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
 那个：本 fork 会合并上游发布再重读它们，若某次合并带进了上游自己的版本号提升，
 就必须顺手把 base 抬上去（并把 `n` 归 1）。
 
-- **`workbuddy` 的 `requestFormat` 选项**：可以按官方 CodeBuddy CLI
-  （`@tencent-ai/codebuddy-code` 2.108.1）的形状，而不是桌面客户端的形状，
-  向中国版发对话请求。取值 `"codebuddy-2108"`，默认 `"magpie"`（即该选项
-  出现之前每个请求的形状），写了不认识的值也按 `"magpie"` 处理。九个请求头、
-  不压缩、强制流式并把分片拼回一个完整回复、`reasoning_effort` 的处理、
-  `max_tokens`/`max_completion_tokens` 按模型区分，细节见上一节；形状本身在
-  `packages/workbuddy/codebuddy.mjs`，`packages/workbuddy/format.test.mjs`
-  把它钉在真实的抓包上。
+- **`workbuddy` 的 CodeBuddy CLI 2.108.1 请求形状**：可以按官方 CodeBuddy
+  CLI（`@tencent-ai/codebuddy-code` 2.108.1）的形状，而不是桌面客户端的形状，
+  向中国版发对话请求。在 magpie 里它是 provider 编辑器里的一个开关（`auth.options`，
+  WorkBuddy › Edit › **Plugin options**，在模型列表下面）：`request_format_2108`
+  打开即按 CLI 形状发送，关闭即按桌面端形状发送；下一笔请求就生效，不重启。
+  中国版的 AI 版不声明这个开关（AI 版只有一种形状）。在 OpenCode 里没有开关，
+  形状来自插件 tuple 的第二项：
+  `["@magpie-community/opencode-workbuddy-auth", { "requestFormat": "codebuddy-2108" }]`。
+  开关压过 tuple（有开关的宿主就是用户设过开关、看不见 tuple 的那种）；没有
+  开关打开时 tuple 的值照旧生效；默认值 `"magpie"`（即该选项出现之前每个请求
+  的形状），写了不认识的值也按 `"magpie"` 处理。第三种形状 = 旁边再加一个布尔
+  开关，按列表顺序最新优先——magpie 在开关变化时不回调插件，所以做不出"最后点的
+  那个赢"。九个请求头、不压缩、强制流式并把分片拼回一个完整回复、
+  `reasoning_effort` 的处理、`max_tokens`/`max_completion_tokens` 按模型区分，
+  细节见上一节；形状本身在 `packages/workbuddy/codebuddy.mjs`，
+  `packages/workbuddy/format.test.mjs` 把它钉在真实的抓包上。
 - **`raccoon` 自带 User-Agent**：magpie 默认以自己的 `magpie/<version>` 请求
   上游，插件无法从 provider 侧改掉它（插件 provider 恒有 account，magpie 的
   `user-agent` 设置和 provider 的 headers 都到不了这里）。本插件按桌面端的

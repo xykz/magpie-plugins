@@ -21,10 +21,5 @@
     "type": "git",
     "url": "git+https://github.com/magpie-community/plugins.git",
     "directory": "packages/workbuddy"
-  },
-  "magpie": {
-    "options": {
-      "requestFormat": "magpie"
-    }
   }
 }
