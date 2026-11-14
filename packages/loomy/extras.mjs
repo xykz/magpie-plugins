@@ -23,6 +23,53 @@ const REQUEST_TIMEOUT = 20_000
 // rebuilt from.
 export const LOOMY_VERSION = "0.9.39"
 
+// ── the request-shape switch ───────────────────────────────────────────────
+//
+// Everything this fork does to a chat's headers and body on its way out — the
+// client's attribution headers, traceparent, loomy-version, the UA, Accept and
+// the plain application/json, and the session as Bearer alone — rides on one
+// magpie switch, off by default: off sends what upstream sends, on sends what
+// Loomy's own 0.9.39 client sends. The same shape as workbuddy's
+// request_format_2108 and raccoon's request_shape_desktop_1_1_5, so a user
+// meets one kind of switch in all three.
+//
+// What does NOT ride on it: the password sign-in and its renewal (renew.mjs),
+// the onboarding ledger. Those are the account's life, not the request's
+// shape, and turning them off would cost the user the sign-in rather than
+// send a different client.
+//
+// OpenCode has no switches, so there the request keeps the client's shape —
+// the same thing this switch asks for. `input.magpie` is absent there, and
+// `option` is absent with it.
+export const WIRE_SWITCH = "request_shape_client_0_9_39"
+// the switch a chat's shape is read from, newest first: the newest one on
+// sends, since magpie hands a plugin nothing when a switch changes (host.js's
+// setProviderOptions only takes the values over). A second shape to add later
+// is one more entry here.
+export const WIRE_SWITCHES = [{ key: WIRE_SWITCH }]
+export const wireOn = (magpie) => WIRE_SWITCHES.some((f) => magpie?.option?.("loomy", f.key) === true)
+
+// shapeOf is the answer for a host that may have no switches at all. magpie
+// passes input.magpie and reads the switch; OpenCode passes nothing, and
+// there the request keeps the client's shape — the fork's whole point, and
+// what the switch asks for anyway. So "no magpie" is not "off".
+export const shapeOf = (magpie) => (magpie === undefined ? true : wireOn(magpie))
+
+// the switch as the provider's editor draws it
+export const WIRE_OPTION = {
+  key: WIRE_SWITCH,
+  label: "Send as the Loomy client 0.9.39",
+  description:
+    "Sends a chat the way Loomy's own 0.9.39 client does — its attribution headers, traceparent and loomy-version, its User-Agent and Accept — instead of the way upstream's plugin sends it. Off sends upstream's request. Both sign in as the same account; what differs is the client the gateway reads.",
+  labels: { zh: "按 Loomy 客户端 0.9.39 发送", "zh-TW": "以 Loomy 用戶端 0.9.39 送出", ja: "Loomy クライアント 0.9.39 として送信", de: "Als Loomy-Client 0.9.39 senden" },
+  descriptions: {
+    zh: "按 Loomy 自己 0.9.39 客户端的请求形状发送 — 它的归因头、traceparent 与 loomy-version、User-Agent 与 Accept，以及只用 Bearer 传 session — 而不是上游插件的形状。关闭时按上游的形状发送。两者登录同一个账号，区别只在网关据此识别的客户端。",
+    "zh-TW": "以 Loomy 自己 0.9.39 用戶端的請求形狀送出 — 它的歸因標頭、traceparent 與 loomy-version、User-Agent 與 Accept，以及只用 Bearer 傳 session — 而不是上游外掛的形狀。關閉時以上游的形狀送出。兩者登入同一個帳號，差別只在閘道據此識別的用戶端。",
+    ja: "Loomy 自身の 0.9.39 クライアントのリクエスト形式 — 帰属ヘッダー、traceparent と loomy-version、User-Agent と Accept、セッションを Bearer のみで送る — で送信します（上流プラグインの形式ではありません）。オフのときは上流の形式で送信します。どちらも同じアカウントで、違いはゲートウェイがどのクライアントと見るかだけです。",
+    de: "Sendet einen Chat im Format des Loomy-Clients 0.9.39 — Zuordnungs-Header, traceparent, loomy-version, User-Agent und Accept — statt im Format des Upstream-Plugins. Aus sendet die Upstream-Anfrage. Beide nutzen dasselbe Konto; anders ist nur, als welcher Client das Gateway die Anfrage liest.",
+  },
+}
+
 const env = (name, fallback) => {
   const v = process.env[name]?.trim()
   return v ? v.replace(/\/+$/, "") : fallback
@@ -236,6 +283,10 @@ export function extendLoomy(plugin) {
 export const _internal = {
   OK,
   AUTH_CODES,
+  WIRE_SWITCH,
+  WIRE_SWITCHES,
+  WIRE_OPTION,
+  wireOn,
   gateway,
   apiJson,
   Expired,

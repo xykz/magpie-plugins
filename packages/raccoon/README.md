@@ -8,10 +8,10 @@ OpenCode & Magpie provider plugin for **SenseTime Raccoon (商汤小浣熊, `xia
   1. Browser OAuth with automatic loopback return: confirm authorization in the browser; no desktop client or pasted code is needed.
   2. Manual callback URL / token fallback (paste `office-raccoon://auth/callback?code=...`, or raw JWT `access_token` / JSON token pair).
   3. Raccoon desktop live session reuse (strictly read-only, reading the `auth.json` the desktop app keeps — `<profile>/agent/config/auth.json` in current builds, where the profile is `~/Library/Application Support/office-raccoon` on macOS and `%USERPROFILE%\.office-raccoon` on Windows, and `~/.box-agent/config/auth.json` in older ones — without writing or spending desktop refresh tokens). A desktop seat keeps the token it was signed in with on its own record, so it is never answered with, and never reports, another account's credentials or credits; once its own token is refused or runs out it asks to be signed in again. The app's own refresh token is still never spent.
-- **Token renewal**: single-flight proactive refresh 5 minutes before expiration for browser logins. A renewal that answers for a different account than the one the seat holds is refused rather than saved — the seat keeps its own credentials and is not marked expired.
+- **Token renewal**: single-flight proactive refresh 5 minutes before expiration for browser logins.
 - **Dynamic model catalog & credit rates**: real-time synchronization from `/api/web/llm/v2/model_catalog` with context window, output limit, vision/reasoning tags, credit multipliers, and limited-free markers.
 - **Usage & allowances**: reports available credits, unexpired grant bills, daily expiration timestamps, and Pro/Free subscription plans.
-- **Daily check-in & desktop onboarding grant**: supports Magpie automatic daily check-in (`+300` credits/day) and one-time desktop onboarding grant (`+3000` credits). The check-in re-reads the credits list after claiming, and falls back to the vendor's own grant flags in the `setting_info` answer when the list is written behind the grant (it lags a minute or two) — once per account per day, so a flag still present on the next call is not counted twice. Concurrent check-ins for one account share a single run.
+- **Daily check-in & desktop onboarding grant**: supports Magpie automatic daily check-in (`+300` credits/day) and one-time desktop onboarding grant (`+3000` credits).
 - **SSE model rewrite**: transparently rewrites internal upstream model names back to requested downstream models for client compatibility.
 - **The card's name**: the account's own phone number (`138****8000`), read once per token from `/api/web/auth/v1/user_info` with the JWT the sign-in holds. `accountId` stays the account's identity (the JWT's `Raccoon-pu-<uuid>`, or the desktop app's name) — magpie keys the user's own name for the account, its proxy, model picks and a gateway key's list by it, so it never changes. The card shows usage's `user`, which is the phone once a sign-in or renewal has read it. A failed read changes nothing and never costs a sign-in.
 
@@ -25,10 +25,10 @@ OpenCode & Magpie provider plugin for **SenseTime Raccoon (商汤小浣熊, `xia
   1. 浏览器 OAuth 授权登录：确认授权后自动返回，无需安装官方桌面客户端，也无需输入短信验证码或粘贴网页地址。
   2. 手动回调 / Token 备用入口：粘贴 `office-raccoon://auth/callback?code=...` 完整回调链接，或 `access_token` / JSON；普通授权网页地址和单独授权码不能代替完整回调。
   3. 直接只读复用本机商汤小浣熊客户端实时登录态（客户端保存的 `auth.json`：新版在客户端配置目录下的 `agent/config/auth.json`（macOS 为 `~/Library/Application Support/office-raccoon`，Windows 为 `%USERPROFILE%\.office-raccoon`），旧版在 `~/.box-agent/config/auth.json`）。桌面端席位会把登录时读到的 token 保存在自己的账号记录里，因此它不会拿到、也不会**上报**另一个账号的凭据或积分；一旦自己的 token 被拒或用尽，就提示重新登录（客户端自身的 refresh token 依旧不会被动用）。
-- **Token 自动续期**：浏览器登录账号过期前 5 分钟自动单飞刷新。若续期返回的是另一个账号，则拒绝覆盖本地凭据：席位保留自己的凭据，也不会被判为过期。
+- **Token 自动续期**：浏览器登录账号过期前 5 分钟自动单飞刷新。
 - **动态模型目录与积分倍率**：实时同步 `/api/web/llm/v2/model_catalog`，展示模型上下文、最大输出、视觉/思考能力、积分倍率与限免（`Free`）标识。
 - **积分余额与套餐查询**：展示可用积分、未过期发放额度、每日积分过期时间与 Pro/Free 套餐状态。
-- **每日签到与桌面端登录奖励**：支持 Magpie 每日自动签到（`+300` 积分/天）及首次桌面端 `+3000` 积分登录奖励领取。签到领取后会回读积分流水；流水写在发放之后（滞后一两分钟），因此还会以 `setting_info` 里上游自己的发放标记兜底读数，且每个账号每天只计一次——下一次调用仍带着该标记时不会重复计。同一账号的并发签到共用同一次执行。
+- **每日签到与桌面端登录奖励**：支持 Magpie 每日自动签到（`+300` 积分/天）及首次桌面端 `+3000` 积分登录奖励领取。
 - **SSE 模型名重写**：将上游响应中的内部模型名重写为下游请求的 `model`，确保 Claude Code / Codex / OpenCode 等客户端兼容。
 
 ### Browser callback lifecycle

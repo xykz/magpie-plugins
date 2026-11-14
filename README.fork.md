@@ -36,6 +36,41 @@ whatever `packages/*/package.json` said last: this fork merges upstream's
 releases and re-reads them, and a merge that brings upstream's own version
 bump in must be followed by moving the base up (and `n` back to 1).
 
+## One switch per plugin, and what each of them turns on
+
+All three of this fork's plugins put their difference from upstream behind a
+single magpie switch (`auth.options`), off by default: off sends what upstream
+sends, on sends what the vendor's own client sends. They are drawn in the
+provider's editor under the models — Provider › Edit › **Plugin options** — and
+magpie reads them as the plugin works, so a flip reaches the next request and
+nothing restarts.
+
+| Plugin | Switch | On means |
+|---|---|---|
+| `workbuddy` | `request_format_2108` — *Send as CodeBuddy CLI 2.108.1* | chats go out in the CLI's shape |
+| `raccoon` | `request_shape_desktop_1_1_5` — *Send as the Raccoon desktop app 1.1.5* | chats go out in the app's shape |
+| `loomy` | `request_shape_client_0_9_39` — *Send as the Loomy client 0.9.39* | chats go out in the client's shape |
+
+The switches cover the *request's shape* and nothing else: headers, the body's
+transform, the stream's framing. What each plugin reads off the vendor — the
+credit windows, the model lists, the check-in, the sign-in's renewal — is not
+behind a switch, because turning that off would make the plugin lie about the
+account instead of sending a different client. The sections below say for each
+plugin exactly where the line is.
+
+**In OpenCode** there are no switches, so each plugin reads its shape from
+what OpenCode does have: `raccoon` and `loomy` keep the vendor client's shape
+there — the same thing their switch asks for, so a missing `input.magpie` is
+read as "on" rather than "off" (`shapeOf` in each `extras.mjs`), while
+`workbuddy` goes by its install tuple's `requestFormat` value and sends
+magpie's own shape when that says nothing (`formatOf` in its `index.mjs`).
+
+A switch declares no `default: true`, so a fresh install sends upstream's
+request until someone turns it on. magpie caps an option's label at 60
+characters and its description at 300 (`host.js`'s `shown`), silently
+truncating anything longer; the two plugins that declare a switch assert in
+their tests that all four languages fit.
+
 ## `workbuddy`: the CodeBuddy CLI 2.108.1 request shape
 
 A chat to the China build can go out in the shape of the official CodeBuddy
@@ -128,23 +163,46 @@ body transform, the stream reassembly — is `packages/workbuddy/codebuddy.mjs`,
 a file of its own so that following upstream's `index.mjs` never has to merge
 past it.
 
-## `raccoon`: its own User-Agent
+## `raccoon`: the desktop app's request shape, on a switch
 
-magpie asks vendors with its own `magpie/<version>`, and a plugin can't take
-that back (a plugin's provider has an account, so magpie's `user-agent`
-setting and the provider's headers don't reach it). This plugin asks the chat
-API as the OpenAI SDK does, `AsyncOpenAI/Python 2.8.0`, the way the desktop
-app does. `RACCOON_USER_AGENT` overrides it; set it to an empty string to
-leave magpie's own alone.
+Everything this fork does to a chat on its way out — the desktop app's
+headers, thinking in its own per-family shape, the `max_tokens` floor,
+`stream_options` — rides on one magpie switch, off by default.
+
+**In magpie** it is a switch (`auth.options`), drawn with the plugin's other
+switches in the provider's editor — Raccoon › Edit › **Plugin options**, under
+the models:
+
+| Switch | On means |
+|---|---|
+| `request_shape_desktop_1_1_5` — *Send as the Raccoon desktop app 1.1.5* | chats go out in the app's shape |
+| off | chats go out in upstream's shape |
+
+A switch takes effect on the next request (magpie keeps it, then reads it as
+it works); nothing restarts.
+
+**In OpenCode** there are no switches, so the request keeps the app's shape —
+the same thing the switch asks for. That is why "no `input.magpie`" is not
+"off": `shapeOf` in `packages/raccoon/extras.mjs` reads it that way.
+
+What the switch does **not** carry: the vision whitelist and the picker
+fallbacks, the `refresh_conflict` heal, the phone-side grant and the check-in
+triage. Those are readings of what the vendor says rather than shapes of the
+request, and turning them off would make the plugin lie about the account
+rather than send a different client.
+
+`RACCOON_USER_AGENT` still overrides the SDK's own UA the switch puts on; set
+it to an empty string to leave magpie's own alone.
 
 The one thing it does not change is the version it reports of itself:
-`packages/raccoon/package.json` is `0.1.5-fork.1`, upstream's number with this
+`packages/raccoon/package.json` is `0.1.5-fork.2`, upstream's number with this
 fork's suffix (above) — the package is not renamed, so what a vendor sees is
 still upstream's own name.
 
-## `raccoon`: the rest of the app's request
+## `raccoon`: what the app's request shape is
 
-The User-Agent was the first half of a larger difference. The desktop app's
+The User-Agent was the first half of a larger difference. All of what follows
+is what the switch above turns on. The desktop app's
 chat calls are not made by its JavaScript: the Electron build writes the config
 out and a bundled CPython sidecar (`resources/box-agent-runtime/`) makes the
 call with the `openai` 2.8.0 SDK over httpx. So the request is defined by
@@ -206,6 +264,28 @@ byte-identical. `Connection: keep-alive` is set the way httpx sets it; whether
 a transport forwards a forbidden header is the transport's business (Bun does,
 Node's undici does not), so it is not listed as a divergence.
 
+## `raccoon`: a renewal answers for its own account, and a check-in reads back
+
+Two readings of the vendor's answers, neither of them a shape of the request,
+so neither is behind the switch above.
+
+**A renewal is taken only if it answers for the seat's own account.** The
+desktop app signs in to one account at a time and rotates its own refresh
+token, so a token that moved can answer for someone else; taking it billed the
+seat to that account and showed its credits (upstream #166). `callRefreshApi`
+now carries the uid the seat was signed in with (`expectedUid`) and refuses a
+different one — the stored credential is left exactly as it is, the seat is not
+marked expired (`signIn: "kept"`), and a later attempt can still answer its own
+account.
+
+**A check-in reads the credits list again after claiming.** The list is
+written behind the grant and lags a minute or three, so a read taken
+immediately after the claim called a paid day unpaid. The claim now re-reads,
+falls back to the vendor's own grant flags in `setting_info` when the list is
+still behind, and counts a day once — a flag still present on the next call is
+not counted twice. Concurrent check-ins for one account share a single run
+(`checkinInFlight`).
+
 ## `raccoon`: the day's points run out before the permanent ones
 
 The vendor keeps two kinds of points apart. `/api/web/points/v1/balance`
@@ -228,6 +308,26 @@ its own time.
   made-up limit would always read as full. A spent day with nothing to say of
   it is `used: 100`, which is a known, used-up account where an empty window
   list would be an unknown one.
+- **Both readings carry `balance`**, so the card says the same thing either
+  way. magpie's `quotaText` reads a balance before it reads a share
+  (`app.js`: `if (w.balance != null) return t("{n} left", ...)`), so an account
+  whose bills came back and one whose did not both say "剩余 519 积分" instead of
+  one showing `519 / 600 · 剩余 100%` and the other a bare total. A balance of
+  0 is left out: `Allowance.Left` takes the least balance in the unit, and a
+  window saying 0 while its day is merely spent would drag the account's
+  `Left` to nothing beside the wallet.
+- **Both name when the day ends**, `resetsAt` and `span` and `runsOutAt` —
+  and that is a routing fix, not decoration. A window that names neither a
+  reset nor a span leaves `Seat.Soon` at its zero value, and Smart files a seat
+  whose renewal is unknown *behind every seat that told one* (`strategies.go`:
+  `case x.IsZero() || y.IsZero(): return y.IsZero()`, "not known: after those
+  known") — for good, so the account is never picked while any other in the
+  pool has credit left. `resetsAt`/`span` alone are not enough either: the day
+  lapses at 23:59:59+08 (where a `daily_grant`'s `expire_at` points), one
+  second before the midnight it resets at, and `Allowance.Renewal` folds a
+  lapse that comes before the reset into it — so `runsOutAt` is what ties with
+  an account whose bills *were* read. A window quoting no bill names
+  `nextBeijingMidnight() - 1000` itself.
 - **`每日积分` never steps aside**, because its share is the only reading
   magpie can order an account by — an aside window never reaches
   `allowanceOf`, and a day set aside would leave the account with no share at
@@ -259,12 +359,11 @@ absent is the old reading: one `Credits` share over every unexpired grant,
 else the balance as a wallet. That keeps a vendor reply without the buckets —
 or a relay that strips them — from having its split guessed at.
 
-Tested with `bun test packages/raccoon` (137 pass, 0 fail, 506 expect, across
-four files: the day's share and the permanent wallet from the vendor's own
-buckets, the wallet aside while the day pays and weighing once it does not,
-an empty wallet making no window, the old single-window reading for a reply
-without `daily_points`, and a grant the cached ledger has not caught up with)
-and `bun scripts/check.mjs` (every package ✓).
+Tested with `bun test packages/raccoon` (131 tests, 446 assertions, across four
+files: the day's share and the permanent wallet from the vendor's own buckets,
+the wallet aside while the day pays and weighing once it does not, an empty
+wallet making no window, and the old single-window reading for a reply without
+`daily_points`) and `bun scripts/check.mjs` (every package ✓).
 
 ## `loomy`: password sign-in, and the session it keeps alive
 
@@ -338,6 +437,23 @@ that left either out would have a plugin that cannot import.
 the wire. That is not decoration: the plugin reaches the same gateway the
 desktop app does, and a request that identifies itself differently is
 distinguishable from the app's.
+
+**In magpie** all of it is one switch (`auth.options`), off by default, drawn
+in the provider's editor — Loomy › Edit › **Plugin options**, under the models:
+
+| Switch | On means |
+|---|---|
+| `request_shape_client_0_9_39` — *Send as the Loomy client 0.9.39* | chats go out in the client's shape |
+| off | chats go out in upstream's shape |
+
+A switch takes effect on the next request; nothing restarts. **In OpenCode**
+there are no switches, so the request keeps the client's shape — the same
+thing the switch asks for, which is why "no `input.magpie`" is not "off"
+(`shapeOf` in `packages/loomy/extras.mjs`).
+
+What the switch does not carry: the password sign-in and its renewal
+(`renew.mjs`), and the onboarding ledger. Those are the account's life rather
+than the request's shape.
 
 The evidence is the client's own traffic. The app ships an LLM debug proxy
 (`electron/llm/llm-debug-proxy.js`, switched on by `LOOMY_LLM_DEBUG_PROXY=1`)
@@ -476,67 +592,6 @@ for every model discovered live and only the hard-coded `STATIC_MODELS` numbers
 ever showed. `Buddy2api`'s `capacity_fields()` is a fourth independent reading of
 the same names. Fixed, with the fake serving the catalogue's real spelling.
 
-## `raccoon` and `loomy`: how often the vendor's non-chat endpoints are read
-
-magpie polls a plugin account's allowance on clocks it owns, and none of them
-is a user's click. In `internal/provider/routing.go` (`Allowances`) an account
-in a group with chat traffic is re-read once a minute per agent; the tray reads
-every `TrayUsageEvery` minutes (`internal/settings/settings.go`, default 3);
-the Usage page reads while it is open; and `internal/provider/checkin.go` wakes
-every minute, re-asking the day's check-in every 30 minutes
-(`wbCheckinEvery`) for as long as the account's answer does not say when it
-stops being true. A hook is handed no sign of which of those asked
-(`infoOf`, `internal/plugin/host.js`: id, name, source, env, options, npm,
-api, … — no "why"), so the only lever a plugin has is to answer once for
-several asks.
-
-That lever has a floor, which is why these numbers are what they are:
-magpie's own host already caches a reading for a minute
-(`cachedLoginReading`, `internal/provider/login_usage.go`), so any plugin TTL
-at or below 60s cuts nothing. And because the host's cache sits in front of the
-plugin, `refreshCards`/`forgetLoginReading` cannot reach through it — a user's
-刷新 can be answered from the plugin's reading. Three minutes was chosen as the
-shortest TTL that is a real cut and still short enough that a hand-pressed
-refresh is not visibly stale.
-
-- **`raccoon`**: `auth.usage` answers from one reading for
-  `RACCOON_USAGE_TTL_MS` (default 180000), single-flighted per account, with a
-  30-second negative cache so an endpoint answering 500 is not pressed every
-  pass — a lapse (`signIn: "expired"`) is never cached. Inside that reading the
-  two per-endpoint costs are cached separately because they move on different
-  clocks: `RACCOON_ENTITLEMENT_TTL_MS` (default 6h, the plan changes a few
-  times a year) and `RACCOON_BILLS_TTL_MS` (default 10min), while the balance is
-  read every time. Because the balance is fresh and the ledger is not, a grant
-  that lands mid-window shows up as `grantedFromBills < avail`; that answer is
-  re-read once per bills TTL (`billsHealedAt`) rather than reported as a
-  negative `used`. Caches are keyed by account, not by access token, so a
-  renewal does not buy a second read. A check-in clears the account's reading,
-  so the press is answered by what it just claimed.
-- **`loomy`**: `auth.usage` the same way (`LOOMY_USAGE_TTL_MS`, default
-  180000), and `provider.models` answers from one `GET /api/v1/models` for
-  `LOOMY_MODELS_TTL_MS` (default 600000), keyed by base URL plus account (the
-  endpoint is asked with the account's token, and nothing establishes that two
-  accounts see the same list). A failed catalogue read is not remembered: the
-  static table still answers and the next ask tries again.
-- **both, check-in `until`**: a check-in answer now carries `until`, the next
-  Beijing midnight, on every non-failed outcome (`claimed` and `done` alike;
-  never on `failed`). The host parses it into `ValidUntil`
-  (`internal/provider/plugin_checkin.go`) and `settled()`
-  (`internal/provider/workbuddy_checkin.go`) then holds the answer until it —
-  which is what suppresses the every-30-minutes re-ask, a rule that only
-  applies while `ValidUntil.IsZero()` (`checkin.go`). A user pressing 签到 still
-  re-asks (`if soon && prev.unclaimedAnswer() { settled = false }`), so this
-  costs nothing. `raccoon`'s `done` is "nothing new in the bills yet", not
-  "the vendor has not paid" — the ledger lags the grant — so it says when to
-  ask again too. `loomy`'s check-in still reads the daily balance before and
-  after the `first-login` POST: that pair is the only claimed-vs-done verdict
-  the endpoint allows.
-
-What this does not change: the chat path, any hook's answer shape, and every
-read a user's own action makes necessary. `RACCOON_*_TTL_MS` /
-`LOOMY_*_TTL_MS` set to `0` turns the corresponding cache off, which is what
-the tests use.
-
 ### The two point wallets: which one carries the account
 
 Loomy reports two balances and they are not alike: a **daily grant** of 5000
@@ -577,6 +632,21 @@ So the grant always carries, and the wallet joins it once the day is spent:
   used up and would say a spent account has nothing at all. Nor does a wallet
   with no limit/remaining pair to rank against: there the day's own
   `dailyBalance` carries.
+- **Both readings of the grant carry `balance`**, so the card says the same
+  thing whether or not the limit pair came back: magpie's `quotaText` reads a
+  balance before a share (`app.js`: `if (w.balance != null) return t("{n}
+  left", ...)`), so an account whose pair arrived and one whose did not both
+  read 剩余 3000 积分.
+- **Both name when the day ends** — `resetsAt`, `span`, `runsOutAt` — and that
+  is a routing fix. A window naming neither a reset nor a span leaves
+  `Seat.Soon` at its zero value, and Smart files a seat whose renewal is unknown
+  *behind every seat that told one* (`strategies.go`: "not known: after those
+  known"), for good: never picked while any other account in the pool has
+  credit. `resetsAt`/`span` alone do not settle it — the grant lapses at
+  23:59:59+08, one second before the midnight it resets at, and
+  `Allowance.Renewal` folds a lapse that comes before the reset into it — so
+  `runsOutAt` is what ties with an account whose pair *was* read. A window that
+  read no pair names `nextBeijingMidnight() - 1000` itself.
 - **A spent grant with no wallet at all keeps carrying**, because a lone
   `used: 100` is a *known*, used-up account where an empty window list is an
   unknown one and the Routing page would say nothing.
@@ -628,6 +698,34 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
 那个：本 fork 会合并上游发布再重读它们，若某次合并带进了上游自己的版本号提升，
 就必须顺手把 base 抬上去（并把 `n` 归 1）。
 
+### 三个插件各一个开关，开关管的是请求形状
+
+本 fork 的三个插件都把与上游的差别收在一个 magpie 开关（`auth.options`）
+后面，默认关闭：关＝上游本来发的请求，开＝厂商自己客户端发的请求。开关画在
+提供商编辑器的模型列表下面 —— 提供商 › 编辑 › **插件选项** —— magpie 边用边
+读，打开后下一笔请求即生效，不重启任何东西。
+
+| 插件 | 开关 | 打开的含义 |
+|---|---|---|
+| `workbuddy` | `request_format_2108` — *Send as CodeBuddy CLI 2.108.1* | 按 CLI 的形状发 |
+| `raccoon` | `request_shape_desktop_1_1_5` — *Send as the Raccoon desktop app 1.1.5* | 按桌面端的形状发 |
+| `loomy` | `request_shape_client_0_9_39` — *Send as the Loomy client 0.9.39* | 按客户端的形状发 |
+
+开关只管**请求的形状**：请求头、请求体的改写、流的包装。插件从厂商读回来的
+东西 —— 积分窗口、模型列表、签到、登录态的续期 —— 不在开关后面，因为把它们
+关掉是让插件对账号说谎，而不是换一个客户端发请求。每一节下面写了那条线画在
+哪里。
+
+**在 OpenCode 里没有开关**，因此插件改读 OpenCode 有的东西：`raccoon` 与
+`loomy` 在那里保持厂商客户端的形状 —— 正是它们开关打开时要求的东西，所以
+`input.magpie` 缺席被读作"开"而不是"关"（各自的 `extras.mjs` 里叫 `shapeOf`）；
+`workbuddy` 则按安装 tuple 里的 `requestFormat` 取值，那里没写时发 magpie 自己的
+形状（`index.mjs` 的 `formatOf`）。
+
+开关不带 `default: true`，所以新装的插件发的是上游的请求，直到有人把它打开。
+magpie 把选项的 label 截到 60 字符、description 截到 300（`host.js` 的
+`shown`），超长的部分静默丢掉；带开关的两个插件在测试里断言四种语言都在限内。
+
 - **`workbuddy` 的 CodeBuddy CLI 2.108.1 请求形状**：可以按官方 CodeBuddy
   CLI（`@tencent-ai/codebuddy-code` 2.108.1）的形状，而不是桌面客户端的形状，
   向中国版发对话请求。在 magpie 里它是 provider 编辑器里的一个开关（`auth.options`，
@@ -644,11 +742,27 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
   `reasoning_effort` 的处理、`max_tokens`/`max_completion_tokens` 按模型区分，
   细节见上一节；形状本身在 `packages/workbuddy/codebuddy.mjs`，
   `packages/workbuddy/format.test.mjs` 把它钉在真实的抓包上。
-- **`raccoon` 自带 User-Agent**：magpie 默认以自己的 `magpie/<version>` 请求
-  上游，插件无法从 provider 侧改掉它（插件 provider 恒有 account，magpie 的
-  `user-agent` 设置和 provider 的 headers 都到不了这里）。本插件按桌面端的
-  做法，以 OpenAI SDK 的 `AsyncOpenAI/Python 2.8.0` 请求对话接口；环境变量
-  `RACCOON_USER_AGENT` 可覆盖，设为空字符串则沿用 magpie 自己的。
+- **`raccoon` 的桌面端请求形状，一个开关**：本 fork 对发出的对话所做的一切 ——
+  桌面端的请求头、按模型分派的 thinking、`max_tokens` 下限、`stream_options` ——
+  都挂在一个 magpie 开关上，默认关闭。在 magpie 里它是 provider 编辑器里的
+  `auth.options`（Raccoon › Edit › **Plugin options**，在模型列表下面）：
+  `request_shape_desktop_1_1_5` 打开即按桌面端 1.1.5 的形状发送，关闭即按上游
+  的形状发送；下一笔请求就生效，不重启。在 OpenCode 里没有开关，请求保持桌面端
+  形状 —— 也就是这个开关所要的东西，所以 `packages/raccoon/extras.mjs` 的
+  `shapeOf` 把"没有 `input.magpie`"读作开启而不是关闭。开关不管：vision 白名单与
+  选择器的回落项、`refresh_conflict` 的愈合、手机端赠分与签到分诊 —— 那些是读
+  厂商说了什么，不是请求的形状，关掉它们只会让插件对账号说谎。
+  `RACCOON_USER_AGENT` 仍可覆盖开关装上的 UA，空串则保留 magpie 自己的。
+- **`raccoon` 的续期只认本席位自己的账号，签到会回读**：两件事都是对厂商回答的
+  读法，与上面那个开关无关。桌面端一次只登一个账号并轮换自己的 refresh token，
+  所以一个被搬走的 token 可能替别的账号回答；照收就把席位记到了那个账号名下、
+  显示的是它的积分（上游 #166）。`callRefreshApi` 现在带上席位登录时的 uid
+  （`expectedUid`），不是同一个就拒收 —— 本地凭据原样保留、席位不标记过期
+  （`signIn: "kept"`），之后的重试仍能回答自己的账号。签到则在领取后**再读一遍**
+  积分流水：流水写在发放之后、滞后一两分钟，所以领完立刻读会把已经发放的一天
+  判成未发放；现在领完回读，流水仍滞后时用 `setting_info` 里厂商自己的发放标记
+  兜底，且每天只计一次 —— 下一次调用仍带着该标记时不会重复计。同一账号的并发
+  签到共用一次执行（`checkinInFlight`）。
 - **`raccoon` 请求的其余部分**：User-Agent 只是差异的一半。桌面端的对话请求
   不是它的 JavaScript 发的——Electron 把配置写出去，由打包进应用的 CPython
   侧车（`resources/box-agent-runtime/`）用 `openai` 2.8.0 SDK 经 httpx 发出。
@@ -692,42 +806,6 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
   转写成 magpie 的 `plugin-auth.json`，账号原样搬过来，不用重新登录、不碰
   厂商接口。两者都零依赖（`node:sqlite`、`node:crypto`，Node 22.5 起），
   都支持 `--dry-run` 与 `--install`。
-- **`raccoon` / `loomy` 非对话接口的读取频率**：magpie 按自己的时钟轮询插件
-  账号的额度，没有一次是用户点的——分组里有对话流量时 `Allowances`
-  （`internal/provider/routing.go`）每分钟对每个 agent 重读一次，托盘每
-  `TrayUsageEvery` 分钟（`internal/settings/settings.go`，默认 3），Usage 页
-  开着时一直读，`internal/provider/checkin.go` 每分钟醒来、对「没说答案何时
-  失效」的账号每 30 分钟重问一次签到。hook 拿不到「是谁问的」（`infoOf`
-  只给 id/name/source/env/options/npm/api…），插件唯一能用的杠杆是一次读数
-  回答多次询问。这个杠杆有下限：宿主自己已经按账号缓存一分钟
-  （`cachedLoginReading`，`internal/provider/login_usage.go`），所以插件 TTL
-  ≤60s 等于没省；而宿主缓存挡在插件前面，`refreshCards` /
-  `forgetLoginReading` 穿不过去，用户按刷新可能被插件读数回答。取 180 秒是
-  「确实省下」与「手按刷新不至于明显过期」之间最短的一档。
-  `raccoon`：`auth.usage` 一次读数回答 `RACCOON_USAGE_TTL_MS`（默认 180000）
-  内的所有调用，按账号单飞，失败读数另存 30 秒（登录失效从不缓存）；读数内部
-  再按两端点各自的节奏分缓存——`RACCOON_ENTITLEMENT_TTL_MS`（默认 6 小时，
-  套餐一年才变几次）、`RACCOON_BILLS_TTL_MS`（默认 10 分钟），余额每次都读。
-  由于余额新鲜而流水不新鲜，窗口内到账的发放会表现为
-  `grantedFromBills < avail`，这种答案按流水 TTL 重读一次（`billsHealedAt`），
-  而不是报成负的 `used`。缓存按账号而不是 token 存，续期不会换来第二次读数；
-  签到会清掉该账号的读数，按下之后看到的就是刚领到的数。
-  `loomy`：`auth.usage` 同样（`LOOMY_USAGE_TTL_MS`，默认 180000）；
-  `provider.models` 一次 `GET /api/v1/models` 回答
-  `LOOMY_MODELS_TTL_MS`（默认 600000）——目录是应用的不是账号的，所以按 base
-  存。失败的目录读取不缓存：静态表照样回答，下一次再问。
-  两者的签到回答都带 `until`（下一个北京时间零点），`claimed` 与 `done` 都带，
-  `failed` 不带。宿主把它解析成 `ValidUntil`
-  （`internal/provider/plugin_checkin.go`），`settled()`
-  （`internal/provider/workbuddy_checkin.go`）于是把答案扣到那一刻——这正是
-  每 30 分钟重问的抑制条件，而该规则只在 `ValidUntil.IsZero()` 时生效
-  （`checkin.go`）。用户按「签到」仍会重问
-  （`if soon && prev.unclaimedAnswer() { settled = false }`），所以不吃亏。
-  `raccoon` 的 `done` 是「流水里还没有新发放」而不是「厂商没发」（流水滞后于
-  发放），所以它也说明何时再问；`loomy` 的签到仍要在 `first-login` 前后各读
-  一次每日余额——这对读数是该端点唯一能给出的 claimed/done 判据。
-  把对应的 `RACCOON_*_TTL_MS` / `LOOMY_*_TTL_MS` 设为 `0` 即关闭该缓存
-  （测试就是这么用的）。
 - **`raccoon` 的日积分先于永久积分用完**：厂商把两种积分分开——
   `/api/web/points/v1/balance` 在总额之外还回 `daily_points` 与
   `reward_points`：前者是当天赠送（签到 300），过了北京时间午夜作废；后者连同
@@ -741,6 +819,21 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
     `span: 86400`；没有时（流水读不到，或当天还没签到）只带余额——编一个上限
     永远读成满格。当天用完又无据可依时是 `used: 100`：这是「已知用完」的账号，
     而空窗口列表会被当成未知。
+  - **两种读法都带 `balance`**，所以无论流水读没读到，卡片说的话都一样。
+    magpie 的 `quotaText` 先看余额再看 share（`app.js`：
+    `if (w.balance != null) return t("{n} left", ...)`），于是流水读得到和读不
+    到的账号都显示「剩余 519 积分」，而不是一个 `519 / 600 · 剩余 100%`、另一
+    个只有总额。余额为 0 时不带：`Allowance.Left` 取同一单位里最小的余额，当天
+    只是用完、窗口却报 0，会把该账号的 `Left` 拉到 0，反而被钱包压下去。
+  - **两种读法都说明当天何时结束**：`resetsAt`、`span`、`runsOutAt`。这不是装
+    饰而是路由修复——窗口既不报重置也不报 span，`Seat.Soon` 就停在零值，而
+    Smart 把「续期未知」的座位排在**所有报出续期的座位之后**
+    （`strategies.go`：`case x.IsZero() || y.IsZero(): return y.IsZero()`），
+    且是永久排后，于是只要池子里别的账号还有额度，它就永远不会被选中。只有
+    `resetsAt`/`span` 也不够：当天额度在 23:59:59+08 就作废（`daily_grant` 的
+    `expire_at` 指向那里），比它重置的午夜早一秒，而 `Allowance.Renewal` 会把
+    早于重置的作废折进重置里——所以能和「流水读到了」的账号打平的是
+    `runsOutAt`。没读到流水的窗口自己写 `nextBeijingMidnight() - 1000`。
   - **`每日积分` 永不 aside**，因为它的 share 是 magpie 唯一能用来排序的读数。
     0% 就是 0%，而那最后两点也还能花，所以分界是当天的最后一点，不是 magpie
     自己的 98%。
@@ -763,10 +856,9 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
   `Credits` 窗口跨所有未过期发放，或者余额当钱包。这样厂商回复里没带分桶（或
   中继把它剥掉）时，不会去猜一个拆分出来。
 
-  测试：`bun test packages/raccoon`（137 pass、0 fail、506 expect，四个文件：
-  按厂商分桶拆出日 share 与永久钱包、当天还有额度时钱包 aside 而用完时参与、
-  空钱包不生成窗口、没有 `daily_points` 时走旧的单窗口读法、账单缓存尚未
-  跟上的一次发放）与
+  测试：`bun test packages/raccoon`（131 条、446 个断言，四个文件：按厂商分桶
+  拆出日 share 与永久钱包、当天还有额度时钱包 aside 而用完时参与、空钱包不
+  生成窗口、没有 `daily_points` 时走旧的单窗口读法）与
   `bun scripts/check.mjs`（每个包 ✓）。
 - **`loomy` 的密码登录与自动续登**：Loomy 没有 refresh token，session 只有
   14 天，唯一能续期的凭据是账号密码，所以本 fork 加了第三种登录方式
@@ -804,7 +896,13 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
   客户端自己的流量：应用内置了 LLM 调试代理（`electron/llm/llm-debug-proxy.js`，
   `LOOMY_LLM_DEBUG_PROXY=1` 打开），把每次对话请求原样录下来，录稿在
   `.sandbox/loomy-captures/real-windows*/`，同时对照了从 `app.asar` 解出的源码。
-  确认不了的取值宁可不写，也不编。
+  确认不了的取值宁可不写，也不编。在 magpie 里这一切是一个开关（`auth.options`，
+  默认关闭，Loomy › Edit › **Plugin options**，在模型列表下面）：
+  `request_shape_client_0_9_39` 打开即按客户端 0.9.39 的形状发送，关闭即按上游
+  的形状发送；下一笔请求就生效，不重启。在 OpenCode 里没有开关，请求保持客户端
+  形状（`packages/loomy/extras.mjs` 的 `shapeOf` 把"没有 `input.magpie`"读作开启）。
+  开关不管密码登录与它的续期（`renew.mjs`），也不管新手任务账本——那些是账号的
+  生命，不是请求的形状。
   抓包定下来的几件事：**认证是按面分的**——聊天面只有 `Authorization: Bearer`、
   **不发** `token`；目录、两个积分路径与 onboarding 只有 `token`、不发
   `Authorization`；画图面两个都发（插件原先处处都发）；`Content-Type` 是裸的
@@ -913,5 +1011,17 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
     时由每日自己的 `dailyBalance` 承载。
   - **每日用完而根本没有永久窗口时，仍然让每日承载**：孤零零的 `used: 100` 是
     「已知、已用完」的账号，而一个窗口都没有是「未知」，Routing 页会什么都不说。
+  - **两种读法都带 `balance`**，所以 limit/remaining 这对数字回没回来，卡片说的话
+    都一样：magpie 的 `quotaText` 先看余额再看份额（`app.js`：
+    `if (w.balance != null) return t("{n} left", ...)`），于是拿到了对的号和没拿到
+    的都显示「剩余 3000 积分」。
+  - **两种读法都说明当天何时结束**：`resetsAt`、`span`、`runsOutAt`。这是路由
+    修复：窗口既不报重置也不报 span，`Seat.Soon` 就停在零值，而 Smart 把「续期
+    未知」的座位永久排在所有报出续期的座位之后（`strategies.go`：「not known:
+    after those known」），于是池子里还有别的账号有额度时它永远不会被选中。只有
+    `resetsAt`/`span` 也不够——当天额度在 23:59:59+08 就作废，比午夜早一秒，而
+    `Allowance.Renewal` 会把早于重置的作废折进重置，所以能和「读到了这对数字」
+    的账号打平的是 `runsOutAt`。没读到这对数字的窗口自己写
+    `nextBeijingMidnight() - 1000`。
   另外，任何地方都不做加法：`Allowance.For` 在各窗口间取最大份额、`Allowance.Left`
   取最小余额，唯一相加的地方是 Usage 页的跨账号汇总（`mergeQuotas`），路由从不读它。

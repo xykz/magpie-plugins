@@ -39,6 +39,64 @@ export {
   wireHeaders,
 }
 
+// ── the request-shape switch ───────────────────────────────────────────────
+//
+// Everything this file does to a chat on its way out — the desktop app's
+// headers, thinking in its own per-family shape, the max_tokens floor,
+// stream_options — rides on one magpie switch, off by default: off sends what
+// upstream sends, on sends the app's request. The same shape as
+// workbuddy's request_format_2108 (its index.mjs), so a user meets one kind of
+// switch in both plugins.
+//
+// What does NOT ride on it: the vision whitelist, the picker fallbacks, the
+// refresh_conflict heal, the phone grant, and the check-in triage. Those are
+// readings of what the vendor says, not shapes of the request, and turning
+// them off would make the plugin lie about the account rather than send a
+// different client (`switch_scope` in the goal that asked for this).
+//
+// OpenCode has no switches, so there the request keeps the app's shape: the
+// same thing this switch asks for. `input.magpie` is absent there, and
+// `option` is absent with it.
+export const WIRE_SWITCH = "request_shape_desktop_1_1_5"
+// the switch a chat's shape is read from, newest first: the newest one on
+// sends, since magpie hands a plugin nothing when a switch changes (host.js's
+// setProviderOptions only takes the values over). A second shape to add later
+// is one more entry here.
+export const WIRE_SWITCHES = [{ key: WIRE_SWITCH }]
+export const wireOn = (magpie) => WIRE_SWITCHES.some((f) => magpie?.option?.("raccoon", f.key) === true)
+
+// shapeOf is the answer for a host that may have no switches at all. magpie
+// passes input.magpie and reads the switch; OpenCode passes nothing, and
+// there the request keeps the client's shape — the fork's whole point, and
+// what the switch asks for anyway. So "no magpie" is not "off".
+export const shapeOf = (magpie) => (magpie === undefined ? true : wireOn(magpie))
+
+// USER_AGENT is what the vendor's chat API is asked with. magpie sends its own
+// (`magpie/<version>`, internal/provider/user_agent.go), and a plugin can't
+// take that back: a plugin's provider has an Account, so provider.PassesUserAgent
+// is false, and its Account.sign is a no-op (internal/provider/plugins.go), so
+// neither `user-agent=agent` nor the provider's `header.User-Agent` reaches the
+// request. So the wrapper below puts this one on, over whatever magpie handed
+// in — only while the shape switch is on. RACCOON_USER_AGENT overrides it, ""
+// leaves magpie's own alone.
+export const USER_AGENT = "AsyncOpenAI/Python 2.8.0"
+export const userAgent = () => process.env.RACCOON_USER_AGENT ?? USER_AGENT
+
+// the switch as the provider's editor draws it
+export const WIRE_OPTION = {
+  key: WIRE_SWITCH,
+  label: "Send as the Raccoon desktop app 1.1.5",
+  description:
+    "Sends a chat the way Raccoon's own desktop app does — its headers, its thinking parameters, its max_tokens and stream_options — instead of the way upstream's plugin sends it. Off sends upstream's request. Both sign in as the same account; what differs is the client the endpoint reads.",
+  labels: { zh: "按 Raccoon 桌面端 1.1.5 发送", "zh-TW": "以 Raccoon 桌面端 1.1.5 送出", ja: "Raccoon デスクトップ 1.1.5 として送信", de: "Als Raccoon-Desktop-App 1.1.5 senden" },
+  descriptions: {
+    zh: "按 Raccoon 自己桌面端的请求形状发送 — 它的请求头、思考参数、max_tokens 与 stream_options — 而不是上游插件的形状。关闭时按上游的形状发送。两者登录同一个账号，区别只在服务端据此识别的客户端。",
+    "zh-TW": "以 Raccoon 自己桌面端的請求形狀送出 — 它的請求標頭、思考參數、max_tokens 與 stream_options — 而不是上游外掛的形狀。關閉時以上游的形狀送出。兩者登入同一個帳號，差別只在伺服端據此識別的用戶端。",
+    ja: "Raccoon 自身のデスクトップアプリのリクエスト形式 — ヘッダー、思考パラメーター、max_tokens、stream_options — で送信します（上流プラグインの形式ではありません）。オフのときは上流の形式で送信します。どちらも同じアカウントで、違いはサーバーがどのクライアントと見るかだけです。",
+    de: "Sendet einen Chat im Format von Raccoons Desktop-App — ihre Header, Thinking-Parameter, max_tokens und stream_options — statt im Format des Upstream-Plugins. Aus sendet die Upstream-Anfrage. Beide nutzen dasselbe Konto; anders ist nur, als welcher Client der Endpunkt die Anfrage liest.",
+  },
+}
+
 const MOBILE_GRANT_PATH = "/api/web/mobile/v1/login/points/grant"
 
 // The mobile grant is the same Bearer token, but the endpoint only answers
@@ -271,6 +329,12 @@ export function extendRaccoon(plugin, deps = {}) {
   const auth = { ...plugin.auth }
   const out = { ...plugin, auth }
 
+  // the switch as the provider's editor draws it (WIRE_SWITCH's words). It
+  // is declared whatever the host: OpenCode ignores `auth.options` and this
+  // plugin's request keeps the app's shape there, which is what the switch
+  // asks for — see WIRE_SWITCH's comment.
+  auth.options = [...(auth.options ?? []), WIRE_OPTION]
+
   // the picker: the three fallback entries the measurements contradict
   if (typeof plugin.config === "function") {
     out.config = async (config) => {
@@ -307,7 +371,9 @@ export function extendRaccoon(plugin, deps = {}) {
     }
   }
 
-  // the loader: the app's headers, thinking, and max_tokens on the way in
+  // the loader: the app's headers, thinking, and max_tokens on the way in.
+  // All of it is the app's request shape, so all of it is the switch's
+  // (WIRE_SWITCH): off hands the request on as upstream's loader left it.
   if (typeof auth.loader === "function") {
     const baseLoader = auth.loader
     auth.loader = async (getAuth) => {
@@ -316,6 +382,11 @@ export function extendRaccoon(plugin, deps = {}) {
       return {
         ...made,
         async fetch(input, init = {}) {
+          // read once per request, so a switch flipped mid-request cannot
+          // change the shape half way through. No reader at all is a host
+          // with no switches (OpenCode), where the shape is the client's.
+          const shape = deps.wire ? deps.wire() === true : true
+          if (!shape) return made.fetch(input, init)
           let parsed = null
           if (typeof init?.body === "string") {
             try {
@@ -347,6 +418,11 @@ export function extendRaccoon(plugin, deps = {}) {
             body: parsed,
             orgCode: readOrgCode(auth),
           })
+          // the SDK's own UA, over magpie's (`magpie/<version>`): the same
+          // reason the headers above — the app is a CPython sidecar over
+          // openai 2.8.0, and this is the UA that SDK puts on every call
+          const ua = userAgent()
+          if (ua) headers.set("User-Agent", ua)
           return made.fetch(input, { ...init, headers })
         },
       }
@@ -480,6 +556,12 @@ async function readGrantHistory(token, deps) {
 
 // for tests
 export const _internal = {
+  WIRE_SWITCH,
+  WIRE_SWITCHES,
+  WIRE_OPTION,
+  wireOn,
+  USER_AGENT,
+  userAgent,
   MOBILE_GRANT_PATH,
   thinkingLevelOf,
   normalizeThinking,

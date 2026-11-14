@@ -7,6 +7,8 @@ import { RaccoonAuthPlugin, _internal as raccoon } from "./index.mjs"
 const parseCatalog = raccoon.parseCatalog
 import {
   FALLBACK_IMAGES_FIX,
+  WIRE_SWITCH,
+  wireOn,
   MIN_OUTPUT_TOKENS,
   MOBILE_CLIENT_HEADERS,
   VISION_MEASURED,
@@ -324,7 +326,7 @@ test("the loader hands the patched body to the vendor", async () => {
       }),
     },
   }
-  const out = extendRaccoon(plugin, {})
+  const out = extendRaccoon(plugin, { wire: () => true })
   const made = await out.auth.loader(async () => ({}))
   const res = await made.fetch("/chat/completions", {
     method: "POST",
@@ -343,7 +345,7 @@ test("the loader gives a kimi body an effort, not a thinking switch", async () =
       }),
     },
   }
-  const out = extendRaccoon(plugin, {})
+  const out = extendRaccoon(plugin, { wire: () => true })
   const made = await out.auth.loader(async () => ({}))
   const res = await made.fetch("/chat/completions", {
     method: "POST",
@@ -354,6 +356,68 @@ test("the loader gives a kimi body an effort, not a thinking switch", async () =
   expect(seen.extra_body).toBeUndefined()
 })
 
+test("with the shape switch off the loader is upstream's, byte for byte", async () => {
+  const plugin = {
+    auth: {
+      loader: async () => ({
+        fetch: async (_input, init) => new Response(init.body, { status: 200, headers: init.headers }),
+      }),
+    },
+  }
+  const out = extendRaccoon(plugin, { wire: () => false })
+  const made = await out.auth.loader(async () => ({}))
+  const body = JSON.stringify({ model: "sn-deepseek-v4-1-flash", max_tokens: 128, thinking: "enabled" })
+  const res = await made.fetch("https://xiaohuanxiong.com/chat/completions", { method: "POST", body, headers: { "user-agent": "magpie/dev" } })
+  expect(await res.text()).toBe(body)
+  expect(res.headers.get("user-agent")).toBe("magpie/dev")
+  expect(res.headers.get("x-client-name")).toBeNull()
+})
+
+test("on OpenCode the shape stays the app's: no wire reader is not off", async () => {
+  const plugin = {
+    auth: {
+      loader: async () => ({
+        fetch: async (_input, init) => new Response(init.body, { status: 200, headers: init.headers }),
+      }),
+    },
+  }
+  const out = extendRaccoon(plugin, {})
+  const made = await out.auth.loader(async () => ({}))
+  const res = await made.fetch("https://xiaohuanxiong.com/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ model: "sn-deepseek-v4-1-flash", max_tokens: 128, thinking: "enabled" }),
+  })
+  expect(JSON.parse(await res.text()).max_tokens).toBe(MIN_OUTPUT_TOKENS)
+  expect(res.headers.get("x-client-name")).toBeTruthy()
+})
+
+test("the switch is declared as a magpie option, off by default", () => {
+  const out = extendRaccoon({ auth: {} }, {})
+  const opt = out.auth.options.find((o) => o.key === WIRE_SWITCH)
+  expect(opt).toBeTruthy()
+  expect(opt.default).not.toBe(true)
+  expect(opt.label.length).toBeLessThanOrEqual(60)
+  expect(opt.description.length).toBeLessThanOrEqual(300)
+  // magpie truncates these silently (host.js's shown(v, 60) / shown(v, 300)),
+  // so a longer one loses its end with nothing to say so
+  for (const lang of ["zh", "zh-TW", "ja", "de"]) {
+    expect(opt.labels[lang]).toBeTruthy()
+    expect(opt.descriptions[lang]).toBeTruthy()
+    expect(opt.labels[lang].length).toBeLessThanOrEqual(60)
+    expect(opt.descriptions[lang].length).toBeLessThanOrEqual(300)
+  }
+})
+
+test("wireOn reads magpie's option() for this provider's own key alone", () => {
+  const ask = (magpie) => wireOn(magpie)
+  expect(ask(undefined)).toBe(false)
+  expect(ask({})).toBe(false)
+  expect(ask({ option: () => false })).toBe(false)
+  expect(ask({ option: (p, k) => p === "raccoon" && k === WIRE_SWITCH })).toBe(true)
+  // a switch of another provider's does not reach this one
+  expect(ask({ option: (p) => p === "workbuddy" })).toBe(false)
+})
+
 test("a non-JSON body reaches the vendor untouched", async () => {
   const plugin = {
     auth: {
@@ -362,7 +426,7 @@ test("a non-JSON body reaches the vendor untouched", async () => {
       }),
     },
   }
-  const out = extendRaccoon(plugin, {})
+  const out = extendRaccoon(plugin, { wire: () => true })
   const made = await out.auth.loader(async () => ({}))
   const res = await made.fetch("/x", { method: "POST", body: "not json" })
   expect(await res.text()).toBe("not json")
