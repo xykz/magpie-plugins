@@ -173,17 +173,38 @@ adds only while its server-side tracing is on.
 
 A chat to the China build can go out in the shape of the official CodeBuddy
 CLI, `@tencent-ai/codebuddy-code` 2.108.1, instead of WorkBuddy's own desktop
-app. Its option is `requestFormat`:
+app.
 
-    { "requestFormat": "codebuddy-2108" }
+**In magpie** it is a switch (`auth.options`), drawn with the plugin's other
+switches in the provider's editor — WorkBuddy › Edit › **Plugin options**,
+under the models:
 
-In magpie it is set from the plugin's row on the Plugins page (Installed ›
-Options, which starts from the package's `magpie.options`), or in its
-`plugins.json` entry; in OpenCode,
-`["@magpie-community/opencode-workbuddy-auth", { "requestFormat": "codebuddy-2108" }]`.
-The default, `"magpie"`, is the format every request used before the option
-existed, and a value naming neither is read as `"magpie"`, so a typo sends
-what every request sent before rather than failing a chat.
+| Switch | On means |
+|---|---|
+| `request_format_2108` — *Send as CodeBuddy CLI 2.108.1* | chats go out in the CLI's shape |
+| off | chats go out in WorkBuddy's desktop app's shape |
+
+A switch takes effect on the next request (magpie keeps it, then reads it as
+it works); nothing restarts. The AI build declares no such switch: it has the
+one format.
+
+**In OpenCode** there are no switches, so the format comes from the plugin
+tuple's second entry:
+
+```json
+["@magpie-community/opencode-workbuddy-auth", { "requestFormat": "codebuddy-2108" }]
+```
+
+A switch wins over the tuple (a host with switches is one whose user set
+them and can't see the tuple), and with no switch on the tuple's value
+stands. `"magpie"`, the default, is the format every request used before the
+option existed, and a value naming neither is read as `"magpie"`, so a typo
+sends what every request sent before rather than failing a chat.
+
+A third format is one more boolean switch beside this one, and the newest one
+on sends: magpie hands a plugin nothing when a switch changes, so no switch
+can tell whether another was turned on after it, and the plugin fixes the
+order instead of letting the last one clicked win.
 
 What changes:
 

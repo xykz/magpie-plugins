@@ -1,15 +1,22 @@
-// The request format option: a chat to WorkBuddy's China build can go out in
+// The request format switch: a chat to WorkBuddy's China build can go out in
 // the shape of the official CodeBuddy CLI 2.108.1 instead of WorkBuddy's own
 // desktop app. What that shape is comes from durindoor's
 // docs/providers/codebuddy-cn.md, whose version history records what each
 // release contributes, so this file checks the plugin against that table
 // rather than against a reading of the CLI's bundle.
 //
-// Nothing of the option reaches anything but a chat. /v1/messages and
+// Two ways in, one per host. magpie draws the plugin's switches in the
+// provider's editor (auth.options) and hands them over as input.magpie.option;
+// OpenCode has none, so there the format comes from the plugin tuple's second
+// entry. A switch wins, because a host with switches is one whose user set
+// them and can't see the tuple.
+//
+// Nothing of the format reaches anything but a chat. /v1/messages and
 // count_tokens are another API, whose headers no CodeBuddy capture
 // describes; the product config, the meter and the check-in are not chats at
-// all. WorkBuddy AI has the one format. And a value naming no format this
-// plugin knows sends what every request sent before the option existed.
+// all. WorkBuddy AI has the one format. And with no switch on, a value naming
+// no format this plugin knows sends what every request sent before the option
+// existed.
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { gunzipSync } from "node:zlib"
 import { WorkBuddyAIAuthPlugin, WorkBuddyAuthPlugin, _internal } from "./index.mjs"
@@ -42,11 +49,13 @@ function serve(routes) {
   return calls
 }
 
-// chat sends one chat through the plugin as magpie's host does, with the
-// options the package's entry carries, and answers what went out
-async function chat({ body, options, url = "https://copilot.tencent.com/v2/chat/completions", plugin = WorkBuddyAuthPlugin, auth } = {}) {
+// chat sends one chat through the plugin as magpie's host does: the switch
+// (magpie's own) as the input carries it, and the tuple's options as the
+// package's entry carries them, and it answers what went out
+async function chat({ body, options, switches, url = "https://copilot.tencent.com/v2/chat/completions", plugin = WorkBuddyAuthPlugin, auth } = {}) {
   const calls = serve({})
-  const hooks = await plugin({ client: {} }, options)
+  const magpie = { option: (provider, key) => switches?.[provider]?.[key] === true }
+  const hooks = await plugin({ client: {}, magpie }, options)
   const l = await hooks.auth.loader(async () => auth ?? { type: "oauth", access: "at", refresh: "r", uid: "u1", expires: later() })
   const res = await l.fetch(url, {
     method: "POST",
@@ -70,6 +79,9 @@ const text = (b) => {
 
 const send = (text, extra = {}) => ({ model: "glm-5.3", stream: true, messages: [{ role: "system", content: "be brief" }, { role: "user", content: text }], ...extra })
 const FORMAT = { requestFormat: "codebuddy-2108" }
+// the switch magpie draws in the provider's editor, as input.magpie.option
+// reads it: a value per provider, true only when on
+const on = (site = "workbuddy") => ({ [site]: { [_internal.FORMAT_SWITCH]: true } })
 
 // WHAT_2108 is the header surface 2.108.1 sends on a chat, by the table in
 // durindoor's docs/providers/codebuddy-cn.md: the six identity headers its
@@ -245,6 +257,102 @@ test("no options at all is the format the plugin always sent", async () => {
   expect(hooks).toBeTruthy()
   const { headers } = await chat({ body: send("hi"), options: undefined })
   expect(headers.get("user-agent")).toBe("WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0")
+})
+
+// The switch magpie draws (auth.options): booleans read as they stand, and
+// the tuple's own value underneath it.
+
+test("the switch sends 2.108.1's shape with no options at all", async () => {
+  const { headers, body } = await chat({ body: send("hi"), switches: on() })
+  for (const [k, v] of Object.entries(WHAT_2108)) expect([k, headers.get(k)]).toEqual([k, v])
+  for (const k of NOT_2108) expect([k, headers.get(k)]).toEqual([k, null])
+  expect(headers.get("content-encoding")).toBe(null)
+  expect(body).not.toBe("<gzip>")
+})
+
+test("a switch that is on wins over a tuple saying magpie", async () => {
+  const { headers } = await chat({ body: send("hi"), options: { requestFormat: "magpie" }, switches: on() })
+  expect(headers.get("user-agent")).toBe("CLI/2.108.1 CodeBuddy/2.108.1")
+})
+
+test("the switches are per provider: the AI build's chat is the app's either way", async () => {
+  const { headers } = await chat({
+    body: send("hi"),
+    switches: on("workbuddy"),
+    plugin: WorkBuddyAIAuthPlugin,
+    url: "https://www.workbuddy.ai/v2/chat/completions",
+  })
+  expect(headers.get("user-agent")).toBe("WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0")
+})
+
+test("off, and no tuple value, is the app's shape: a switch turned off falls back", async () => {
+  for (const switches of [undefined, {}, { workbuddy: {} }, { workbuddy: { [_internal.FORMAT_SWITCH]: false } }]) {
+    const { headers } = await chat({ body: send("hi"), switches })
+    expect([switches, headers.get("user-agent")]).toEqual([switches, "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"])
+  }
+})
+
+test("a host with no option reader at all is OpenCode: the tuple's value stands", async () => {
+  // OpenCode hands a plugin only the tuple, so magpie is undefined there
+  expect(_internal.formatOf(_internal.SITES.workbuddy, FORMAT, undefined)).toBe(_internal.FORMAT_2108)
+  const { headers } = await chat({ body: send("hi"), options: FORMAT })
+  expect(headers.get("user-agent")).toBe("CLI/2.108.1 CodeBuddy/2.108.1")
+})
+
+// A third format is one entry in FORMAT_SWITCHES and one switch beside it:
+// the first one on is the one that sends, whatever order they were set in,
+// because magpie tells a plugin nothing when a switch changes.
+
+test("with more than one switch on, the newest in the list sends", () => {
+  const SITES = _internal.SITES
+  const older = { key: "request_format_2070", fmt: "codebuddy-2070" }
+  // the list newest first; an entry added after 2.108.1's is the older one
+  expect(_internal.FORMAT_SWITCHES.map((f) => f.fmt)).toEqual([_internal.FORMAT_2108])
+  _internal.FORMAT_SWITCHES.push(older)
+  try {
+    // both on: the one listed first sends, and the order they were turned on
+    // in is not known to the plugin at all
+    const both = { option: (_p, k) => k === _internal.FORMAT_SWITCH || k === older.key }
+    expect(_internal.formatOf(SITES.workbuddy, undefined, both)).toBe(_internal.FORMAT_2108)
+    // the older one alone still sends its own shape
+    expect(_internal.formatOf(SITES.workbuddy, undefined, { option: (_p, k) => k === older.key })).toBe(older.fmt)
+    // and neither on is the app's, whatever the tuple says
+    expect(_internal.formatOf(SITES.workbuddy, FORMAT, { option: () => false })).toBe(_internal.FORMAT_2108)
+  } finally {
+    _internal.FORMAT_SWITCHES.pop()
+  }
+  expect(_internal.FORMAT_SWITCHES.map((f) => f.fmt)).toEqual([_internal.FORMAT_2108])
+})
+
+test("the AI build has no switch: it never reaches a format of its own", () => {
+  const SITES = _internal.SITES
+  expect(_internal.formatOf(SITES["workbuddy-ai"], FORMAT, { option: () => true })).toBe(_internal.FORMAT_MAGPIE)
+})
+
+// What magpie draws: the switch is declared where the plugin's others are
+// (auth.options), in magpie's own caps — a label of 60 characters and a
+// description of 300 — and says its words in magpie's languages.
+
+test("the China build declares the switch, the AI build doesn't", async () => {
+  const cn = await WorkBuddyAuthPlugin({ client: {} })
+  const ai = await WorkBuddyAIAuthPlugin({ client: {} })
+  const keys = (h) => h.auth.options.map((o) => o.key)
+  expect(keys(cn)).toEqual([_internal.FREE_ONLY, _internal.FORMAT_SWITCH])
+  expect(keys(ai)).toEqual([_internal.FREE_ONLY])
+  const o = cn.auth.options.find((x) => x.key === _internal.FORMAT_SWITCH)
+  expect(o.label.length).toBeLessThanOrEqual(60)
+  expect(o.description.length).toBeLessThanOrEqual(300)
+  // on is the CLI's shape, so off — the default — is the app's
+  expect(o.default).not.toBe(true)
+  // not a list filter: it changes how a chat is sent, not which models show
+  expect(o.filtersModels).not.toBe(true)
+  for (const lang of ["zh", "zh-TW", "ja", "de"]) {
+    expect(o.labels[lang].length).toBeGreaterThan(0)
+    expect(o.labels[lang].length).toBeLessThanOrEqual(60)
+    expect(o.descriptions[lang].length).toBeGreaterThan(0)
+    expect(o.descriptions[lang].length).toBeLessThanOrEqual(300)
+  }
+  expect(o.labels.zh).toBe("按 CodeBuddy CLI 2.108.1 发送")
 })
 
 // What is not a chat at all.

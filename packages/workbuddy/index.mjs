@@ -27,13 +27,26 @@ const KEEP_RENEWED_MS = 60 * 1000 // how long a refresh's result answers for the
 // other is that of @tencent-ai/codebuddy-code 2.108.1, the official CodeBuddy
 // CLI, as live captures of its releases describe it rather than a reading of
 // its bundle (which assembles headers over three layers and so under-reports
-// them). It is an option a person sets, never a default: a format that isn't
-// one of these two goes out as "magpie", which is what every request did
-// before the option existed.
+// them). It is a switch a person turns on, never a default: with none on, and
+// with a value naming no format, chats go out as "magpie", which is what every
+// request did before the option existed.
+//
+// Two ways in, one per host. magpie has switches (auth.options): booleans, one
+// per format, drawn in the provider's editor and read through
+// input.magpie.option. OpenCode has none, so there the format comes from the
+// plugin tuple's second entry, { "requestFormat": "codebuddy-2108" }.
 const FORMAT_KEY = "requestFormat"
+const FORMAT_SWITCH = "request_format_2108"
 const FORMAT_MAGPIE = "magpie"
 const FORMAT_2108 = "codebuddy-2108"
 const FORMATS = new Set([FORMAT_MAGPIE, FORMAT_2108])
+// FORMAT_SWITCHES are the switches a chat's format is read from, newest first.
+// magpie hands a plugin nothing when a switch changes (host.js's
+// setProviderOptions only takes the values over), so no switch can know
+// whether another was turned on after it: the first one on is the one that
+// sends, whatever order they were set in. A third format is one entry here
+// and one switch beside it, and the newest wins from then on.
+const FORMAT_SWITCHES = [{ key: FORMAT_SWITCH, fmt: FORMAT_2108 }]
 
 // What 2.108.1 says it is. Its User-Agent is buildUserAgent()'s shape with the
 // CLI's own version in both halves, and X-IDE-Version is the same version
@@ -355,11 +368,14 @@ async function refreshed(site, auth) {
 
 // formatOf is the request format a chat to site goes out in. WorkBuddy AI has
 // the one format: the option is about the China build's chat endpoint alone,
-// and no capture of the AI build's own CLI was ever taken. A value naming no
-// format this plugin knows is "magpie", so a typo in plugins.json sends what
-// every request sent before the option existed rather than failing a chat.
-function formatOf(site, options) {
+// and no capture of the AI build's own CLI was ever taken. A switch wins over
+// the tuple's own value, because a host with switches is one whose user set
+// them and can't see the tuple; with no switch on, the value stands, and one
+// naming no format this plugin knows is "magpie", so a typo sends what every
+// request sent before the option existed rather than failing a chat.
+function formatOf(site, options, magpie) {
   if (site.ai) return FORMAT_MAGPIE
+  for (const f of FORMAT_SWITCHES) if (magpie?.option?.(site.id, f.key) === true) return f.fmt
   const want = options?.[FORMAT_KEY]
   return FORMATS.has(want) ? want : FORMAT_MAGPIE
 }
@@ -3541,6 +3557,21 @@ function makePlugin(site) {
           },
           filtersModels: true,
         },
+        // the China build's chats only: the AI build has the one format, and
+        // its switch would be one that changed nothing (formatOf)
+        ...(site.ai ? [] : [{
+          key: FORMAT_SWITCH,
+          label: "Send as CodeBuddy CLI 2.108.1",
+          description: `Sends a chat in the shape of Tencent's official CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 instead of WorkBuddy's desktop app. Off sends the app's shape. Both sign in as the same account; what differs is the client the endpoint reads.`,
+          // the same words in magpie's other languages (plugins#590)
+          labels: { zh: "按 CodeBuddy CLI 2.108.1 发送", "zh-TW": "以 CodeBuddy CLI 2.108.1 送出", ja: "CodeBuddy CLI 2.108.1 として送信", de: "Als CodeBuddy CLI 2.108.1 senden" },
+          descriptions: {
+            zh: `以腾讯官方 CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 的请求形状发送聊天，而不是 WorkBuddy 桌面端。关闭时按桌面端的形状发送。两者登录同一个账号，区别只在服务端据此识别的客户端。`,
+            "zh-TW": `以騰訊官方 CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 的請求形狀送出聊天，而不是 WorkBuddy 桌面端。關閉時以桌面端的形狀送出。兩者登入同一個帳號，差別只在伺服端據此識別的用戶端。`,
+            ja: `Tencent 公式の CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 のリクエスト形式でチャットを送信し、WorkBuddy デスクトップアプリの形式では送信しません。オフのときはアプリの形式で送信します。どちらも同じアカウントで、違いはサーバーがどのクライアントと見るかだけです。`,
+            de: `Sendet einen Chat im Format von Tencent's offizieller CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 statt im Format der WorkBuddy-Desktop-App. Aus bleibt das Format der App. Beide nutzen dasselbe Konto; unterschiedlich ist nur, als welcher Client der Endpunkt die Anfrage liest.`,
+          },
+        }]),
       ],
       async loader(getAuth) {
         const auth = await getAuth()
@@ -3599,11 +3630,12 @@ function makePlugin(site) {
             // list to read (effortList) the chat goes as it came
             const completion = !native && isCompletion(req ? req.url : input, chat)
             if (completion && chat && !namesEffort(chat) && withDefaultEffort(chat, await effortList(a))) changed = true
-            // the format this request goes out in (formatOf): the option's on
-            // the China build's chat endpoint alone. /v1/messages and
-            // count_tokens keep this plugin's own whatever the option says —
-            // another API, whose headers no CodeBuddy CLI capture describes.
-            const fmt = completion ? formatOf(site, options) : FORMAT_MAGPIE
+            // the format this request goes out in (formatOf): the switches'
+            // and the tuple's own are about the China build's chat endpoint
+            // alone. /v1/messages and count_tokens keep this plugin's own
+            // whatever either says — another API, whose headers no CodeBuddy
+            // CLI capture describes.
+            const fmt = completion ? formatOf(site, options, magpie) : FORMAT_MAGPIE
             // 2.108.1's model-settings interceptor writes verbosity:"high"
             // whenever thinking is on, and injectReasoningSummaryIfNeeded
             // writes reasoning_summary:"auto" — both beside a reasoning_effort,
@@ -3972,4 +4004,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { planCodes, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, rowTime, rowAccount, ofAccount, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { planCodes, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, defaultEffortOf, gzipped, FREE_ONLY, FORMAT_SWITCH, FORMAT_SWITCHES, FORMAT_2108, FORMAT_MAGPIE, formatOf, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, rowTime, rowAccount, ofAccount, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
