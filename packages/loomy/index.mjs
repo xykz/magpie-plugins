@@ -402,6 +402,37 @@ function catalogModel(entry) {
   return { id, config }
 }
 
+// listedModel is the vendor's entry as the models hook gives it: the config's
+// fields, and the capabilities the host reads a listed model by. The config's
+// fields alone left the vendor's vision, reasoning and tool calls unread:
+// magpie's host reads a listed model by capabilities.input.image,
+// capabilities.reasoning and capabilities.toolcall (host.js rowOf, the model
+// row it sends magpie), and the config's own spellings (modalities, reasoning,
+// tool_call) are only converted on the config hook's path (host.js info),
+// never on what a models hook gives back. So deepseek-v4-flash-1017, which
+// models.dev doesn't know, went as a text-only model of no reasoning and no
+// tool calls (plugins#1141). What the vendor doesn't say keeps what was known
+// of the model (models.dev, the static table).
+function listedModel(was, m, entry) {
+  const caps = entry?.capabilities ?? {}
+  const had = was?.capabilities ?? { temperature: true, toolcall: true, input: { text: true }, output: { text: true } }
+  const capabilities = { ...had, input: { ...(had.input ?? { text: true }) } }
+  if (typeof caps.reasoning === "boolean") capabilities.reasoning = caps.reasoning
+  if (typeof caps.function_calling === "boolean") capabilities.toolcall = caps.function_calling
+  if (typeof caps.vision === "boolean") {
+    capabilities.input.image = caps.vision
+    capabilities.attachment = caps.vision
+  }
+  const limit = { ...(was?.limit ?? {}), ...(m.config.limit ?? {}) }
+  return {
+    ...(was ?? {}),
+    ...m.config,
+    id: m.id,
+    ...(Object.keys(limit).length ? { limit } : {}),
+    capabilities,
+  }
+}
+
 // ── the plugin ─────────────────────────────────────────────────────────────
 
 export async function LoomyAuthPlugin({ client, magpie } = {}) {
@@ -752,7 +783,7 @@ export async function LoomyAuthPlugin({ client, magpie } = {}) {
           for (const entry of entries) {
             const m = catalogModel(entry)
             if (!m) continue
-            p.models[m.id] = m.config
+            p.models[m.id] = listedModel(p.models[m.id], m, entry)
           }
           return p.models
         } catch {
@@ -781,6 +812,7 @@ export const _internal = {
   totalOf,
   splitRateSuffix,
   catalogModel,
+  listedModel,
   normalizePhone,
   makeBase,
   toNum,

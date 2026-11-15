@@ -361,6 +361,28 @@ describe("models", () => {
     expect(list["glm-5.3-flash"].modalities).toEqual({ input: ["text", "image"], output: ["text"] })
     expect(list["plain"].rate).toBeUndefined()
     expect(list["plain"].name).toBe("No Suffix At All")
+
+  // plugins#1141: the host reads a listed model by OpenCode's shape
+  // (capabilities.input.image, capabilities.reasoning, capabilities.toolcall),
+  // so the vendor's vision and reasoning go there too.
+  test("the vendor's capabilities, in the shape the host reads", async () => {
+    // glm-5.3-flash is the entry the vendor's catalogue says nothing of
+    // outside its capabilities: what magpie handed in is what it keeps.
+    const p = { models: { "glm-5.3-flash": { id: "glm-5.3-flash", name: "GLM", limit: { context: 1000000, output: 64000 }, capabilities: { temperature: true, reasoning: false, attachment: false, toolcall: true, input: { text: true, image: false }, output: { text: true } }, api: { id: "glm-5.3-flash", npm: "@ai-sdk/openai-compatible" } } } }
+    const list = await plugin.provider.models(p, { auth: saved })
+    expect(list["glm-5.3-flash"].capabilities.input.image).toBe(true)
+    expect(list["glm-5.3-flash"].capabilities.attachment).toBe(true)
+    expect(list["spark-x"].capabilities.reasoning).toBe(true)
+    expect(list["spark-x"].capabilities.toolcall).toBe(true)
+    expect(list["spark-x"].capabilities.input.image).toBe(false)
+    // what the vendor doesn't say keeps what was known of the model
+    expect(list["glm-5.3-flash"].limit.context).toBe(1000000)
+    expect(list["glm-5.3-flash"].api.npm).toBe("@ai-sdk/openai-compatible")
+    expect(list["glm-5.3-flash"].rate).toBe("x0.8")
+    // and what the vendor does say is its own word: the catalogue's
+    // 64000/16384 for deepseek-v4-flash, not what magpie handed in
+    expect(list["deepseek-v4-flash"].limit).toEqual({ context: 64000, output: 16384 })
+  })
     // the catalog's own field names, and both spellings of the output cap:
     // spark-x carries context_length/max_output_tokens, deepseek carries the
     // resolved limit{} shape. Reading only `max_tokens` left output unset for

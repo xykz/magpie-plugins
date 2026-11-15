@@ -653,11 +653,26 @@ fork's own non-aside day window is gone:
 what m02926 asked for ("显示剩余多少即可"), and it comes from upstream's own
 `totalOf`.
 
-Checked with `bun test packages/loomy` (102 tests, 364 assertions): the total
+### What a listed model says it can do
+
+The models hook and the config hook are not read alike. magpie's host turns a
+**config** model's `reasoning`, `tool_call` and `modalities` into the shape it
+reads (`capabilities.reasoning`, `.toolcall`, `.input.image`), but a model the
+**models hook** returns is passed through as it came (`host.js` `rowOf`).
+Loomy's hook returned the config's spelling, so every model models.dev doesn't
+know — `deepseek-v4-flash-1017` among them — went to an agent as text alone: no
+images, no reasoning, no tool calls. Upstream 0.1.8 fixed this (#1141) and this
+fork follows it (`listedModel`, `packages/loomy/index.mjs`): the vendor's
+`capabilities` go into the runtime shape over whatever was known of the model,
+so what the vendor doesn't mention keeps its old value rather than turning
+false.
+
+Checked with `bun test packages/loomy` (103 tests, 373 assertions): the total
 carries and both wallets step aside, a spent day with permanent points left is
 not used up, a fresh day reads 0% and an empty one 100%, spending under a
-balance over every grant counts as used, and a reply without the pair is an
-amount without a limit.
+balance over every grant counts as used, a reply without the pair is an amount
+without a limit, and the vendor's capabilities arrive where the host reads
+them.
 
 ## `helper/`: carrying sign-ins in from other tools
 
@@ -1030,7 +1045,17 @@ magpie 把选项的 label 截到 60 字符、description 截到 300（`host.js` 
   `display` 是 `${left} credits left`，也就是卡片上那个数字，正好是
   m02926 要的「显示剩余多少即可」，同样来自上游的 `totalOf`。
 
-  测试：`bun test packages/loomy`（102 条、364 个断言）：合计承载而两个钱包
+  测试：`bun test packages/loomy`（103 条、373 个断言）：合计承载而两个钱包
   都让开、当日花光但还有永久积分不算用完、新的一天读成 0% 而空的一天读成
   100%、余额高于所有发放时花掉的算作已用、回复里没有那对数字时是只有金额没有
   上限。
+
+  **列表里的模型能做什么**：models hook 和 config hook 的读法不一样。magpie
+  宿主会把 **config** 模型的 `reasoning`、`tool_call`、`modalities` 转成它读的
+  形状（`capabilities.reasoning`、`.toolcall`、`.input.image`），而 **models
+  hook** 返回的模型是原样通过的（`host.js` 的 `rowOf`）。Loomy 的 hook 发的是
+  config 拼写，于是所有 models.dev 不认识的模型——包括
+  `deepseek-v4-flash-1017`——都以纯文本交给 agent：没有图片、没有推理、没有
+  工具调用。上游 0.1.8 修了这个（#1141），本 fork 跟随（`listedModel`，
+  `packages/loomy/index.mjs`）：厂商的 `capabilities` 以运行时形状覆盖已知的
+  值，厂商没提到的字段保留原值，而不是变成 false。
