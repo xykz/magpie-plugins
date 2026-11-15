@@ -1,6 +1,6 @@
 # magpie-page-token-widget
 
-> [English](README.en.md) · 中文 · 当前版本 0.4.6（变更见 [CHANGELOG.md](CHANGELOG.md)）
+> [English](README.en.md) · 中文 · 当前版本 0.4.9（变更见 [CHANGELOG.md](CHANGELOG.md)）
 
 把 iPhone 桌面的额度组件接进 Magpie：装上这个插件，扫一次码，手机上就能显示 Codex、MiniMax、GLM 各家套餐的剩余额度与真实 Token 用量。
 
@@ -47,6 +47,8 @@ magpie plugin add ./magpie-page-token-widget
 3. iPhone 用相机扫码，在 Safari 里打开配对页，点「下载组件脚本」。
 4. 在「文件」App 里打开刚下载的 `UsageWidget.js`，选「共享 → 用 Scriptable 打开」。
 5. 长按 iPhone 桌面空白处，添加 Scriptable 小组件，选择 `UsageWidget`。
+
+组件脚本是下载一次就存在手机上的，服务端改了它，它自己不会过去。**组件更新之后，在 Scriptable 里再跑一次安装器（`SetupUsageWidget.js`，地址和令牌它自己记得），它会把最新的脚本覆盖到手机上**，桌面的组件就跟着变了。
 
 配对码只能用一次，而且只活十分钟：十分钟之后它就废了，插件页会自己换一个新的出来（不用手点），所以第一次配对不用先去点「重新生成配对码」；用掉之后旧码立刻作废。**每配一台手机，它都会拿到属于自己的那枚只读令牌**，服务端只留这枚令牌的哈希，明文只在配对的那一次出现，之后再也拿不出来。一台手机作废，只停这一台。
 

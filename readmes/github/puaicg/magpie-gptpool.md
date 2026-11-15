@@ -13,7 +13,7 @@
 > | 选号 | 按剩余额度加权轮转（nginx smooth WRR）+ 连续失败熔断（10min→1h）+ 额度归零后按上游重置时间自动复检 |
 > | 判死 | 四条规则（`auth` / `never` / `stale` / `marked`），分类计数，可整组复检或删除 |
 > | 请求预算 | 单次 35s / 整单 55s 硬超时，额度耗尽的 400 自动换号而不是整个请求失败 |
-> | 图片桥 | 新增 `lib/chat-image-bridge.mjs`，把 `chat/completions` 上的图片模型桥到 `/images/generations` |
+> | 图片桥 | 新增 `lib/chat-image-bridge.mjs`，把 `chat/completions` 上的图片模型桥到 `/images/generations`；正文默认「内联图 + 一行裸地址」，面板里可切（图+地址 / 只要地址 / 只要内联图） |
 > | 统计 | 按天记成功/失败（生图与文本分开）、失败原因分布、限流起止时间；趋势图可在 **按日 / 按周 / 按月 / 按年** 之间切换（账本保留 400 天） |
 > | 导入 | 分隔符 `----` / `---` / `--` 都认，同一文件可混写；五字段仍要求 `----`（见下方「支持的账号文本格式」） |
 > | 面板 | 账号池按状态分组 + 搜索 + 排序 + 批量删除；额度表点表头排序；Token 徽章只认上游的真实反馈（`已确认` / `未确认`），不再拿本地解码 JWT 当结论 |
@@ -34,7 +34,7 @@
 [![Magpie](https://img.shields.io/badge/Magpie-Plugin-3177d9)](https://github.com/yetone/magpie)
 [![license](https://img.shields.io/badge/license-MIT-16845c)](./LICENSE)
 [![changelog](https://img.shields.io/badge/changelog-%E6%9B%B4%E6%96%B0%E8%AE%B0%E5%BD%95-6f7d91)](./CHANGELOG.md)
-[![version](https://img.shields.io/badge/version-0.8.7-0f6e56)](./package.json)
+[![version](https://img.shields.io/badge/version-0.8.9-0f6e56)](./package.json)
 
 ---
 
