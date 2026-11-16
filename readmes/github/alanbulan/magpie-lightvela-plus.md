@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.2.3-blue" alt="version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/magpie-plugin-orange" alt="magpie plugin">
   <a href="https://github.com/alanbulan/magpie-lightvela-plus/stargazers"><img src="https://img.shields.io/github/stars/alanbulan/magpie-lightvela-plus" alt="stars"></a>

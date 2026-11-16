@@ -1,6 +1,6 @@
-# Ducoro 0.4.7
+# Ducoro 0.4.8
 
-The 0.4.7 interface supports English and Chinese, follows Magpie language changes, and preserves drafts, focus and open dialogs. It includes grouped settings, bordered Bot summaries and aligned expanded editors. See the [release notes](RELEASE-NOTES.md).
+Version 0.4.8 fixes missing connector revocations in previews, removes contradictory skill changes, and makes skill scanning cancellable and time-bounded. Preview, sync and verification share the same resource rules. English and Chinese follow Magpie's language setting while preserving unsaved drafts, focus and open dialogs. See the [release notes](RELEASE-NOTES.md).
 
 Sync Magpie models, connectors, skills, instructions and explicitly selected subagents to Ducoro, and manage per-Bot assignments from the plugin page. Changes go through previews with confirmation before saving; failures are recorded by category with per-item retry; verification distinguishes saved settings, written configuration, readback and session loading.
 
@@ -12,9 +12,10 @@ Full history: [CHANGELOG.md](CHANGELOG.md) · Release notes: [RELEASE-NOTES.md](
 
 - **Models**: follow the Magpie default globally, or assign per Bot with inheritance; unavailable models keep their previous setting and report a pending result. Capability references are matched automatically against Ducoro's official catalog and can be pinned or disabled manually.
 - **Connectors**: two sources — Magpie library connectors (global or per Bot) and Ducoro account connectors (connect the service first, then select allowed tools per Bot in the account drawer). Revocations run before additions and connector failures are isolated; the first explicit assignment records the previous policy and revocation restores it; external edits produce conflicts instead of being overwritten. When the current CLI cannot clear a nonempty args/env/headers list or safely change transport, the plugin retains the definition and reports a conflict.
-- **Skills**: assigned per Bot from Magpie resources already allocated to Ducoro; skill artifacts with the same name and content digest are prepared once and reused. Skill bundles are bounded by file count (5000) and total size (32 MiB).
+- **Skills**: assigned per Bot from Magpie resources already allocated to Ducoro; skill artifacts with the same name and content digest are prepared once and reused. Skill bundles are limited to 5,000 files, 1,000 directories, depth 64, 10,000 entries and 32 MiB of source content. Each scan has a 10-second budget within the preview's overall 25-second budget. Cancellation also stops byte reads; unreadable bundles retain their existing managed content for review.
 - **Instructions and subagents**: instructions are appended inside the plugin-owned block, and removal restores the user's original profile; subagents are selected explicitly per target.
 - **Plans**: define a name, model, library connectors, skills and extra instructions under **Manage plans**; multiple Bots inherit continuously and explicit selections take precedence. One click clears per-Bot overrides back to the plan (including instruction overrides). Plan IDs accept 1–64 letters, digits, underscores and hyphens; cancel inheritance before deleting a plan.
+- **Target range**: `targetAgents` applies to models, instructions and subagents. Library connectors and skills in per-Bot mode also use this range; their managed resources outside it are revoked. Account connectors remain configured separately for each Bot.
 
 ### Preview and verification
 
@@ -32,6 +33,8 @@ Full history: [CHANGELOG.md](CHANGELOG.md) · Release notes: [RELEASE-NOTES.md](
 ### Drafts and bulk actions
 
 - Unfinished settings and plan drafts autosave completely through the authenticated local service and are restored against the same settings baseline. Concurrent edits across pages prompt to restore the latest draft instead of silently overwriting; a corrupt draft keeps the original file with guidance.
+- Plan drafts retain model and resource assignment modes; hidden input values do not change the selected mode. Legacy drafts infer missing modes from saved plans. Previously lost editing intent cannot be fully recovered, so review the preview after restoring an old draft.
+- Draft locks recover ownership from processes confirmed to have exited and preserve live owners. Anonymous legacy locks or unverified ownership are never deleted automatically. If prompted, stop all plugin hosts, back up and move `page-draft.lock` and `page-draft-locks` out of the state directory, then reopen the page. Keep `page-draft.json`.
 - Bulk copy stages the source Bot's effective configuration, including inherited plans, into the draft; the latest bulk change can be undone. Account permissions are excluded from bulk copy.
 
 ### Backups and rollback
@@ -39,15 +42,16 @@ Full history: [CHANGELOG.md](CHANGELOG.md) · Release notes: [RELEASE-NOTES.md](
 - **Backup and restore** centralizes management-record backups and configuration checkpoints: create backups, open the backup folder, import external files (8 MiB limit; record imports need a complete v1/v2 snapshot, checkpoint imports accept version 1 records), JSON export and per-collection clearing. Backups support names, notes and retention flags; retained items survive automatic pruning, bulk clearing and local-record cleanup.
 - A configuration checkpoint is created before each save (file mode 0600, latest 20 unretained kept). Checkpoints roll back selectively by field and Bot, automatically including related plan definitions, inheritance and scope changes; restores stage a draft for preview before saving.
 - Restoring a management-record backup pauses automatic sync until previewed and manually continued; restarting the host does not clear the pause.
+- Restore preflight failures do not introduce a new pause. Failures after the state-writing stage begins retain the pause until the result can be reviewed.
 - **Clean up local records** previews counts and sizes before confirming: it removes completed operation history (up to 500 records), old state backups (latest 5 unretained kept) and skill caches unused for over 7 days, and compacts the journal. Current ownership, permission-recovery data, unfinished operations and skills in use are retained.
 
 ## Installation
 
-Add this folder's absolute path in Magpie's plugin settings, or install the local `magpie-ducoro-0.4.7.tgz` package. Open **Ducoro** in the sidebar. Magpie must support plugin page services, and `ducoro-cli` and the Ducoro daemon must be available locally.
+Add `github:YE4IM/magpie-ducoro-plugin#v0.4.8` in Magpie's plugin settings, or download the GitHub Release's automatically generated Source code, extract it and add the folder's absolute path. You can also install the local `magpie-ducoro-0.4.8.tgz` package. Open **Ducoro** in the sidebar. Magpie must support plugin page services, and `ducoro-cli` and the Ducoro daemon must be available locally.
 
 Upgrading: stop the previous host, then replace the plugin path or package before loading the new version, so two versions never write the same management state. Existing settings and compatible v1/v2 records carry forward without reconfiguration.
 
-Downgrading: stop the 0.4.7 host first, then run `npm run state:compact -- /absolute/path/to/state.json` from this package directory to merge the journal under the shared lock. After an interrupted run, recover with 0.4.7 first. Do not manually delete an uncompacted journal.
+Downgrading: stop the 0.4.8 host first, then run `npm run state:compact -- /absolute/path/to/state.json` from this package directory to merge the journal under the shared lock. After an interrupted run, recover with 0.4.8 first. Do not manually delete an uncompacted journal.
 
 ## Page and assignments
 

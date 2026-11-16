@@ -2,11 +2,11 @@
 
 让普通版 Cursor 使用 **Magpie** 中配置的模型与路由组：模型菜单只列出 Magpie 目录，隐藏 Cursor Auto 入口，保留 Cursor 原有登录与 Tab 补全。
 
-- **当前版本**：`0.2.17`（本地增强版）
+- **当前版本**：`0.2.21`（本地增强版）
 - **适配范围**：Cursor 3.28.x ～ 3.30.8（已实测）
-- **平台支持**：macOS（Apple Silicon，LaunchAgent 守护）与 Windows x64（启动文件夹守护，`bin/win32-x64/cursor-magpie-bridge.exe`，无需管理员权限即可常驻；首次信任证书需一次管理员确认）；Linux 可运行控制台，原生引擎与服务守护尚未提供。Intel Mac 需自行构建 x64 版本
-- **与上游的关系**：基于 [nodlles/magpie-agent-cursor-bridge](https://github.com/nodlles/magpie-agent-cursor-bridge) `v0.2.2` 与本机 fork 增补，原生核心来自 [leookun/cursor-byok v1.0.1](https://github.com/leookun/cursor-byok/tree/v1.0.1)
-- **本仓库定位**：公开增强版，GitHub topic 已标记 `magpie-plugin`；可从 Magpie 插件页安装 `github:kingchen95272025/magpie-agent-cursor-bridge-enhanced#v0.2.17`，也支持本机源码安装
+- **平台支持**：macOS（Apple Silicon 与 Intel x64，LaunchAgent 守护；Intel 引擎为 `bin/darwin-x64/cursor-magpie-bridge`）、Windows x64（启动文件夹守护，`bin/win32-x64/cursor-magpie-bridge.exe`，无需管理员权限即可常驻；首次信任证书需一次管理员确认）与 Linux x64/arm64（systemd 用户单元守护，`bin/linux-<arch>/cursor-magpie-bridge`；证书写入 Cursor `argv.json` 与用户 NSS 库，无需 root；无 systemd 用户实例时回退为分离进程）
+- **与上游的关系**：基于 [nodlles/magpie-agent-cursor-bridge](https://github.com/nodlles/magpie-agent-cursor-bridge) `v0.2.2` 与本机 fork 增补，原生核心来自 [leookun/cursor-byok v1.0.1](https://github.com/leookun/cursor-byok/tree/v1.0.1)；Linux 适配参考 [Ice0828/magpie-agent-cursor-bridge-linux](https://github.com/Ice0828/magpie-agent-cursor-bridge-linux)
+- **本仓库定位**：公开增强版，GitHub topic 已标记 `magpie-plugin`；可从 Magpie 插件页安装 `github:kingchen95272025/magpie-agent-cursor-bridge-enhanced#v0.2.21`，也支持本机源码安装
 - **变更记录**：[CHANGELOG.md](CHANGELOG.md)
 
 ---
@@ -192,17 +192,18 @@ Cursor 请求里的 `requested_model.model_id` 是桥接生成的 `model_hash`�
 
 ### 3.1 前置条件
 
-- Apple Silicon macOS，或 Windows 10/11 x64；
-- macOS：Magpie 与 Cursor 均安装在 `/Applications`；Windows：使用默认安装位置（Magpie 在 `%LOCALAPPDATA%\Programs\magpie`，Cursor 在 `%LOCALAPPDATA%\Programs\cursor`）；
+- macOS（Apple Silicon 或 Intel x64）、Windows 10/11 x64，或 Linux x64/arm64（随包产物以 glibc 2.34 为基线，即 Debian 12 / Ubuntu 22.04 及以上；OpenSSL 以 vendored 方式静态链接，无 `libssl` 运行时依赖；更老的发行版可在本机运行 `scripts/build-native-linux.sh` 原生构建；需 systemd 用户实例，无 systemd 时回退为分离进程）；
+- macOS：Magpie 与 Cursor 均安装在 `/Applications`；Windows：使用默认安装位置（Magpie 在 `%LOCALAPPDATA%\Programs\magpie`，Cursor 在 `%LOCALAPPDATA%\Programs\cursor`）；Linux：Magpie 在 `PATH` 或 `~/.local/bin`、`/usr/local/bin`、`/usr/bin`，Cursor 安装位置不限；
 - Magpie 中已配置至少一个可用模型；
-- 无需安装 Cursor BYOK 或 Rust；Windows 下运行时直接复用 Magpie 自带的 Bun。
+- 无需安装 Cursor BYOK 或 Rust；各平台运行时都直接复用 Magpie 自带的 Bun。
+- Linux 可选安装 `nss-tools`（Debian/Ubuntu 为 `libnss3-tools`）以获得用户 NSS 证书库导入；未安装时仍会写入 Cursor `argv.json`，不影响使用。
 
 ### 3.2 安装
 
 从 Magpie 插件页安装（推荐）——在 **Magpie → Plugins** 添加固定版本地址：
 
 ```text
-github:kingchen95272025/magpie-agent-cursor-bridge-enhanced#v0.2.17
+github:kingchen95272025/magpie-agent-cursor-bridge-enhanced#v0.2.21
 ```
 
 安装后在终端运行一次包内初始化：
@@ -220,13 +221,13 @@ bash setup.command
 
 初始化会：
 
-1. 校验二进制摘要与版本配对（`integrity.json` 分别固定插件版本 `version` 与随包引擎版本 `engineVersion`）；
-2. 复用已有证书，或在首次安装时生成本机 CA 并请求 macOS 信任；
-3. 把完整版本目录 stage 到 `releases/0.2.17-xxxxxx`；
+1. 校验二进制摘要与版本配对（`integrity.json` 分别固定插件版本 `version` 与随包引擎版本 `engineVersion`，分平台摘要见 `platforms`）；
+2. 复用已有证书，或在首次安装时生成本机 CA 并完成平台信任：macOS 请求系统授权、Windows 加入本机 Root、Linux 写入 Cursor `argv.json` 并尽力导入用户 NSS 库；
+3. 把完整版本目录 stage 到 `releases/0.2.21-xxxxxx`；
 4. 把 `~/.local/share/magpie-cursor-bridge` 注册为本地 Magpie 插件；
-5. 停止旧后台、切换 LaunchAgent、启动新后台。
+5. 停止旧后台、切换服务定义（LaunchAgent / 启动文件夹 / systemd 用户单元）、启动新后台。
 
-完成后在 **Magpie → Agents** 选择 **Cursor · Magpie Bridge** 和一个模型，再重启 Cursor。
+完成后在 **Magpie → Agents** 选择 **Cursor · Magpie Bridge** 和一个模型，再重启 Cursor。也可以直接在插件控制台的「连接模型」卡片中从 Magpie 模型目录选择并点「连接并启动」：控制台会调用 Magpie 的 agent 接口写入连接，随后自动拉起原生引擎；首次安装时连后台服务也一并启动。**未选择模型时原生引擎显示「等待连接」属于正常待机（省电）状态，不是故障**，选择模型后数秒内会变为「运行中」。
 
 Windows x64 不必使用终端：在 Magpie 的 **Cursor · Magpie Bridge** 行菜单打开「桥接控制台」，点「启动」即可，等价于在包目录执行 `node install.js setup`。Windows 的差异：
 
@@ -235,6 +236,14 @@ Windows x64 不必使用终端：在 Magpie 的 **Cursor · Magpie Bridge** 行�
 3. 安装目录为 `%LOCALAPPDATA%\magpie-cursor-bridge`，`releases\` 下只保留当前版本，旧版本在每次「启动」后自动清理。
 4. 若 Magpie 插件列表里同时登记了本仓库路径和 `%LOCALAPPDATA%\magpie-cursor-bridge` 两份，请移除其中一份；重复登记会让两个控制服务争用同一端口。安装器检测到重复时会给出提示，但不会擅自删除登记。
 5. Magpie 的 Agent 沙箱在 Windows 下拿不到进程环境，`connection.json` 实际由 Magpie 展开 `~` 写入 `%USERPROFILE%\.config\magpie-cursor-bridge\`；后台会同时读取该位置与 `%APPDATA%\magpie-cursor-bridge\`，无需手动复制。后台状态、数据库与 release 仍在 `%APPDATA%` / `%LOCALAPPDATA%`。
+
+Linux x64/arm64 同样可以在控制台点「启动」或在包目录执行 `bash setup.command`。Linux 的差异：
+
+1. 后台由 **systemd 用户单元** `~/.config/systemd/user/local.magpie.cursor-bridge.service` 守护（`Restart=on-failure`，登录自启），日志追加到 `supervisor.log` / `supervisor-error.log`，也可用 `journalctl --user -u local.magpie.cursor-bridge` 查看。
+2. 当 `systemctl --user` 不可用（容器、未启用 systemd 的 WSL、精简发行版）时，安装器**回退为分离进程**立即启动 supervisor，并保留单元文件；下次登录若 systemd 用户实例可用，会自动接管。控制台「后台服务」此时显示「ready」或「stopped」，实际运行状态以「后台监视器」的 PID 为准。
+3. 证书信任全程**不需要 root**：安装器把 CA 路径写入 Cursor 的 `~/.config/Cursor/argv.json`（`certificate-authority`），并在检测到 `certutil` 时导入用户 NSS 库 `~/.pki/nssdb`；两者任一成立，随包引擎即认为 CA 已受信任。若还需系统级信任，按安装日志最后一行提示执行一次 `sudo cp ... && sudo update-ca-certificates`（Debian/Ubuntu）或 `sudo update-ca-trust extract`（Fedora/RHEL/Arch）。
+4. 安装目录为 `~/.local/share/magpie-cursor-bridge`，每次 setup 只保留当前 release；旧版本在激活成功后自动清理。
+5. Cursor 需要**重启一次**才能读取新的 `argv.json` 与模型目录；若模型菜单仍为空，先确认 `~/.config/Cursor/User/settings.json` 的 `http.proxy` 已由桥接写入。
 
 > 若同时装有上游 GitHub 插件，请先移除，避免两个同名 agent 争用连接：
 >
@@ -269,11 +278,12 @@ Magpie 的代理卡片内部是内置 UI，插件无法把控件插进那张卡�
 
 控制台提供：
 
-- **启动**：macOS 运行 `bash setup.command`（校验包、stage 新版本、切换 LaunchAgent）；Windows 运行 `install.js setup`（写入启动文件夹、结束旧后台、启动新后台）
-- **状态**：macOS 为 `bash setup.command status`，Windows 为 `install.js status`，同时刷新运行概览
-- **重启**：终止 supervisor 与原生引擎后重新执行「启动」；macOS 额外 `launchctl bootout`
+- **启动**：macOS / Linux 运行 `bash setup.command`（校验包、stage 新版本、切换 LaunchAgent 或 systemd 用户单元）；Windows 运行 `install.js setup`（写入启动文件夹、结束旧后台、启动新后台）
+- **状态**：macOS / Linux 为 `bash setup.command status`，Windows 为 `install.js status`，同时刷新运行概览
+- **重启**：终止 supervisor 与原生引擎后重新执行「启动」；macOS 额外 `launchctl bootout`，Linux 额外 `systemctl --user stop`
 - **运行模式**：默认模式 / 轻量模式。轻量模式让原生引擎使用进程内存中的 SQLite（shared-cache），不写 `data/bridge.db`；切换后 supervisor 在 2 秒内自动重启引擎，当前对话可能中断一次。轻量模式会沿用上次的代理端口（端口占用时回退随机），避免 Cursor 因端口变化而需要重启。
 - **可编辑参数**：模型目录同步间隔（默认 15 秒）、网关断线容错（默认 60 秒）、引擎日志上限（默认 4 MiB），写入 `~/.config/magpie-cursor-bridge/bridge-settings.json`。运行模式与同步间隔、容错在下一轮循环生效（模式变更会重启引擎）；日志上限在下次后台启动时生效。
+- **模型显示名**：在「可编辑参数 → 模型显示名」中为每个模型填写 Cursor 模型菜单中的显示名称，留空使用 Magpie 原名；只覆盖传给引擎的 `name`，模型 ID 不变，因此路由、计费与连接语义不受影响。保存后 supervisor 更新 `effective.json`，引擎热更新模型目录，Cursor 菜单数秒内刷新（可能需要重新打开菜单或重启 Cursor）。
 - **快捷入口**：配置目录、`engine.log`、`supervisor.log`、`supervisor-error.log`、安装目录、插件目录。
 
 控制服务只监听 `127.0.0.1:3580`（可在引导页修改，约 2 秒切换），每次启动生成随机口令，并校验 `Host` 与 `Origin`。它由 Magpie 插件宿主拉起，**后台桥接停止时仍能点「启动」**。`magpie web`（浏览器远程）下无法访问本机环回地址，控制台不可用。
@@ -290,7 +300,7 @@ bash setup.command status    # 输出 status.json 原文
 
 ```json
 {
-  "version": "0.2.17",
+  "version": "0.2.21",
   "state": "connected",
   "mode": "lite",
   "engineMode": "lite",
@@ -342,12 +352,15 @@ bash setup.command uninstall
 | 控制台打不开 / 端口被占用 | 控制服务未启动或端口冲突 | 在引导页修改控制端口后重试；确认插件处于开启状态 |
 | 控制台没有样式、按钮无响应 | 沙箱页的 CSP 拦截了外链资源 | 升级到包含 CSP 修复的版本；旧页面强制刷新或重新打开 |
 | 控制台提示「控制口令无效」或「控制服务不可达」 | 页面在控制服务重启（插件重载、端口切换、升级）前打开，内联令牌已过期 | 点「刷新页面」或重新打开控制台；新版页面会自动重载一次 |
-| 控制台显示「当前平台不支持后台服务」 | 仅 Linux 尚未实现自动安装、证书信任与服务守护 | 控制台仍可查看状态；完整桥接需 macOS / Windows，或自行构建对应平台的原生引擎 |
+| Linux 控制台显示「当前平台不支持后台服务」 | 运行在非 Linux/macOS/Windows 平台，或包内缺少对应架构引擎 | 确认 `uname -m` 为 x86_64/aarch64，且 `bin/linux-<arch>/cursor-magpie-bridge` 存在并通过 `integrity.json` 校验 |
+| Linux 启动失败：`requires an already trusted CA` | 引擎未在 `argv.json`、用户 NSS 库或系统 anchor 中看到该 CA | 重跑 `bash setup.command`；确认 `~/.config/Cursor/argv.json` 的 `certificate-authority` 指向 `~/.config/magpie-cursor-bridge/data/ca/ca.crt`，然后重启 Cursor |
+| Linux 启动回退为分离进程 | 当前会话没有可用的 systemd 用户实例（容器/WSL/精简系统） | 属预期回退；若希望登录自启，启用 systemd user manager 或执行 `loginctl enable-linger "$USER"` 后重跑 setup |
+| Linux 控制台「后台服务」显示 ready 但未运行 | 单元已写入但尚未由 systemd 启动 | 点「启动」，或执行 `systemctl --user enable --now local.magpie.cursor-bridge` |
 | Windows 启动失败：`Access is denied` 或证书未受信任 | 证书未加入本机 Root，或取消了 UAC 授权 | 重新点「启动」，在管理员确认窗口选择「是」；确认 `certmgr.msc` 的「受信任的根证书颁发机构」中存在 `Cursor BYOK Local CA` |
 | Windows 启动失败：引擎退出码 1 / `requires an already trusted CA` | 旧版安装器只写入了当前用户证书存储，随包引擎只认本机存储 | 升级到本版本后重新点「启动」；首次会弹出一次 UAC |
 | Windows 日志出现 `EADDRINUSE` 或 agent id 重复 | Magpie 插件列表登记了两份本插件 | 在 Magpie 插件页保留一份，移除 `%LOCALAPPDATA%\magpie-cursor-bridge` 或仓库路径的其余登记 |
 | Windows 控制台「后台服务」显示未加载 | 登录自启文件被删除，或从未完成「启动」 | 检查 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\local.magpie.cursor-bridge.vbs`，重新点「启动」 |
-| Intel Mac 提示仅含 arm64 引擎 | 发布物只包含 Apple Silicon 二进制 | 用 `--target x86_64-apple-darwin` 自行构建并重算 `integrity.json` |
+| Intel Mac 提示缺少引擎 | 包内缺少 `bin/darwin-x64` 产物 | 使用 v0.2.21+ 版本；或在 Apple Silicon 上运行 `scripts/build-native-macos-x64.sh` 重新构建并更新 `integrity.json` |
 
 ---
 
@@ -359,7 +372,7 @@ bash setup.command uninstall
 .
 ├── agent.js                 # Magpie Agent 插件入口（id: cursor-bridge）
 ├── bridge.js                # 后台监视器：目录同步、启停桥接、代理接管
-├── install.js               # 安装器：校验、证书、stage、注册、激活；Windows 的「启动」直接调用它
+├── install.js               # 安装器：校验、证书、stage、注册、激活；macOS/Linux 经 setup.command 调用，Windows 的「启动」直接调用它
 ├── setup.command            # macOS/Linux 初始化入口（转调 install.js：setup/status/uninstall/--version）
 ├── control/                 # Agent 行菜单控制台：插件宿主服务 + 本机 HTTP 控制台
 │   ├── host.js              # 由 Magpie 插件宿主加载，守护控制服务与端口切换
@@ -371,13 +384,21 @@ bash setup.command uninstall
 │   └── cursor.svg           # Cursor 官方图标（Agent 行 / 侧栏页）
 ├── lib/
 │   ├── config.js            # connection.json 校验与 Magpie 模型目录拉取
-│   ├── bridge-settings.js   # 可编辑参数（运行模式、同步间隔、断线容错、日志上限）
-│   ├── install.js           # 版本配对、证书、release stage、LaunchAgent
+│   ├── bridge-settings.js   # 可编辑参数（运行模式、同步间隔、断线容错、日志上限、模型显示名）
+│   ├── install.js           # 版本配对、证书、release stage、LaunchAgent / systemd 单元
 │   └── settings.js          # Cursor settings.json 的原子写与代理恢复
-├── bin/cursor-magpie-bridge # 编译产物（Rust）
+├── bin/cursor-magpie-bridge # macOS arm64 编译产物（Rust，历史布局）
+├── bin/darwin-x64/          # macOS Intel 引擎
+├── bin/win32-x64/           # Windows x64 引擎
+├── bin/linux-x64|arm64/     # Linux 引擎（按架构分目录）
 ├── source.patch             # 相对上游 v1.0.1 的全部源码改动
-├── scripts/build-native.sh  # 克隆上游 → 应用补丁 → cargo build → 写摘要
-├── test/                    # Node 测试（22 项）
+├── source-linux.patch       # Linux 专属补丁：argv.json / NSS 用户级信任判定
+├── scripts/build-native.sh  # macOS arm64：克隆上游 → 应用补丁 → cargo build → 写摘要
+├── scripts/build-native-macos-x64.sh # Apple Silicon 上交叉编译 Intel x64
+├── scripts/build-native-windows.sh        # macOS 上交叉编译 Windows x64
+├── scripts/build-native-linux.sh          # Linux 原生构建（Linux 主机或容器内）
+├── scripts/build-native-linux-docker.sh   # macOS/Linux 上用 Docker 构建 x64 + arm64
+├── test/                    # Node 测试
 ├── integrity.json           # 二进制版本与 SHA-256
 └── CHANGELOG.md
 ```
@@ -405,7 +426,30 @@ CARGO_BUILD_JOBS=2 bash scripts/build-native-windows.sh
 
 脚本产出 `bin/win32-x64/cursor-magpie-bridge.exe`，并写入 `integrity.json` 的 `platforms.win32-x64` 摘要。
 
-依赖：Git、Rust/Cargo、Python 3（Windows 交叉编译另需 mingw-w64）。默认 `CARGO_BUILD_JOBS=2`，可覆盖：
+macOS Intel x64 产物在 Apple Silicon 上交叉编译（arm64 仍由 `build-native.sh` 产出到历史路径 `bin/cursor-magpie-bridge`）：
+
+```sh
+CARGO_BUILD_JOBS=2 bash scripts/build-native-macos-x64.sh
+```
+
+脚本会安装 `x86_64-apple-darwin` target，产出 `bin/darwin-x64/cursor-magpie-bridge`，并写入 `integrity.json` 的 `platforms.darwin-x64` 摘要。Rosetta 可用时直接执行 `--version` 自检，否则回退到 `strings` 校验版本常量。
+
+Linux x64 / arm64 产物用 Docker 从 macOS 或 Linux 构建。两个架构都在已缓存的 `linux/amd64` 容器内完成：x64 原生编译，arm64 使用 Debian 的 `aarch64-linux-gnu` 工具链交叉编译（因此只需要 Debian 源与 `static.rust-lang.org` 可达，不依赖 Docker Hub 的 arm64 镜像）：
+
+```sh
+bash scripts/build-native-linux-docker.sh                 # 默认构建 x64 + arm64
+CURSOR_BRIDGE_LINUX_ARCHES=arm64 bash scripts/build-native-linux-docker.sh
+```
+
+也可以直接在 Linux 主机上构建（在目标发行版上构建即可获得与该系统一致的 glibc 基线）：
+
+```sh
+bash scripts/build-native-linux.sh
+```
+
+两者都会先应用 `source.patch`，再应用 `source-linux.patch`（含 Linux 信任判定与 vendored OpenSSL 依赖），产出 `bin/linux-<arch>/cursor-magpie-bridge` 并写入 `integrity.json` 的 `platforms.linux-<arch>` 摘要。Docker 方式默认使用 `rust:1-bookworm`（glibc 2.34），可用 `CURSOR_BRIDGE_LINUX_IMAGE` 覆盖镜像；交叉编译的 arm64 产物用 `strings` 校验版本常量，x64 原生产物直接执行 `--version`。Docker 方式使用命名卷缓存 Cargo registry 与 target；切换镜像或需要干净重建时删除 `cursor-bridge-cargo-registry-{x64,arm64}` 与 `cursor-bridge-target-{x64,arm64}` 四个卷。在 Apple Silicon 上构建 `linux/amd64` 建议在 Docker Desktop / OrbStack 中启用 Rosetta，否则会走 QEMU 模拟，耗时显著增加。
+
+依赖：Git、Rust/Cargo、Python 3（Windows 交叉编译另需 mingw-w64；macOS x64 交叉编译需 Xcode Command Line Tools；Linux Docker 构建需 Docker）。默认 `CARGO_BUILD_JOBS=2`，可覆盖：
 
 ```sh
 CARGO_BUILD_JOBS=4 bash scripts/build-native.sh
@@ -446,7 +490,16 @@ git -C /tmp/verify apply --check <项目目录>/source.patch
 node --test test/*.test.js
 ```
 
-覆盖：独立 CA 生成、版本配对与摘要、证书信任流程、release stage 不覆盖运行中版本、激活失败回退、代理设置恢复、配置校验。
+覆盖：独立 CA 生成、版本配对与摘要、证书信任流程、release stage 不覆盖运行中版本、激活失败回退、代理设置恢复、配置校验；Linux 额外覆盖 systemd 单元、argv.json 注释保留、NSS 导入与信任标记、无 systemd 回退。
+
+Linux 平台分支可以在 Debian 12 容器内完整验证（构建产物已在 `bin/linux-x64` 与 `bin/linux-arm64`）：
+
+```sh
+docker run --rm --platform linux/amd64 -v "$PWD:/work" -w /work rust:1-bookworm bash -c '
+  sed -i "s|http://deb.debian.org|https://deb.debian.org|g" /etc/apt/sources.list.d/debian.sources
+  apt-get update -qq && apt-get install -y -qq --no-install-recommends nodejs sqlite3 libnss3-tools ca-certificates
+  node --test test/*.test.js'
+```
 
 已有正常连接时，可手动验证生命周期（不会生成模型请求）：
 
@@ -459,7 +512,8 @@ node test/manual-lifecycle.mjs
 | 目标 | 方法 |
 |---|---|
 | 看后台状态 | `bash setup.command status`（Windows：`node install.js status`），或 Magpie → Cursor · Magpie Bridge 行菜单「桥接控制台」 |
-| 看桥接诊断 | macOS：`~/.config/magpie-cursor-bridge/engine.log`；Windows：`%APPDATA%\magpie-cursor-bridge\engine.log` |
+| 看桥接诊断 | macOS/Linux：`~/.config/magpie-cursor-bridge/engine.log`；Windows：`%APPDATA%\magpie-cursor-bridge\engine.log` |
+| 看 Linux 服务日志 | `journalctl --user -u local.magpie.cursor-bridge -f`，或 `~/.local/share/magpie-cursor-bridge/releases/<version>/supervisor.log` |
 | 看最近模型调用 | `sqlite3 data/bridge.db "SELECT ... FROM llm_calls ORDER BY created_at_ms DESC LIMIT 10"` |
 | 看 Agent 运行 | `data/bridge.db` 的 `runs`、`cursor_run_traces` |
 | 协议解码失败 | 桥接会把原始报文写到 `$TMPDIR/bidi-dump-<seqno>.bin` |
@@ -475,7 +529,7 @@ node test/manual-lifecycle.mjs
 
 ### 5.1 差异总览
 
-| 项目 | 上游 0.2.2 | 增强版 0.2.17 | 机制 |
+| 项目 | 上游 0.2.2 | 增强版 0.2.21 | 机制 |
 |---|---|---|---|
 | Cursor 3.29+ / 3.30.8 | ❌ 30 秒后 “Connection stalled” | ✅ 正常对话 | 上行编码从 hex 文本改为原始 protobuf 字节 |
 | `BidiAppend` 载荷 | 只接受 `data`（tag 1，hex） | `data_binary`（tag 4）优先，`data` 兜底 | 同一消息的两种编码，共用一个解码器 |
@@ -484,7 +538,7 @@ node test/manual-lifecycle.mjs
 | Cursor 3.27 / 3.28.x | ✅ | ✅ | 公共路径未改动 |
 | 运行模式 | 仅文件库 | 默认 + 轻量（内存库） | 轻量模式不写 `bridge.db`，适合磁盘敏感或只做转发的场景 |
 | Multitask 后台子代理 | 完成后不接管，子代理停在 Stopped | 完成即唤醒父代理，状态回写 Success | 完成通知进入运行时，不再当作 unsupported action 丢弃 |
-| 分发方式 / 版本 | GitHub 插件页 / 0.2.2 | 本机 fork / 0.2.17 | 避免与上游 release 目录、摘要互相覆盖 |
+| 分发方式 / 版本 | GitHub 插件页 / 0.2.2 | 本机 fork / 0.2.21 | 避免与上游 release 目录、摘要互相覆盖 |
 
 ### 5.2 0.2.7：Multitask 后台子代理完成后的接管
 
