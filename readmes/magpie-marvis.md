@@ -102,6 +102,48 @@ magpie plugin add MYCF711/magpie-marvis
 - **`/v1/chat/completions` 不需要 UAL 签名**：那是 `/v3/*` 业务接口的事。把签名头加到模型
   网关上会从 `403 风控` 变成 `401 登录态过期`。
 
+## 首行改写（供应商卡片里的两个开关）
+
+被上游内容过滤拦下（403 `非法请求`）时，插件会对 system 提示词的**第一句**做处理。
+开关就在**腾讯 Marvis 的供应商编辑器**里（和账号、路由、模型同一张卡，标题「插件选项 / Plugin options」）：
+
+| 开关 | 默认 | 打开后 |
+| --- | --- | --- |
+| 被上游拒绝时改写首行 / `first_line_fallback` | **开** | 被 403 拦下的请求，把 system 首行换成兜底句**重试一次**；正常请求一个字节都不改 |
+| 每个请求都改写首行 / `first_line_always` | 关 | 每个请求都把首行换成自定义那句（开了会先弹一次确认） |
+
+两个都关 = 只走内置白名单（已知客户端的默认首句），不做任何兜底。
+
+自定义那句写在插件行的 **Options**（JSON 编辑框）里，与开关是两套东西：
+
+```json
+{ "firstLine": { "text": "" } }
+```
+
+`text` 留空 = 内置兜底 `You are a helpful assistant.`（不含任何 agent 产品名，实测 200）。
+换掉的只是 system 消息的**第一行**，第二行起原样；改写是幂等的，前缀缓存不会反复失效。
+
+> 开关是 magpie 自己的扩展点（`auth.options`，#2038）：点一下立刻保存，插件下一个请求就读到，**不用重启**。
+
+## 你的号被降级了没有？跑一条命令
+
+auto 家族（`main-auto` / `file-auto` / `computer-auto` / `browser-auto`）在服务端是**按账号**改路由的：
+同一个槽位，A 号可能服务 `deepseek-v4-1-flash-261017`，B 号被换到某个**旧快照**。
+
+⚠ **旧快照的名字不固定** —— 已知出现过 `deepseek-v4-flash-ga-260731`（issue #13）、
+`deepseek-v4-flash-202605`（issue #43）。所以别记名字、也别信槽位名，
+**只认响应体里的 `model` 字段**：
+
+```bash
+node scripts/probe-served-model.mjs          # 每个账号 × main-auto / 防降级槽位，各打一次
+node scripts/probe-served-model.mjs --json   # 机器可读；退出码 2 = 有号被路由到别的快照
+```
+
+它绕开 magpie、直接用插件自己的 `llmHeaders()` 打上游（供应商关着也能跑），只读本机账号文件、不改任何配置。
+
+被降级了怎么办：**换 `deepseek-v4-pro-external`（卡片上的 `deepseek-v4-1-flash-261017-antidowngrade`）** ——
+那条是固定映射，不受账号级改路由影响。名字里的 `-antidowngrade` 只是显示后缀，上游回的仍是 `261017`。
+
 ## 开发
 
 ```bash
