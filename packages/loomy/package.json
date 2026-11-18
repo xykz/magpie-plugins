@@ -1,15 +1,17 @@
 {
   "name": "@magpie-community/opencode-loomy-auth",
-  "version": "0.1.2-fork.4",
+  "version": "0.1.12-fork.1",
   "description": "OpenCode & Magpie provider plugin for Loomy (讯飞, loomyad.xunfei.cn): SMS sign-in, chat, models, the two point wallets and the daily first-login grant",
   "type": "module",
-  "main": "./index.mjs",
-  "exports": "./index.mjs",
+  "main": "./opencode.mjs",
+  "exports": { ".": "./opencode2.mjs" },
   "files": [
     "index.mjs",
     "renew.mjs",
     "extras.mjs",
     "headers.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
     "README.md"
   ],
   "keywords": [

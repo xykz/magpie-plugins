@@ -67,7 +67,10 @@ async function chat({ body, options, switches, url = "https://copilot.tencent.co
     body: typeof body === "string" ? body : JSON.stringify(body),
   })
   await res.text()
-  const sent = calls.at(-1)
+  // the chat, not whatever else the plugin sends after it: main reports a
+  // growth event to /v2/report once the reply is in, and that call carries
+  // none of the chat's headers
+  const sent = calls.filter((c) => c.url.pathname.endsWith("/chat/completions")).at(-1) ?? calls.at(-1)
   return { headers: sent.headers, body: text(sent.init?.body), raw: sent.init?.body, calls }
 }
 
@@ -415,8 +418,10 @@ test("the China build declares the switch, the AI build doesn't", async () => {
   const cn = await WorkBuddyAuthPlugin({ client: {} })
   const ai = await WorkBuddyAIAuthPlugin({ client: {} })
   const keys = (h) => h.auth.options.map((o) => o.key)
-  expect(keys(cn)).toEqual([_internal.FREE_ONLY, _internal.FORMAT_SWITCH])
-  expect(keys(ai)).toEqual([_internal.FREE_ONLY])
+  // three on the China build (upstream's hide-the-name switch landed beside
+  // the fork's format switch), two on the AI build
+  expect(keys(cn)).toEqual([_internal.FREE_ONLY, _internal.FORMAT_SWITCH, _internal.HIDE_DSH])
+  expect(keys(ai)).toEqual([_internal.FREE_ONLY, _internal.HIDE_DSH])
   const o = cn.auth.options.find((x) => x.key === _internal.FORMAT_SWITCH)
   expect(o.label.length).toBeLessThanOrEqual(60)
   expect(o.description.length).toBeLessThanOrEqual(300)

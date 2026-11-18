@@ -31,7 +31,7 @@ beforeEach(() => {
       case "/api/monitor/usage/quota/limit": return ok({ limits: [{ type: "CREDIT_LIMIT", unit: 6, number: 1, percentage: 90 }] })
       case "/api/biz/team/subscribe/product/querySubscribeDetail": return ok({ hasSubscription: true, status: "EFFECTIVE", memberGrantStatus: "VALID", productName: "Team Max" })
       case "/api/biz/customer-package-reset/list": return ok({})
-      case "/api/v1/zcode-plan/billing/preview": return ok({ plans: [{ plan_id: "trust", name: "Trust Build" }] })
+      case "/api/v1/marketing/touch": return ok({ deliveries: [{ banner: { background: { args: { zcode_plan: { name: "Trust Build" } } }, buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "trust" } } }] } }] })
       case "/api/anthropic/v1/messages":
       case "/api/v1/zcode-plan/anthropic/v1/messages": return ok({ type: "message", content: [] })
       default: return new Response("", { status: 404 })
@@ -96,7 +96,7 @@ test("ordinary models spend the team; trials spend the personal gift without tea
   expect(messages[1].headers.get("authorization")).toBe("Bearer " + jwt)
   expect(messages[1].headers.get("x-api-key")).toBeNull()
   expect(messages[1].headers.get("Bigmodel-Organization")).toBeNull()
-  expect(JSON.parse(messages[1].body).model).toBe("glm-5.3")
+  expect(JSON.parse(messages[1].body).model).toBe("GLM-5.3")
 })
 
 test("free first is on by default for a team seat: the plain model spends the personal gift", async () => {

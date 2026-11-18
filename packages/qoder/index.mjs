@@ -1200,7 +1200,18 @@ function reasoningOf(m) {
 // thinking before the call said, and said it had none without it. A turn
 // with thinking and nothing else is still left out, as that client leaves
 // it.
-function qoderMessages(msgs) {
+// Kimi on QwenWork (kimi-k3.1-pro) answers 400 "Error in upstream response"
+// to an assistant turn with tool_calls and an empty content, which is how
+// every OpenAI client records a call-only turn (nanfei892, #1213: 9-token
+// bodies, DeepSeek, GLM and Qwen on the same account fine, " " served).
+// QwenWork's own client always writes text beside a call. A Kimi model's
+// call-only turn carries one space; other models get the turn as written.
+function kimiModel(m) {
+  const key = String(m?.key ?? "")
+  return /^kmodel/i.test(key) || /kimi/i.test(key + " " + (m?.config?.display_name ?? "") + " " + (m?.name ?? ""))
+}
+
+function qoderMessages(msgs, opts = {}) {
   const out = []
   const names = {}
   let seen = []
@@ -1259,7 +1270,7 @@ function qoderMessages(msgs) {
         return { id, type: "function", function: { name: c.function?.name, arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) } }
       })
       const think = reasoningOf(m)
-      out.push({ role: "assistant", content: textOf(m.content), ...(think ? { reasoning_content: think } : {}), tool_calls: calls })
+      out.push({ role: "assistant", content: textOf(m.content) || (opts.callText ?? ""), ...(think ? { reasoning_content: think } : {}), tool_calls: calls })
       const open = calls.map((c) => c.id)
       const kept = new Set()
       for (let j = i + 1; j < msgs.length && msgs[j].role === "tool"; j++) {
@@ -1478,6 +1489,15 @@ function modelConfig(m, thinking) {
   }
 }
 
+// The business record also names the model: Qoder's CLI (qodercli 1.1.82,
+// qoder-worker-runtime v3 → snn + model_key) puts the chosen model's key
+// there when a prompt starts, and the server attributes the call's billing
+// from it. Without it Qoder and Qoder CN booked the call as Auto whatever
+// model_config named (plugins#692, chansee97; the same shape as #638, where
+// the model_config fix of 0.2.54 did not change the billing). Qoder.app
+// 0.4.3 and QwenWork 1.0.46 build their record without it, so a site that
+// ships such a client says businessModelKey: false.
+//
 // qoderBody is the plaintext agent_chat_generation takes for a chat
 // completion request, for model m, in the session the agent named (named,
 // "" when none) and the task it is a call of (taskOf's, a new one when
@@ -1492,7 +1512,9 @@ function qoderBody(chat, m, named = "", task, site) {
   const sys = { type: "text", text: sysText }
   const budget = chat.max_completion_tokens || chat.max_tokens || 0
   const [thinking, effort] = effortFor(chat.reasoning_effort, m, typeof budget === "number" ? budget : 0)
-  const params = { enable_thinking: thinking, max_tokens: chat.max_completion_tokens || chat.max_tokens || 32000 }
+  const asked = chat.max_completion_tokens || chat.max_tokens || 32000
+  const cap = outputCap(m)
+  const params = { enable_thinking: thinking, max_tokens: cap > 0 && asked > cap ? cap : asked }
   if (effort) params.reasoning_effort = effort
   const window = windowFor(chat, m, params.max_tokens)
   if (window > 0) params.context_length = window
@@ -1505,13 +1527,13 @@ function qoderBody(chat, m, named = "", task, site) {
     chat_record_id: request,
     session_id: session,
     parameters: params,
-    business: { product: site?.businessProduct ?? "app", version: site?.cosyVersion ?? COSY_VERSION, type: "agent", id: task.id, name: task.name ?? "", begin_at: task.begin, stage: task.answered ? "processing" : "start" },
+    business: { product: site?.businessProduct ?? "app", version: site?.cosyVersion ?? COSY_VERSION, type: "agent", id: task.id, name: task.name ?? "", begin_at: task.begin, stage: task.answered ? "processing" : "start", ...(site?.businessModelKey === false ? {} : { model_key: m.key }) },
     agent_id: "agent_common",
     task_id: "common",
     session_type: site?.sessionType ?? "app",
     model_config: modelConfig(m, thinking),
     system: [sys],
-    messages: [{ role: "system", content: [sys] }, ...cacheMarked(qoderMessages(chat.messages ?? []))],
+    messages: [{ role: "system", content: [sys] }, ...cacheMarked(qoderMessages(chat.messages ?? [], { callText: kimiModel(m) ? " " : "" }))],
   }
   if (tools.length)
     body.tools = tools.map((t) => ({
@@ -1519,6 +1541,42 @@ function qoderBody(chat, m, named = "", task, site) {
       function: { name: t.function.name, description: t.function.description ?? "", parameters: typedUnions(t.function.parameters) ?? { type: "object", properties: {} } },
     }))
   return body
+}
+
+// OUTPUT_CAPS are the largest max_tokens a model takes where its listing
+// entry names none: Qoder CN's QoDuck (lmodel) answers a larger one with a
+// 400 "Error in upstream response: Range of max_tokens should be [1,
+// 131072]", whatever the account (plugins#822, Gruu6y). A client asking
+// DeepSeek's 384K output was refused on every try, and each refusal rested
+// another account.
+const OUTPUT_CAPS = { lmodel: 131072 }
+// LEARNED_CAPS are the ceilings Qoder named in such a refusal, by model
+// key, for a model whose entry and OUTPUT_CAPS give none or a wrong one: the
+// refused request is asked again once at that ceiling, and later ones are
+// sent it from the start.
+const LEARNED_CAPS = new Map()
+// MAX_TOKENS_RANGE is that refusal's own words.
+const MAX_TOKENS_RANGE = /\brange of max_tokens should be \[\s*(\d+)\s*,\s*(\d+)\s*\]/i
+
+// outputCap is the largest max_tokens model m takes, 0 when none is known:
+// what a refusal named, which is Qoder's own word, else its listing
+// entry's own (max_output_tokens), else OUTPUT_CAPS. A request's max_tokens is never sent above it, and one
+// asked lower is sent as asked.
+function outputCap(m) {
+  const n = (v) => (Number.isInteger(v) && v > 0 ? v : 0)
+  const raw = m?.config ?? {}
+  return n(LEARNED_CAPS.get(m?.key)) || n(raw.max_output_tokens) || n(raw.maxOutputTokens) || n(OUTPUT_CAPS[m?.key])
+}
+
+// reclamp is whether the request body was refused for a max_tokens above
+// model m's ceiling (failure's maxTokens), lowered to it if so: the
+// ceiling is remembered for the model, and the caller asks again once.
+function reclamp(f, body, m) {
+  const cap = f?.maxTokens
+  if (!(cap > 0) || !(body?.parameters?.max_tokens > cap)) return false
+  if (m?.key) LEARNED_CAPS.set(m.key, cap)
+  body.parameters.max_tokens = cap
+  return true
 }
 
 // failure is the status and message for a Qoder failure. Qoder's own code
@@ -1589,6 +1647,11 @@ function failure(status, text) {
   }
   if (QUOTA_CODES.has(code)) return { status: 429, message: "usage limit reached: " + msg, signIn: "" }
   if (REQUEST_CODES.has(code)) return { status: 400, message: `Qoder refused the request (${code}): ${msg}`, signIn: "" }
+  // a max_tokens above the model's ceiling, said behind "Error in upstream
+  // response": the request's fault on every account, so a 400 that rests
+  // none, with the ceiling for ask to send again at (plugins#822)
+  const range = MAX_TOKENS_RANGE.exec(msg)
+  if (range) return { status: 400, message: `Qoder refused the request's max_tokens: ${msg}`, signIn: "", maxTokens: Number(range[2]) }
   if (UPSTREAM_FAILED.test(msg)) return { status: 502, message: msg, signIn: "" }
   // a refused chat is the built-in's 401, which never marked the account
   // lapsed: only a refused refresh did (errorResponse says kept). Qoder's
@@ -1600,7 +1663,16 @@ function failure(status, text) {
     const said = msg && msg !== STATUS_CODES[status] ? ` (Qoder said ${status}: ${msg.slice(0, 300)})` : ""
     return { status: 401, message: "the sign-in lapsed — sign in again" + said, lapsed: true }
   }
-  if (status === 429 || msg.toLowerCase().includes("quota")) return { status: 429, message: "usage limit reached: " + msg }
+  // Qoder's words go with the status and code they came in, and the reply
+  // itself when it says more than the message: a 429 that names no quota
+  // ("All models failed", QwenWork) is not shown as an account's limit
+  // with nothing to tell it apart (dsh, QwenWork flash)
+  if (status === 429 || msg.toLowerCase().includes("quota")) {
+    const raw = String(text ?? "").trim()
+    const seen = `Qoder replied HTTP ${status}${code ? `, code ${code}` : ""}`
+    const body = raw && raw !== msg ? `: ${raw.slice(0, 400)}` : ""
+    return { status: 429, message: `usage limit reached: ${msg} (${seen}${body})` }
+  }
   return { status, message: msg }
 }
 
@@ -1630,24 +1702,54 @@ const errorResponse = ({ status, message, signIn = status === 401 ? "kept" : und
 // request again in the same request_set_id under a new request_id and
 // chat_record_id, up to 10 times; the refused call's stream is closed. Three failed asks
 // in a row, a 404 (no queue there) or a state with neither field end the
-// wait. Qoder's client waits up to an hour; here the whole of it is held
-// under QUEUE.budget from the request's start, since nothing reaches the
-// agent meanwhile: magpie keeps a stream's agent alive with comments for 5
-// minutes of a vendor's silence, and then leaves it to the agent's own
-// timeout. Past the budget it is the 503 with Retry-After it was before, so
-// magpie may ask another account. Qoder's client also tells
+// wait. Qoder's client waits up to an hour, and so does a streamed request
+// here (QUEUE.held, from the request's start): at the first queue answer
+// it is given its 200 and an SSE comment at once, and one every
+// QUEUE.beat while it waits, so the agent is never left with nothing.
+// magpie hears the comments as the reply going on (its plugin host gives
+// a body 30 minutes between bytes, its translated replies keep the client
+// alive while the upstream is heard from) and tells a Codex client
+// response.in_progress for each, the event its 300s idle timeout counts
+// (plugins#807: at the old 4-minute cap Codex saw a 503 and a restart).
+// What comes of the wait goes on in the same stream: the answer, or the
+// refusal as the stream's error. A request not streamed has nothing to
+// keep its client alive with, and waits QUEUE.budget at most, then the
+// 503 with Retry-After it was before, so magpie may ask another account.
+// Qoder's client also tells
 // /api/v2/service/ask/finish when its turn ends; that is left out, and its
 // own log says Qoder's TTL releases the lease when finish is not heard.
 const QUEUE_STATUS_PATH = "/algo/api/v2/service/ask/queue/status"
 const QUEUE = {
-  budget: 4 * 60 * 1000, // the longest a request is held, its first answer's wait included
+  budget: 4 * 60 * 1000, // the longest a request not streamed is held, its first answer's wait included
+  held: 60 * 60 * 1000, // the longest a streamed one is, as Qoder's client waits
+  beat: 10_000, // the longest a held stream's client goes without a comment
   shortest: 500,
   longest: 30_000,
   unsaid: 30_000, // a pause when the queue gives no retryAfterSeconds
   recoveries: 10, // the queue waited out this many times, at most, for one request
   failures: 3, // status asks failing in a row that end the wait
   ask: 30_000, // the longest one status ask may take
+  // the longest a call waits for Qoder's first event (headers included).
+  // Qoder CN once held a call 15 minutes with nothing sent and nothing to
+  // log (#1204); after this it is a 504 that says so, which magpie can
+  // fail over from. A queued call answers its 10605 at once, and a
+  // thinking model streams its reasoning, so a real answer starts sooner.
+  silent: 120_000,
+  // the longest a wait goes on with nothing ahead of the request
+  // (queueCount 1 or none) and the queue's state the same at every ask.
+  // Qoder CN once held such a RESOURCE_LIMIT queue unchanged, 1 in p4,
+  // for every request from one hour on (plugins#1220): the hour's hold
+  // then left the agent with keepalives only. After this it is the
+  // queue's 503 with Retry-After, which magpie can rest the account on
+  // or fail over from. A queue with others ahead is waited out as
+  // Qoder's client waits it (#807).
+  stuck: 5 * 60 * 1000,
   now: () => Date.now(),
+  // every calls fn each ms until the returned stop is called
+  every: (fn, ms) => {
+    const t = setInterval(fn, ms)
+    return () => clearInterval(t)
+  },
   pause: (ms, signal) =>
     new Promise((ok, no) => {
       if (signal?.aborted) return no(signal.reason ?? new DOMException("aborted", "AbortError"))
@@ -1695,7 +1797,7 @@ function queueState(text) {
     if (isQueued !== undefined || serviceAvailable !== undefined) {
       const num = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? undefined : Number(v))
       const str = (v) => (typeof v === "string" && v ? v : undefined)
-      return { isQueued, serviceAvailable, modelKey: str(o.modelKey), queueType: str(o.queueType), retryAfterSeconds: num(o.retryAfterSeconds) }
+      return { isQueued, serviceAvailable, modelKey: str(o.modelKey), queueType: str(o.queueType), retryAfterSeconds: num(o.retryAfterSeconds), queueCount: num(o.queueCount), subCode: str(o.subCode) }
     }
     for (const k of ["data", "result", "message", "body"]) {
       const v = o[k]
@@ -1727,13 +1829,25 @@ async function queueStatus(api, cred, { requestSetId, modelKey, queueType, reque
   return st
 }
 
+// stuckKey is what a queue's state says of the request's place in it, or
+// "" when others are ahead of it (a queue that moves while they are
+// served is waited out, QUEUE.stuck never ends it).
+function stuckKey(st) {
+  const n = Number(st?.queueCount)
+  if (Number.isFinite(n) && n > 1) return ""
+  return JSON.stringify([st?.isQueued, st?.serviceAvailable, Number.isFinite(n) ? n : null, st?.queueType ?? null, st?.subCode ?? null, st?.retryAfterSeconds ?? null])
+}
+
 // queueWait waits in Qoder's queue for the request, from the state its
 // refusal gave, until the queue lets it through (true) or the wait ends
-// (false). A cancelled request throws.
+// (false). A wait ended by QUEUE.stuck sets ask.stuck. A cancelled request
+// throws.
 async function queueWait(api, cred, ask, first, signal, deadline, site) {
   let q = first ?? {}
   let asked = false
   let failed = 0
+  let same = stuckKey(q)
+  let since = QUEUE.now()
   for (;;) {
     if (signal?.aborted) throw signal.reason ?? new DOMException("aborted", "AbortError")
     if (QUEUE.now() >= deadline) return false
@@ -1752,6 +1866,14 @@ async function queueWait(api, cred, ask, first, signal, deadline, site) {
     }
     failed = 0
     q = { ...st, modelKey: st.modelKey ?? q.modelKey, queueType: st.queueType ?? q.queueType }
+    const key = stuckKey(q)
+    if (!key || key !== same) {
+      same = key
+      since = QUEUE.now()
+    } else if (QUEUE.now() - since >= QUEUE.stuck && st.isQueued !== false) {
+      ask.stuck = true
+      return false
+    }
     if (st.isQueued === false) {
       if (st.retryAfterSeconds > 0) await QUEUE.pause(Math.min(queuePause(st.retryAfterSeconds), Math.max(0, deadline - QUEUE.now())), signal)
       return QUEUE.now() < deadline
@@ -1759,6 +1881,73 @@ async function queueWait(api, cred, ask, first, signal, deadline, site) {
     if (st.serviceAvailable === false || st.isQueued === true) continue
     return false
   }
+}
+
+// holdQueued is a streamed request's reply while Qoder's queue holds it
+// (queueWait): its 200 and a comment saying the queue now, a comment every
+// QUEUE.beat after, and then what came of the wait (follow): the answer's
+// stream, or a refusal as the stream's error, as answer ends a stream that
+// fails. signal ends the wait when the client goes, by its request's
+// signal or by cancelling this stream.
+function holdQueued(f, clientSignal) {
+  const enc = new TextEncoder()
+  const gone = new AbortController()
+  let ctl, stop, reader
+  let closed = false
+  const say = (text) => {
+    if (closed) return
+    try {
+      ctl.enqueue(enc.encode(text))
+    } catch {}
+  }
+  const end = () => {
+    stop?.()
+    if (closed) return
+    closed = true
+    try {
+      ctl.close()
+    } catch {}
+  }
+  const body = new ReadableStream({
+    start(c) {
+      ctl = c
+      say(`: ${String(f.message).replace(/[\r\n]+/g, " ")}\n\n`)
+      stop = QUEUE.every(() => say(": queued\n\n"), QUEUE.beat)
+    },
+    cancel(reason) {
+      stop?.()
+      closed = true
+      gone.abort(reason ?? new DOMException("the client went away", "AbortError"))
+      reader?.cancel(reason).catch(() => {})
+    },
+  })
+  const response = new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } })
+  const follow = async (done) => {
+    const res = await done
+    stop?.()
+    if (closed) return res.body?.cancel().catch(() => {})
+    if (!res.ok) {
+      let message = res.statusText || `HTTP ${res.status}`
+      try {
+        message = (await res.json())?.error?.message ?? message
+      } catch {}
+      say(`data: ${JSON.stringify({ error: { message, code: res.status } })}\n\n`)
+      return end()
+    }
+    reader = res.body.getReader()
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done || closed) break
+        ctl.enqueue(value)
+      }
+    } catch (e) {
+      say(`data: ${JSON.stringify({ error: { message: e?.message ?? String(e), code: 502 } })}\n\n`)
+    }
+    end()
+  }
+  const signal = clientSignal ? AbortSignal.any([clientSignal, gone.signal]) : gone.signal
+  return { response, signal, follow: (done) => void follow(done) }
 }
 
 // ---- the reply ----------------------------------------------------------------
@@ -1893,6 +2082,71 @@ function quoted(text) {
 // the XML function form
 const callish = (v) => v.trimStart().startsWith("{") || v.includes("\x3cfunction=")
 
+// plugins#1113: a reply that is one JSON object holding OpenAI's own
+// tool_calls array, written as text ({"tool_calls":[{"name", "arguments"}]}),
+// is those calls. It is told apart from text by where it starts: a line of
+// its own whose object opens with the "tool_calls" key, outside code.
+const JSON_KEY = '{"tool_calls"'
+const JSON_AT_ALL = /(^|\n)[ \t]*\{\s*"tool_calls"\s*:/g
+
+// jsonHold is how much of comb's end may still become JSON_KEY on a line
+// of its own (start says comb starts a line), so it is held for more
+function jsonHold(comb, start) {
+  const n = comb.lastIndexOf("\n")
+  if (n < 0 && !start) return 0
+  const line = comb.slice(n + 1)
+  const s = line.replace(/\s+/g, "")
+  if (!JSON_KEY.startsWith(s)) return 0
+  return line.length
+}
+
+// jsonEnd is where the JSON object at the start of v ends, -1 while it is
+// not whole yet
+function jsonEnd(v) {
+  let depth = 0
+  let str = false
+  for (let k = 0; k < v.length; k++) {
+    const c = v[k]
+    if (str) {
+      if (c === "\\") k++
+      else if (c === '"') str = false
+    } else if (c === '"') str = true
+    else if (c === "{" || c === "[") depth++
+    else if (c === "}" || c === "]") {
+      if (--depth === 0) return k + 1
+    }
+  }
+  return -1
+}
+
+// jsonCalls reads a whole {"tool_calls": [...]} object: its calls, null
+// when it holds none (it stays text), or false when one can't be read
+function jsonCalls(v) {
+  let f
+  try {
+    f = JSON.parse(v)
+  } catch {
+    return false
+  }
+  const list = f?.tool_calls
+  if (!Array.isArray(list) || !list.length) return null
+  const calls = []
+  for (const e of list) {
+    const fn = e?.function ?? e
+    let args = fn?.arguments
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args)
+      } catch {
+        return false
+      }
+    }
+    if (!String(fn?.name ?? "").trim() || !args || typeof args !== "object" || Array.isArray(args)) return false
+    calls.push({ name: fn.name.trim(), args: JSON.stringify(args) })
+  }
+  return calls
+}
+
 const CUT_SHORT = "the model's tool call, written as text, was cut short; it is not sent on as the answer"
 const UNREADABLE = "the model's tool call, written as text, can't be read; it is not sent on as the answer"
 
@@ -1911,6 +2165,7 @@ class Splitter {
   sawTool = false
   after = false // a bare call just ended: the closes and blanks after it are dropped
   sent = "" // the text given out so far, to tell a block in code from a call
+  jsonBuf = null // a {"tool_calls": ...} object being read (plugins#1113)
   constructor(tools = []) {
     this.tools = tools.filter((t) => (t?.function ?? t)?.name)
   }
@@ -1957,9 +2212,43 @@ class Splitter {
     this.after = false
     return rest
   }
+  // json reads the {"tool_calls": ...} object held in jsonBuf: the input
+  // left after it, null while it is not whole, or false when the turn
+  // ended in an error
+  json(out, end) {
+    const v = this.jsonBuf
+    const e = jsonEnd(v)
+    if (e < 0) {
+      if (!end) return null
+      this.jsonBuf = null
+      out.push({ error: CUT_SHORT })
+      return false
+    }
+    this.jsonBuf = null
+    const calls = jsonCalls(v.slice(0, e))
+    if (calls === false) {
+      out.push({ error: UNREADABLE })
+      return false
+    }
+    if (!calls) {
+      this.text(out, v.slice(0, e))
+      return v.slice(e)
+    }
+    this.sawTool = true
+    for (const c of calls) out.push({ call: c })
+    return v.slice(e).replace(/^\s+/, "")
+  }
   feed(input) {
     const out = []
     while (input) {
+      if (this.jsonBuf !== null) {
+        this.jsonBuf += input
+        const next = this.json(out, false)
+        if (next === false) return out
+        if (next === null) break
+        input = next
+        continue
+      }
       if (!this.inCall) {
         let comb = this.textBuf + input
         this.textBuf = ""
@@ -1974,6 +2263,25 @@ class Splitter {
         }
         const i = comb.indexOf(CALL_OPEN)
         const x = this.tools.length ? comb.search(XML_AT) : -1
+        const start = !this.sent || this.sent.endsWith("\n")
+        let k = -1
+        for (const jm of comb.matchAll(JSON_AT_ALL)) {
+          const at = jm.index + jm[1].length
+          if ((jm[1] || start) && !quoted(this.sent + comb.slice(0, at))) {
+            k = at
+            break
+          }
+        }
+        if (k >= 0 && (i < 0 || k < i) && (x < 0 || k < x)) {
+          if (k > 0) this.text(out, comb.slice(0, k))
+          this.jsonBuf = comb.slice(k).replace(/^[ \t]+/, "")
+          input = ""
+          const next = this.json(out, false)
+          if (next === false) return out
+          if (next === null) break
+          input = next
+          continue
+        }
         if (x >= 0 && (i < 0 || x < i)) {
           const next = this.bare(out, comb, x, false)
           if (next === false) return out
@@ -1991,6 +2299,7 @@ class Splitter {
               }
           const h = this.tools.length ? comb.search(XML_HOLD) : -1
           if (h >= 0) keep = Math.max(keep, comb.length - h)
+          keep = Math.max(keep, jsonHold(comb, !this.sent || this.sent.endsWith("\n")))
           if (keep < comb.length) this.text(out, comb.slice(0, comb.length - keep))
           this.textBuf = comb.slice(comb.length - keep)
           break
@@ -2023,6 +2332,12 @@ class Splitter {
     return out
   }
   flush() {
+    if (this.jsonBuf !== null) {
+      const out = []
+      const next = this.json(out, true)
+      if (next) this.text(out, next)
+      return out
+    }
     if (this.inCall) {
       const body = this.callBuf
       this.inCall = false
@@ -2081,6 +2396,7 @@ async function* events(body, tools = []) {
   const a = new Splitter(tools)
   let index = -1 // the tool call being given
   const native = new Map() // upstream index -> call and its output index
+  const begun = [] // every native call, one an index has moved past too
   // one piece of the split text as an event: a call, text, or a call that
   // can't be read, which ends the turn as a 502
   const piece = (f) =>
@@ -2138,9 +2454,14 @@ async function* events(body, tools = []) {
       const args = tc.function?.arguments ?? ""
       if (!tc.id && !name && !args) continue
       let call = native.get(i)
-      if (!call) {
+      // A new id at an index already in use is a new call: Qoder Ultimate
+      // has sent two calls at index 0, and the second's arguments ran
+      // into the first's as {"a"}{"b"} (plugins#930). No id, or the same
+      // one, is the open call going on.
+      if (!call || (tc.id && call.id && tc.id !== call.id)) {
         call = { id: "", args: "" }
         native.set(i, call)
+        begun.push(call)
       }
       if (tc.id) call.id = tc.id
       if (call.index === undefined) {
@@ -2188,7 +2509,7 @@ async function* events(body, tools = []) {
   // text, reasoning and named calls already given are kept: qoder-cn's
   // qfmodel did this now and then, and the whole turn failed with an
   // error the client didn't retry (plugins#579).
-  const nameless = [...native.values()].filter((call) => call.index === undefined).length
+  const nameless = begun.filter((call) => call.index === undefined).length
   if (nameless && !said) {
     yield { error: { status: 502, message: NAMELESS, nameless: true } }
     return
@@ -2464,10 +2785,16 @@ async function campaignRuntime({ home = homedir(), platform = process.platform, 
   const cache = join(config, ".bin")
   const entries = await readdir(cache, { withFileTypes: true }).catch(() => [])
   const found = []
+  // qodercli 1.1.66 cached it on Windows as a folder umid-win32-<arch>-<hash>
+  // holding runtime-info.exe and sgsdk.dll; qodercli 1.21.2 caches the file
+  // itself, runtime-info-win32-<arch>-<hash>.exe, beside sgsdk.dll in .bin,
+  // as elsewhere (plugins#879). Either is taken, the newest first.
   for (const d of entries) {
     let path
-    if (platform === "win32") {
-      if (d.isDirectory() && d.name.startsWith(`umid-win32-${arch}-`)) path = join(cache, d.name, name)
+    if (platform === "win32" && d.isDirectory()) {
+      if (d.name.startsWith(`umid-win32-${arch}-`)) path = join(cache, d.name, name)
+    } else if (platform === "win32") {
+      if (d.isFile() && d.name.startsWith(`runtime-info-win32-${arch}-`) && d.name.toLowerCase().endsWith(".exe")) path = join(cache, d.name)
     } else if (d.isFile() && d.name.startsWith(`runtime-info-${platform}-${arch}-`) && !d.name.endsWith(".tmp")) {
       path = join(cache, d.name)
     }
@@ -2668,6 +2995,31 @@ function when(v) {
 // account used up (magpie-community/plugins#454).
 const SPENT_IN_TURN = new Set(["Credits", "Add-on credits", "Shared credits"])
 
+// spentOf is the credits a usage envelope says the account has used of
+// what it has ("800 / 800 credits") when the pools spent in turn
+// (SPENT_IN_TURN) have none left together, and "" when they have some, or
+// when it says no pool at all. A free account's pools of 0 have none.
+function spentOf(env) {
+  const u = env?.qoderUsage
+  if (env?.displayMode !== "qoder" || !u || typeof u !== "object" || Array.isArray(u)) return ""
+  let used = 0
+  let total = 0
+  let pools = 0
+  for (const [a, b] of [["userQuota", "user_quota"], ["addOnQuota", "add_on_quota"], ["orgResourcePackage", "org_resource_package"]]) {
+    const p = u[a] !== undefined ? u[a] : u[b]
+    if (p === null || typeof p !== "object" || Array.isArray(p)) continue
+    const t = p.total ?? p.cap
+    if (typeof t !== "number" || !Number.isFinite(t) || t < 0) continue
+    const n = typeof p.used === "number" ? p.used : typeof p.remaining === "number" ? t - p.remaining : NaN
+    if (t > 0 && !Number.isFinite(n)) return ""
+    pools++
+    total += t
+    used += t > 0 ? Math.min(Math.max(n, 0), t) : 0
+  }
+  if (!pools || used < total) return ""
+  return `${gfmt(used)} / ${gfmt(total)} credits`
+}
+
 // parseUsage is the plan and each pool of credits the envelope tells. When
 // more than one of the pools spent in turn holds credits, "Total credits"
 // is what they hold together, the one routing counts, and each pool is
@@ -2692,7 +3044,11 @@ function parseUsage(env) {
     const used = b.used != null ? b.used : total - b.remaining
     if (used < 0) return
     const unit = b.unit || "credits"
-    const w = { name: b.name || name, used: Math.min(100, (100 * used) / total), display: `${gfmt(used)} / ${gfmt(total)} ${unit}` }
+    // the count too, so magpie says "183 / 2,000 credits left" as Qoder's
+    // own panel does, not a bare share (jzing.draw on Discord); the plan's
+    // credits refresh when the plan says, as the panel's "refreshes on" does
+    const w = { name: b.name || name, used: Math.min(100, (100 * used) / total), display: `${gfmt(used)} / ${gfmt(total)} ${unit}`, amount: used, limit: total, unit }
+    if (name === "Credits" && until) w.resetsAt = until
     out.windows.push(w)
     if (SPENT_IN_TURN.has(name)) turn.push({ w, used: Math.min(used, total), total, unit })
   }
@@ -2705,7 +3061,14 @@ function parseUsage(env) {
     const used = turn.reduce((a, p) => a + p.used, 0)
     const total = turn.reduce((a, p) => a + p.total, 0)
     for (const p of turn) p.w.aside = true
-    out.windows.unshift({ name: "Total credits", used: Math.min(100, (100 * used) / total), display: `${gfmt(used)} / ${gfmt(total)} ${turn[0].unit}` })
+    const sum = { name: "Total credits", used: Math.min(100, (100 * used) / total), display: `${gfmt(used)} / ${gfmt(total)} ${turn[0].unit}`, amount: used, limit: total, unit: turn[0].unit }
+    // the plan's credits renew when the plan says, and what is left of them
+    // is lost then: routing reads no window set aside, so the whole renews
+    // with the plan's, as WorkBuddy's does (a Teams account renewing
+    // tomorrow was ranked as one that never renews, behind an account
+    // renewing in 18 days: @tnt12231 on X)
+    if (until && turn.some((p) => p.w.resetsAt)) sum.resetsAt = until
+    out.windows.unshift(sum)
   }
   const dedicated = field("dedicatedResourcePackages", "dedicated_resource_packages")
   for (const b of Array.isArray(dedicated) ? dedicated : []) add(b, "Dedicated credits")
@@ -2859,7 +3222,7 @@ const QWENWORK_COMMON = {
   deviceRefreshTarget: "c",
   clientHeaders: qwenworkClientHeaders,
   modelScene: "qwork", listAllModels: true,
-  clientType: "6", businessProduct: "qoder_work", sessionType: "qoder_work",
+  clientType: "6", businessProduct: "qoder_work", sessionType: "qoder_work", businessModelKey: false,
   userInfoPath: "/api/v1/adapter/user/account-context?include=user,plan,quota,page,data_sharing",
   normalizeUser: v => (v?.data ?? v)?.user ?? (v?.data ?? v),
   pat: false,      // no /api/v1/jobToken/exchange on gateway.qwenwork.cn
@@ -3105,11 +3468,16 @@ const makePlugin = (site) => async ({ client }) => {
     if (!l || again) {
       const s = siteOf(site, cred)
       const listing = await fetchListing(s, cred)
+      const off = new Set()
       for (const m of s.modelScene ? (Array.isArray(listing?.[s.modelScene]) ? listing[s.modelScene] : []) : sceneModels(listing)) {
         const k = String(m?.key ?? "").trim()
         if (k) served.add(k)
+        if (k && !m.enable) off.add(k)
       }
       l = modelInfos(listing, s)
+      // the keys this listing names and has off (ask tells a model off for
+      // the credits apart by them)
+      l.off = off
       if (!s.modelScene) l.freeView = freeView(sceneModels(listing))
       listings.set(key, l)
     }
@@ -3203,16 +3571,37 @@ const makePlugin = (site) => async ({ client }) => {
         const env = await fetchUsage(siteOf(site, cred), cred.access)
         return { ...(await spareFree(cred, parseUsage(env))), signIn, ...who }
       }
-      let env
-      try {
-        env = await fetchUsage(siteOf(site, cred), cred.deviceToken)
-      } catch (e) {
-        if (!(e instanceof UsageStatus) || (e.status !== 401 && e.status !== 403)) throw e
-        env = await fetchUsage(siteOf(site, cred), await deviceToken(getAuth, cred.deviceToken))
-      }
-      return { ...(await spareFree(cred, parseUsage(env))), signIn, ...who }
+      return { ...(await spareFree(cred, parseUsage(await usageEnv(getAuth, cred)))), signIn, ...who }
     } catch (e) {
       return { error: e?.message ?? String(e), signIn: e?.expired ? "expired" : signIn }
+    }
+  }
+
+  // usageEnv is the account's usage envelope on its device token, rotated
+  // once when refused, as usage reads it
+  const usageEnv = async (getAuth, cred) => {
+    try {
+      return await fetchUsage(siteOf(site, cred), cred.deviceToken)
+    } catch (e) {
+      if (!(e instanceof UsageStatus) || (e.status !== 401 && e.status !== 403)) throw e
+      return fetchUsage(siteOf(site, cred), await deviceToken(getAuth, cred.deviceToken))
+    }
+  }
+
+  // creditsSpent is the credits the account has used of what it has
+  // ("800 / 800 credits") when its usage says none are left (spentOf), and
+  // "" when some are, or when it can't be read. Qoder and Qoder CN only:
+  // QwenWork reads its usage elsewhere. A PAT account's is read on its job
+  // token, as usage reads it.
+  const creditsSpent = async (getAuth) => {
+    if (site.usagePath) return ""
+    try {
+      const cred = await fresh(getAuth)
+      if (cred.lingma) return ""
+      if (cred.patAuth && !cred.deviceToken) return spentOf(await fetchUsage(siteOf(site, cred), cred.access))
+      return spentOf(await usageEnv(getAuth, cred))
+    } catch {
+      return ""
     }
   }
 
@@ -3354,6 +3743,7 @@ const makePlugin = (site) => async ({ client }) => {
     let m
     let relogged = false
     let renamed = false
+    let reclamped = false
     const listed = (ms) => ms.find((x) => x.key === chat.model)
     try {
       m = listed(await models(cred)) ?? listed(await models(cred, true))
@@ -3366,6 +3756,26 @@ const makePlugin = (site) => async ({ client }) => {
       // could be refused and renew it. An id Qoder has never served is said
       // unknown at once, with no renewal spent on it.
       if (!m && getAuth && knows(chat.model)) {
+        // Off because the credits are used up (plugins#880): on an
+        // international personal_professional_trial account Qoder's listing
+        // had dfmodel off once the 800 credits were spent, and on again
+        // when the daily credits came back. That is the account's quota,
+        // not the request's fault, so it is said as Qoder's own quota codes
+        // are (429 usage limit reached), which a routing group fails over
+        // on and rests the account for. Only a model the live listing names
+        // and has off, on an account whose usage read says no credits are
+        // left; a usage that can't be read says nothing, and the model goes
+        // on to the renewal and the 400 below as before.
+        if ((await models(cred)).off?.has(chat.model)) {
+          const spent = await creditsSpent(getAuth)
+          if (spent) {
+            return errorResponse({
+              status: 429,
+              message: `usage limit reached: the account's credits are used up (${spent}), and Qoder lists "${chat.model}" off for it until they refresh`,
+              signIn: "",
+            })
+          }
+        }
         relogged = true
         const next = await relogin(getAuth, cred.access)
         if (next) {
@@ -3395,65 +3805,101 @@ const makePlugin = (site) => async ({ client }) => {
     // resend). On a real qoder.com account (plugins#427) the free models
     // are queued in p3 for RESOURCE_LIMIT, about 30s at a time, and a
     // resend can be queued again before it is answered.
-    const deadline = QUEUE.now() + QUEUE.budget
+    const began = QUEUE.now()
+    let deadline = began + QUEUE.budget
     const ask = { requestSetId: body.request_set_id, requestId: body.request_id, sessionId: body.session_id, modelKey: m.key }
-    for (let sent = 0, waited = 0; ; sent++) {
-      if (sent) {
-        body.request_id = body.chat_record_id = randomUUID()
-        ask.requestId = body.request_id
-      }
-      const wire = encodeBody(JSON.stringify(body))
-      const headers = chatHeaders(CHAT_URL, cred, wire, siteOf(site, cred), m, chatIdentity(cred.uid))
-      // a refused call's stream is closed: Qoder keeps a 10605 stream open
-      // after its one event, and a connection held open while the call is
-      // waited out and sent again is one more the account holds
-      const call = new AbortController()
-      const signal = init.signal ? AbortSignal.any([init.signal, call.signal]) : call.signal
-      let res, open
-      try {
-        res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal })
-        if (res.ok) open = await opened(res, chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function") : [])
-      } catch (e) {
-        return errorResponse({ status: 502, message: e.message })
-      }
-      const f = !res.ok ? failure(res.status, (await res.text()).slice(0, 1 << 20)) : open.first.value?.error
-      if (f) call.abort()
-      // a refused job token: renewed once (or the one renewed meanwhile)
-      // and the request sent again, before the refusal is said
-      if (f?.lapsed && getAuth && !relogged) {
-        relogged = true
-        let next
-        try {
-          next = await relogin(getAuth, cred.access)
-        } catch (e) {
-          return signedInError(e)
+    // a streamed request queued: its 200 goes to the client at once (held),
+    // and what comes of the wait follows in that stream
+    let held, onHeld
+    let signal = init.signal
+    const heard = new Promise((ok) => (onHeld = ok))
+    const run = async () => {
+      for (let sent = 0, waited = 0; ; sent++) {
+        if (sent) {
+          body.request_id = body.chat_record_id = randomUUID()
+          ask.requestId = body.request_id
         }
-        if (next) {
-          cred = asked.cred = next
+        const wire = encodeBody(JSON.stringify(body))
+        const headers = chatHeaders(CHAT_URL, cred, wire, siteOf(site, cred), m, chatIdentity(cred.uid))
+        // a refused call's stream is closed: Qoder keeps a 10605 stream open
+        // after its one event, and a connection held open while the call is
+        // waited out and sent again is one more the account holds
+        const call = new AbortController()
+        const callSignal = signal ? AbortSignal.any([signal, call.signal]) : call.signal
+        let res, open
+        let silent = false
+        const hush = setTimeout(() => {
+          silent = true
+          call.abort()
+        }, QUEUE.silent)
+        try {
+          res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal: callSignal })
+          if (res.ok) open = await opened(res, chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function") : [])
+        } catch (e) {
+          if (silent) {
+            const who = siteOf(site, cred).name ?? "Qoder"
+            return errorResponse({ status: 504, message: `${who} sent nothing for ${Math.round(QUEUE.silent / 1000)}s after the request (${res ? "no first event" : "no reply headers"}); the call was dropped`, signIn: "" })
+          }
+          return errorResponse({ status: 502, message: e.message })
+        } finally {
+          clearTimeout(hush)
+        }
+        const f = !res.ok ? failure(res.status, (await res.text()).slice(0, 1 << 20)) : open.first.value?.error
+        if (f) call.abort()
+        // a refused job token: renewed once (or the one renewed meanwhile)
+        // and the request sent again, before the refusal is said
+        if (f?.lapsed && getAuth && !relogged) {
+          relogged = true
+          let next
+          try {
+            next = await relogin(getAuth, cred.access)
+          } catch (e) {
+            return signedInError(e)
+          }
+          if (next) {
+            cred = asked.cred = next
+            continue
+          }
+        }
+        // a reply whose only answer was a native tool call the model never
+        // named (plugins#579): nothing of it was given, so it is asked once
+        // more, under a new request_id; a second one is the gateway's 502 to
+        // retry or fail over
+        if (f?.nameless && !renamed) {
+          renamed = true
           continue
         }
+        // a max_tokens above the model's ceiling: asked again once at it
+        if (!reclamped && reclamp(f, body, m)) {
+          reclamped = true
+          continue
+        }
+        // an answered call moves its task on, as Qoder's client moves it
+        if (!f) task.answered = true
+        // with another account, provider or group member after this one
+        // (magpie's X-Magpie-Fallback), a queued request isn't waited out:
+        // its 503 goes back at once, saying the queue, and the next is asked
+        if (!f?.queue || waited >= QUEUE.recoveries || fallback) return f ? errorResponse(f) : answer(open, chat, servedName)
+        if (chat.stream && !held) {
+          held = holdQueued(f, init.signal)
+          signal = held.signal
+          deadline = began + QUEUE.held
+          onHeld(held.response)
+        }
+        try {
+          if (!(await queueWait(api, cred, ask, f.queue, signal, deadline, siteOf(site, cred))))
+            return errorResponse(ask.stuck ? { ...f, message: `${f.message} (the queue hasn't moved in ${Math.round(QUEUE.stuck / 60_000)} minutes with nothing ahead)` } : f)
+        } catch (e) {
+          return errorResponse({ status: 502, message: e?.message ?? String(e) })
+        }
+        waited++
       }
-      // a reply whose only answer was a native tool call the model never
-      // named (plugins#579): nothing of it was given, so it is asked once
-      // more, under a new request_id; a second one is the gateway's 502 to
-      // retry or fail over
-      if (f?.nameless && !renamed) {
-        renamed = true
-        continue
-      }
-      // an answered call moves its task on, as Qoder's client moves it
-      if (!f) task.answered = true
-      // with another account, provider or group member after this one
-      // (magpie's X-Magpie-Fallback), a queued request isn't waited out:
-      // its 503 goes back at once, saying the queue, and the next is asked
-      if (!f?.queue || waited >= QUEUE.recoveries || fallback) return f ? errorResponse(f) : answer(open, chat, servedName)
-      try {
-        if (!(await queueWait(api, cred, ask, f.queue, init.signal, deadline, siteOf(site, cred)))) return errorResponse(f)
-      } catch (e) {
-        return errorResponse({ status: 502, message: e?.message ?? String(e) })
-      }
-      waited++
     }
+    const done = run().catch((e) => errorResponse({ status: 502, message: e?.message ?? String(e) }))
+    const res = await Promise.race([done, heard])
+    if (res !== held?.response) return res
+    held.follow(done)
+    return res
   }
 
   // askLingma is ask for a Lingma 1.0 account: the IDE's models, signed as
@@ -3469,6 +3915,7 @@ const makePlugin = (site) => async ({ client }) => {
     const task = taskOf(sessionOf(chat, named), chat)
     const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function") : []
     let relogged = false
+    let reclamped = false
     for (let i = 0; ; ) {
       const m = order[i]
       const s = siteOf(site, cred)
@@ -3507,6 +3954,10 @@ const makePlugin = (site) => async ({ client }) => {
         }
         return errorResponse({ status: 401, message: `the sign-in lapsed — open Qoder CN IDE so it signs in again (${String(f.message).slice(0, 300)})` })
       }
+      if (!reclamped && reclamp(f, body, m)) {
+        reclamped = true
+        continue
+      }
       if (f && LINGMA_NOT_HERE.test(f.message) && i + 1 < order.length) {
         console.warn(`qoder-cn: ${s.dedicated} doesn't serve ${m.key}; asking ${order[i + 1].key}`)
         i++
@@ -3537,6 +3988,7 @@ const makePlugin = (site) => async ({ client }) => {
       // doesn't call this. The device token of a job-token account has no
       // end on record: usage rotates it once Qoder refuses it, as before.
       refreshLead: RENEW_LEAD,
+      rotating: true,
       async refresh(auth) {
         // a Lingma 1.0 account: the IDE's newer token, when it has one;
         // nothing when it hasn't yet (fresh says so once it is needed)
@@ -3822,4 +4274,4 @@ export async function QwenWorkEnterpriseAuthPlugin({ client }) {
 export const protocol = { makePlugin, deviceSignIn, openapi, siteOf }
 
 // for tests
-export const _internal = { fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
+export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }

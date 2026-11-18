@@ -49,6 +49,14 @@ const LOW_EFFORT_FALLBACKS = new Map([
   ['GPT-5.6 Sol', ['minimal']],
 ])
 
+// Input lengths verified against JoyCode; conservative context claims, not exact model limits.
+const VERIFIED_CONTEXT_LIMITS = new Map([
+  ['GPT-6 Astra', 900000],
+  ['GPT-6.1 Sol', 900000],
+  ['GLM-5.3', 900000],
+  ['DeepSeek-V4.1-Flash', 1000000],
+])
+
 // HMAC signing key, extracted from the JoyCode IDE's bundled extension.js.
 //
 // This is a PUBLIC PROTOCOL CONSTANT, not a secret: it is baked into every
@@ -80,21 +88,21 @@ const MODELS = {
     limit: { context: 200000, output: 64000 },
     reasoning: true,
     tool_call: true,
-    modalities: { input: ['text', 'image'] },
+    modalities: { input: ['text'] },
   },
   'MiniMax-M3-agent': {
     name: 'MiniMax M3',
     limit: { context: 200000, output: 64000 },
     reasoning: true,
     tool_call: true,
-    modalities: { input: ['text', 'image'] },
+    modalities: { input: ['text'] },
   },
   'Doubao-Seed-2.0-pro-agent': {
     name: 'Doubao Seed 2.0 Pro',
     limit: { context: 200000, output: 64000 },
     reasoning: true,
     tool_call: true,
-    modalities: { input: ['text', 'image'] },
+    modalities: { input: ['text'] },
   },
 }
 
@@ -139,17 +147,31 @@ function buildGatewayHeaders(ptKey, tenant, loginType = LOGIN_TYPE) {
   }
 }
 
-/** JoyCode's model catalogue names the wire protocol in extJson.adapterType. */
-function adapterProtocol(model) {
+function modelExtJson(model) {
   let ext = model?.extJson
   if (typeof ext === 'string') {
     try { ext = JSON.parse(ext) } catch { ext = undefined }
   }
+  return ext
+}
+
+/** JoyCode's model catalogue names the wire protocol in extJson.adapterType. */
+function adapterProtocol(model) {
+  const ext = modelExtJson(model)
   const type = ext?.adapterType ?? model?.adapterType
   if (typeof type !== 'string') return 'chat'
   if (type === 'anthropic') return 'anthropic'
   if (type === 'openai-response' || type === 'openai-responses' || type === 'responses') return 'responses'
   return 'chat'
+}
+
+function accountContext(model, baseContext) {
+  const verifiedLimit = VERIFIED_CONTEXT_LIMITS.get(model?.chatApiModel)
+  const directoryContext = modelExtJson(model)?.contextWindowByPlatform?.['JoyCode Desktop']
+  if (verifiedLimit === undefined || !Number.isFinite(directoryContext) || directoryContext <= 0 ||
+    !Number.isFinite(baseContext) || baseContext <= 0 || directoryContext <= baseContext) return baseContext
+  const conservativeLimit = Math.floor(Math.min(directoryContext, verifiedLimit) / 100000) * 100000
+  return Math.max(baseContext, conservativeLimit)
 }
 
 function requestPath(input) {
@@ -377,11 +399,49 @@ async function browserLogin() {
 
 // ---------------------------------------------------------------- chat responses
 
+const JSON_BODY_LIMIT = 8 * 1024 * 1024
+const GRAY_ACCESS_DENIED = 'AI_GRAY_ACCESS_DENIED'
+
 function chatError(status, code, message) {
   return Response.json({ error: { type: 'upstream_error', code, message } }, {
     status,
     headers: { 'x-magpie-sign-in': status === 401 ? 'expired' : 'kept' },
   })
+}
+
+/**
+ * Business code from a JSON body, read off a clone so the original response
+ * can still be normalized. Non-JSON (SSE) returns nothing. cancel() is not
+ * awaited: the clone's tee waits until the original body is read.
+ */
+async function gatewayFailure(response) {
+  if (!response?.body) return {}
+  let clone
+  try { clone = response.clone() } catch { return {} }
+  const reader = clone.body.getReader()
+  const decoder = new TextDecoder()
+  let prefix = ''
+  let bytes = 0
+  try {
+    while (bytes <= 65536) {
+      const next = await reader.read()
+      if (next.done) break
+      bytes += next.value.byteLength
+      prefix += decoder.decode(next.value, { stream: true })
+      if (prefix.trim() && !prefix.trimStart().startsWith('{')) break
+    }
+    prefix += decoder.decode()
+  } catch {
+    return {}
+  } finally {
+    reader.cancel().catch(() => {})
+  }
+  if (!prefix.trimStart().startsWith('{')) return {}
+  let json
+  try { json = JSON.parse(prefix) } catch { return {} }
+  const code = json?.error?.code ?? json?.code
+  const message = json?.error?.message ?? json?.message ?? json?.msg
+  return { code, message: typeof message === 'string' ? message : undefined }
 }
 
 function isSuccessfulJson(json, protocol) {
@@ -474,14 +534,132 @@ function normalizeResponsesSse(source) {
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let pending = ''
+  let frameLines = []
+  let sawOutput = false
+  let terminalSeen = false
+  let stopAfterError = false
+  let atEventBoundary = true
+  let lineEnding = '\n'
+  let lastLineEnding = '\n'
+
+  const nonEmpty = value => typeof value === 'string' && value.length > 0
+  const nonZeroCode = code => {
+    if (typeof code === 'number') return code !== 0
+    if (typeof code === 'string') {
+      if (!code.trim()) return false
+      const numeric = Number(code)
+      return !Number.isFinite(numeric) || numeric !== 0
+    }
+    return code !== undefined && code !== null && code !== false
+  }
+
+  const hasVisibleContent = content => Array.isArray(content) && content.some(part =>
+    part?.type === 'output_text' ? nonEmpty(part.text)
+      : part?.type === 'refusal' && nonEmpty(part.refusal))
+
+  const hasValidOutputItem = item => {
+    if (!item || typeof item !== 'object' || typeof item.type !== 'string') return false
+    if (item.type === 'reasoning') {
+      return (Array.isArray(item.summary) && item.summary.some(part =>
+        part?.type === 'summary_text' && nonEmpty(part.text))) || nonEmpty(item.encrypted_content)
+    }
+    if (item.type === 'message') {
+      return nonEmpty(item.content) || hasVisibleContent(item.content)
+    }
+    if (item.type.endsWith('_call')) {
+      return Object.entries(item).some(([key, value]) => key !== 'type' && value !== undefined && value !== null)
+    }
+    return false
+  }
+
+  const hasValidOutput = output => Array.isArray(output) && output.some(hasValidOutputItem)
+
+  const observeOutput = event => {
+    if (!event || typeof event !== 'object') return
+    const type = event.type
+    if (type === 'response.output_text.delta' || type === 'response.output_text.done') {
+      if (nonEmpty(event.delta) || nonEmpty(event.text)) sawOutput = true
+    } else if (type === 'response.refusal.delta' || type === 'response.refusal.done') {
+      if (nonEmpty(event.delta) || nonEmpty(event.refusal)) sawOutput = true
+    } else if (type === 'response.function_call_arguments.delta' || type === 'response.function_call_arguments.done') {
+      sawOutput = true
+    } else if (type === 'response.reasoning_summary_text.delta' && nonEmpty(event.delta)) {
+      sawOutput = true
+    } else if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+      if (hasValidOutputItem(event.item)) sawOutput = true
+    } else if (type === 'response.content_part.added' || type === 'response.content_part.done') {
+      if (hasVisibleContent([event.part])) sawOutput = true
+    } else if (typeof type === 'string' && /^response\.[a-z_]+_call\./.test(type)) {
+      sawOutput = true
+    }
+  }
+
+  const emitError = (controller, event, ending = '\n', needsSeparator = false, previousEnding = ending) => {
+    const prefix = needsSeparator ? (previousEnding ? previousEnding : `${ending}${ending}`) : ''
+    controller.enqueue(encoder.encode(`${prefix}data: ${JSON.stringify(event)}${ending}${ending}`))
+  }
+
+  const processFrame = (controller, delimited = true) => {
+    if (!frameLines.length) return
+    const lines = frameLines
+    frameLines = []
+    atEventBoundary = delimited
+    if (stopAfterError) return
+
+    let eventName = ''
+    const data = []
+    for (const entry of lines) {
+      if (entry.body.startsWith('event:')) eventName = entry.body.slice(6).trim()
+      if (entry.body.startsWith('data:')) data.push(entry.body.slice(5).replace(/^ /, ''))
+    }
+
+    let payload
+    if (data.length) {
+      try { payload = JSON.parse(data.join('\n')) } catch {}
+    }
+
+    if (payload && typeof payload === 'object' && payload.status === 'FAILED_RESPONSE' && nonZeroCode(payload.code)) {
+      emitError(controller, { ...payload, type: 'error' }, lines.find(entry => entry.ending)?.ending || '\n')
+      terminalSeen = true
+      stopAfterError = true
+      return
+    }
+
+    const type = payload?.type || eventName
+    if (type === 'response.completed') {
+      const output = payload?.response?.output ?? payload?.output
+      if (!sawOutput && !hasValidOutput(output)) {
+        emitError(controller, {
+          type: 'error',
+          code: 'empty_response',
+          message: 'JoyCode 返回空响应',
+          ...(payload?.sequence_number === undefined ? {} : { sequence_number: payload.sequence_number }),
+        }, lines.find(entry => entry.ending)?.ending || '\n')
+        terminalSeen = true
+        stopAfterError = true
+        return
+      }
+    }
+
+    observeOutput(payload)
+    if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.failed' || type === 'error') {
+      terminalSeen = true
+    }
+    controller.enqueue(encoder.encode(lines.map(entry => entry.text).join('')))
+  }
 
   const processLine = (line, controller) => {
+    if (stopAfterError) return
     const ending = line.endsWith('\r\n') ? '\r\n' : line.endsWith('\n') ? '\n' : line.endsWith('\r') ? '\r' : ''
     const body = ending ? line.slice(0, -ending.length) : line
-    const normalized = body.startsWith('data: data: ')
-      ? `data: ${body.slice('data: data: '.length)}${ending}`
-      : line
-    controller.enqueue(encoder.encode(normalized))
+    const normalizedBody = body.startsWith('data: data: ')
+      ? `data: ${body.slice('data: data: '.length)}`
+      : body
+    frameLines.push({ text: `${normalizedBody}${ending}`, body: normalizedBody, ending })
+    if (ending) lineEnding = ending
+    lastLineEnding = ending
+    if (!body) processFrame(controller)
+    else atEventBoundary = false
   }
 
   return source.pipeThrough(new TransformStream({
@@ -496,6 +674,14 @@ function normalizeResponsesSse(source) {
     flush(controller) {
       pending += decoder.decode()
       if (pending) processLine(pending, controller)
+      if (frameLines.length) processFrame(controller, false)
+      if (!terminalSeen) {
+        emitError(controller, {
+          type: 'error',
+          code: 'incomplete_response',
+          message: 'JoyCode 响应流未正常终止',
+        }, lineEnding, !atEventBoundary, lastLineEnding || `${lineEnding}${lineEnding}`)
+      }
     },
   }))
 }
@@ -526,10 +712,18 @@ async function normalizeResponse(response, protocol = 'chat') {
     return chatError(502, 'empty_response', 'JoyCode 返回空响应')
   }
   if (prefix.trimStart().startsWith('{')) {
-    while (bytes <= 1024 * 1024) {
+    if (bytes > JSON_BODY_LIMIT) {
+      await reader.cancel()
+      return chatError(502, 'response_too_large', 'JoyCode 响应超过 8MB')
+    }
+    while (true) {
       const next = await reader.read()
       if (next.done) break
       bytes += next.value.byteLength
+      if (bytes > JSON_BODY_LIMIT) {
+        await reader.cancel()
+        return chatError(502, 'response_too_large', 'JoyCode 响应超过 8MB')
+      }
       prefix += decoder.decode(next.value, { stream: true })
     }
     await reader.cancel()
@@ -538,7 +732,7 @@ async function normalizeResponse(response, protocol = 'chat') {
     try { json = JSON.parse(prefix) } catch {}
     if (json?.error || (json?.code !== undefined && Number(json.code) !== 0)) {
       const code = json.error?.code ?? json.code
-      const status = code === 'AI_GRAY_ACCESS_DENIED' ? 403 : Number(code) === 401 ? 401 : 502
+      const status = code === GRAY_ACCESS_DENIED ? 403 : Number(code) === 401 ? 401 : 502
       const message = json.error?.message ?? json.message ?? json.msg
       return chatError(status, code, typeof message === 'string' ? message.slice(0, 500) : 'JoyCode 请求被拒绝')
     }
@@ -602,6 +796,26 @@ async function fetchAccountData(auth, functionId, body = {}) {
   return json.data ?? json
 }
 
+/**
+ * JoyCode sends a calendar phrase such as "有效期至 2026年11月11日", not an
+ * instant. 23:59:59 that China calendar day is the last moment the IDE still
+ * calls valid, and it is what magpie prints on the account-card tooltip.
+ * This is plan expiry, not a quota-window reset, so callers must not copy it
+ * onto resetsAt — that tooltip line would say the credits reset.
+ */
+function expiryUntil(text) {
+  if (typeof text !== 'string' || !text) return undefined
+  const match = text.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/)
+    ?? text.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/)
+  if (!match) return undefined
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  if (!Number.isInteger(year) || year < 2000 || month < 1 || month > 12 || day < 1) return undefined
+  if (day > new Date(Date.UTC(year, month, 0)).getUTCDate()) return undefined
+  return new Date(Date.UTC(year, month - 1, day, 15, 59, 59)).toISOString()
+}
+
 function quotaFromData(data) {
   const items = data?.usageItems
   if (!Array.isArray(items) || !items.length) throw new Error('JoyCode 暂未返回额度数据')
@@ -611,21 +825,35 @@ function quotaFromData(data) {
   }
   const format = value => new Intl.NumberFormat('en-US', { maximumFractionDigits: 6 }).format(value)
   const plans = [...new Set(items.map(item => item.badge).filter(value => typeof value === 'string' && value))]
+  const dated = items.flatMap(item => {
+    const until = expiryUntil(item.expireText)
+    return until ? [{ until, plan: typeof item.badge === 'string' && item.badge }] : []
+  })
+  const expiries = dated.filter(item => item.plan).map(item => item.until)
+  const until = (expiries.length ? expiries : dated.map(item => item.until)).sort()[0]
   return {
     ...(plans.length ? { plan: plans.join(' / ') } : {}),
+    ...(until ? { until } : {}),
     // Different buckets may overlap; do not manufacture a summed balance.
     ...(items.length === 1 ? { balance: `${format(items[0].remain)} ${items[0].unit || '积分'}` } : {}),
-    windows: items.map(item => ({
-      name: item.title,
-      used: item.usedPercent,
-      amount: item.used,
-      limit: item.total,
-      unit: item.unit || '积分',
-      display: `${format(item.used)} / ${format(item.total)} · 剩余 ${format(item.remain)}${item.expireText ? ` · ${item.expireText}` : ''}`,
-      // Bucket applicability is unspecified, and free models can remain usable.
-      // Show the balance without blocking the entire account at 100%.
-      aside: true,
-    })),
+    windows: items.map(item => {
+      const expires = expiryUntil(item.expireText)
+      return {
+        name: item.title,
+        used: item.usedPercent,
+        amount: item.used,
+        limit: item.total,
+        unit: item.unit || '积分',
+        display: `${format(item.used)} / ${format(item.total)} · 剩余 ${format(item.remain)}${item.expireText ? ` · ${item.expireText}` : ''}`,
+        // The card composes its own "used / limit" line and ignores display.
+        // runsOutAt is the hover line "N 积分 将于 … 过期". resetsAt would
+        // be mislabeled "重置于".
+        ...(expires ? { runsOutAt: expires, runsOut: item.remain } : {}),
+        // Bucket applicability is unspecified, and free models can remain usable.
+        // Show the balance without blocking the entire account at 100%.
+        aside: true,
+      }
+    }),
   }
 }
 
@@ -654,7 +882,8 @@ async function accountModels(provider, { auth } = {}) {
   for (const result of [catalogue, pricing]) {
     if (result.status === 'rejected' && result.reason?.signIn === 'expired') throw result.reason
   }
-  if (catalogue.status !== 'fulfilled' || !Array.isArray(catalogue.value)) return provider.models
+  // An empty catalogue is a glitch, not "this account has no models".
+  if (catalogue.status !== 'fulfilled' || !Array.isArray(catalogue.value) || catalogue.value.length === 0) return provider.models
   const scene = pricing.status === 'fulfilled' ? billingScene(pricing.value) : undefined
   const tenant = auth.metadata?.tenant?.trim()
   const excluded = (scene?.excludeTenants ?? []).some(value => typeof value === 'string' && value.trim() === tenant)
@@ -670,6 +899,7 @@ async function accountModels(provider, { auth } = {}) {
     const image = features.includes('vision')
     const rate = multiplier(model.billingRate) ?? rates.get(id)
     const protocol = adapterProtocol(model)
+    const baseContext = Number.isFinite(model.maxTotalTokens) ? model.maxTotalTokens : base.limit?.context ?? 200000
     // Remove old rate fields so unavailable pricing never becomes fake free usage.
     const { rate: oldRate, rateWas, free, ...rest } = base
     models[id] = {
@@ -679,7 +909,7 @@ async function accountModels(provider, { auth } = {}) {
       api: { id, url: `${BASE}/v1`, npm: SDK[protocol] },
       limit: {
         ...base.limit,
-        context: Number.isFinite(model.maxTotalTokens) ? model.maxTotalTokens : base.limit?.context ?? 200000,
+        context: accountContext(model, baseContext),
         output: Number.isFinite(model.respMaxTokens) ? model.respMaxTokens : base.limit?.output ?? 64000,
       },
       capabilities: {
@@ -772,7 +1002,8 @@ export const JoyCodeAuthPlugin = async (_input, options) => {
             }
 
             // Preserve chat structure; the IDE also adds authenticated metadata.
-            const account = await identity()
+            // The host payload is parsed once. A gray denial refreshes identity
+            // and resends that same payload; effort rewrites must not run twice.
             const request = input instanceof Request ? input : undefined
             let source = init?.body
             if (source === undefined && request) source = await request.clone().text()
@@ -787,36 +1018,46 @@ export const JoyCodeAuthPlugin = async (_input, options) => {
               payload.reasoning = { ...payload.reasoning, effort: 'low' }
             }
             const forwarded = protocol === 'responses' ? withoutUnstoredReasoningIds(payload) : payload
-            const body = JSON.stringify({
-              ...(flatten && protocol === 'chat' ? flattenBody(payload) : forwarded),
-              ...account,
-              language: 'UNKNOWN',
-            })
+            const functionId = FUNCTION_IDS[protocol]
 
-            // 2) URL: fresh signature per request, on the model's wire protocol.
-            const url = buildGatewayUrl(FUNCTION_IDS[protocol])
-
-            // 3) Headers: keep what magpie synthesized (content-type, …),
-            //    add the gateway credentials, drop the OpenAI-style bearer
-            //    JoyCode does not understand.
-            const headers = new Headers(init?.headers ?? request?.headers)
-            for (const [k, v] of Object.entries(buildGatewayHeaders(ptKey, account.tenant, loginType))) {
-              headers.set(k, v)
+            const send = async () => {
+              const account = await identity()
+              const body = JSON.stringify({
+                ...(flatten && protocol === 'chat' ? flattenBody(payload) : forwarded),
+                ...account,
+                language: 'UNKNOWN',
+              })
+              const url = buildGatewayUrl(functionId)
+              // Rebuild headers per attempt so an empty tenant cannot stick.
+              const headers = new Headers(init?.headers ?? request?.headers)
+              headers.delete('tenant')
+              for (const [k, v] of Object.entries(buildGatewayHeaders(ptKey, account.tenant, loginType))) {
+                headers.set(k, v)
+              }
+              headers.delete('authorization')
+              headers.delete('x-api-key')
+              headers.delete('content-length')
+              headers.delete('host')
+              const resp = await fetch(url, {
+                ...init,
+                method: init?.method ?? request?.method,
+                headers,
+                body,
+                signal: init?.signal ?? request?.signal,
+              })
+              return { resp, account }
             }
-            headers.delete('authorization')
-            headers.delete('x-api-key')
-            headers.delete('content-length')
-            headers.delete('host')
 
-            // 4) Forward (...init carries the abort signal).
-            const resp = await fetch(url, {
-              ...init,
-              method: init?.method ?? request?.method,
-              headers,
-              body,
-              signal: init?.signal ?? request?.signal,
-            })
-
+            let { resp } = await send()
+            const failure = await gatewayFailure(resp)
+            // Missing account fields are cached with the first userInfo. One
+            // refresh can recover; a second denial is the gateway's answer.
+            // Other 403s (a bad signature, a clock) are not retried.
+            if (failure.code === GRAY_ACCESS_DENIED) {
+              await resp.body?.cancel?.().catch(() => {})
+              identityPromise = undefined
+              ;({ resp } = await send())
+            }
             return normalizeResponse(resp, protocol)
           },
         }

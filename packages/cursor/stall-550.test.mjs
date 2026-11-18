@@ -193,6 +193,36 @@ const until = async (predicate) => {
 }
 const nativeFrames = (opts) => wire(opts).map((b) => ({ data: envelope(b).subarray(5) }))
 
+// Two real Hydrogen failures: the count follows a partial second call,
+// but its exec arrives after a checkpoint waiting on only the first.
+const partialBatch = (started) => [
+  callUpdate(7, "c3", MCP),
+  callUpdate(2, "c3", MCP),
+  bin(2, execMessage("c3")),
+  callUpdate(7, "c4", MCP),
+  ...(started ? [callUpdate(2, "c4", MCP)] : []),
+  bin(1, bin(27, uint(1, 2))),
+  bin(3, state(['{"call":"c3"}'])),
+  ...(!started ? [callUpdate(2, "c4", MCP)] : []),
+  bin(2, message(uint(1, 8), text(15, "exec-c4"), bin(11, mcpArgs("c4")))),
+]
+
+for (const started of [false, true]) test(`native: a checkpoint after the count waits for a ${started ? "started" : "partial"} call's exec`, async () => {
+  const run = owner()
+  run.pump(open(partialBatch(started).map((data) => ({ data }))))
+  await until(() => run.error || run.state === "awaiting-results")
+  expect(run.error).toBeUndefined()
+  expect(run.segment.events.filter((e) => e.tool).map((e) => e.tool.name)).toEqual(["read_file", "read_file"])
+  expect(run.segment.events.at(-1).stop).toBe("tool_calls")
+})
+
+for (const started of [false, true]) test(`stateless: a checkpoint after the count waits for a ${started ? "started" : "partial"} call's exec`, async () => {
+  const { how, events } = await stateless(partialBatch(started))
+  expect(how).toBe("ended")
+  expect(events.filter((e) => e.tool).map((e) => e.tool.name)).toEqual(["read_file", "read_file"])
+  expect(events.at(-1).stop).toBe("tool_calls")
+})
+
 // pending: a checkpoint that waits on more than came, so only the calls
 // Cursor completed can seal it
 for (const [name, opts] of [["call updates", { pending: ["c3", "c9"] }], ["the checkpoint alone", { updates: false }]]) test(`native: the reporter's step seals on its one call, by ${name} (#550)`, async () => {
@@ -282,4 +312,78 @@ test("stateless: a count that comes inside the wait ends the step on the count, 
   expect(how).toBe("ended")
   expect(events.filter((e) => e.tool)).toHaveLength(2)
   expect(notes).toEqual([])
+})
+
+test("native: a checkpoint between parallel calls after count-before-calls waits for the remaining calls", async () => {
+  const run = owner({ batchWait: 2000 })
+  const second = bin(2, message(uint(1, 8), text(15, "exec-c4"), bin(11, mcpArgs("c4"))))
+  const frames = [
+    bin(1, bin(27, uint(1, 2))),
+    callUpdate(7, "c3", MCP),
+    callUpdate(2, "c3", MCP),
+    bin(2, execMessage("c3")),
+    bin(3, state(['{"call":"c3"}'])),
+    callUpdate(7, "c4", MCP),
+    callUpdate(2, "c4", MCP),
+    second,
+    bin(3, state(['{"call":"c3"}', '{"call":"c4"}'])),
+  ].map((b) => ({ data: envelope(b).subarray(5) }))
+  run.pump(open(frames))
+  await until(() => run.error || run.state === "awaiting-results")
+  expect(run.error).toBeUndefined()
+  expect(run.segment.events.filter((e) => e.tool).map((e) => e.tool.name)).toEqual(["read_file", "read_file"])
+  expect(run.segment.events.at(-1).stop).toBe("tool_calls")
+})
+
+test("stateless: a checkpoint between parallel calls after count-before-calls waits for the remaining calls", async () => {
+  const second = bin(2, message(uint(1, 8), text(15, "exec-c4"), bin(11, mcpArgs("c4"))))
+  const frames = [
+    bin(1, bin(27, uint(1, 2))),
+    callUpdate(7, "c3", MCP),
+    callUpdate(2, "c3", MCP),
+    bin(2, execMessage("c3")),
+    bin(3, state(['{"call":"c3"}'])),
+    callUpdate(7, "c4", MCP),
+    callUpdate(2, "c4", MCP),
+    second,
+  ]
+  const { how, events, notes } = await stateless(frames)
+  expect(how).toBe("ended")
+  expect(events.filter((e) => e.tool).map((e) => e.tool.name)).toEqual(["read_file", "read_file"])
+  expect(events.at(-1).stop).toBe("tool_calls")
+  expect(notes).toEqual([])
+})
+
+test("native and stateless: a checkpoint after count-between-calls waits when a call update follows the count", async () => {
+  const second = bin(2, message(uint(1, 8), text(15, "exec-c4"), bin(11, mcpArgs("c4"))))
+  const raw = [
+    callUpdate(7, "c3", MCP),
+    callUpdate(2, "c3", MCP),
+    bin(2, execMessage("c3")),
+    bin(1, bin(27, uint(1, 2))),
+    callUpdate(7, "c4", MCP),
+    bin(3, state(['{"call":"c3"}'])),
+    callUpdate(2, "c4", MCP),
+    second,
+  ]
+  const run = owner({ batchWait: 2000 })
+  run.pump(open(raw.map((b) => ({ data: envelope(b).subarray(5) }))))
+  await until(() => run.error || run.state === "awaiting-results")
+  expect(run.error).toBeUndefined()
+  expect(run.segment.events.filter((e) => e.tool)).toHaveLength(2)
+
+  const { how, events, notes } = await stateless(raw)
+  expect(how).toBe("ended")
+  expect(events.filter((e) => e.tool)).toHaveLength(2)
+  expect(notes).toEqual([])
+})
+
+test("StepCalls: an exec that arrives after its update #3 removes it from completedByCursor", () => {
+  const s = new StepCalls(nativeFields)
+  const uf = (id) => nativeFields(text(1, id))
+  s.update(7, uf("c3"))
+  expect(s.update(3, uf("c3"))).toBe(true)
+  expect(s.completed).toBe(1)
+  s.exec(execMessage("c3"))
+  expect(s.completed).toBe(0)
 })

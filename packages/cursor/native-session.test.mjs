@@ -141,6 +141,49 @@ test("native admission: competing initial requests cannot overwrite a session re
   expect(pool.selectors.get(run.account + ":" + run.selector)).toBe(run)
 })
 
+test("native admission: a fresh user turn whose old native calls all have results gets an owner; any pending call falls back", () => {
+  const pool = new NativeSessionPool()
+  pools.push(pool)
+  const id = "call_cursor_abcdef_0_0"
+  const call = { role: "assistant", content: "", tool_calls: [{ id, type: "function", function: { name: "audit_echo", arguments: "{}" } }] }
+  const result = { role: "tool", tool_call_id: id, content: "done" }
+  const answered = [{ role: "user", content: "first" }, call, result, { role: "assistant", content: "finished" }, { role: "user", content: "next" }]
+  expect(pool.prepare("synthetic-token", { messages: answered }, "synthetic-session", registered).fallback).toBeUndefined()
+  // the old call has no result: it is pending, so the request is imported history
+  const pending = answered.filter((m) => m !== result)
+  expect(pool.prepare("synthetic-token", { messages: pending }, "synthetic-session", registered).fallback).toBe("historical native calls")
+  // a tool result with no owner here is not a fresh user turn
+  expect(pool.prepare("synthetic-token", { messages: answered.slice(0, 3) }, "synthetic-session", registered).fallback).toBe("owner unavailable")
+})
+
+test("native admission: answered native calls and new input past a held reservation get an owner that takes no reservation", () => {
+  const { pool, run } = owner()
+  const key = run.account + ":" + run.selector
+  const id = "call_cursor_abcdef_0_0"
+  const call = { role: "assistant", content: "", tool_calls: [{ id, type: "function", function: { name: "audit_echo", arguments: "{}" } }] }
+  const messages = [{ role: "user", content: "synthetic" }, call, { role: "tool", tool_call_id: id, content: "done" }, { role: "user", content: "a reminder beside the result" }]
+  const prepared = pool.prepare("synthetic-token", chat({ messages }), "synthetic-session", registered)
+  expect(prepared.fallback).toBeUndefined()
+  expect(prepared.selected).toBe(false)
+  // with no native call in its history, a request past the reservation is a branch, as before
+  expect(pool.prepare("synthetic-token", chat(), "synthetic-session", registered).fallback).toBe("owner busy")
+  // another conversation of the same account, live in the same pool
+  const another = pool.prepare("synthetic-token", chat({ messages: [{ role: "user", content: "another conversation" }] }), "another-session", registered)
+  expect(another.selected).toBe(true)
+  const other = pool.create(another, run.resolution, _internal)
+  expect(other.account).toBe(run.account)
+  expect(other.selector).not.toBe(run.selector)
+  const next = pool.create(prepared, run.resolution, _internal)
+  expect(next).not.toBeNull()
+  expect(pool.selectors.get(key)).toBe(run)
+  // the holder, still live, owes only what came before this Run; another conversation is untouched
+  expect(run.laterRunAt).toBeNumber()
+  expect(next.laterRunAt).toBeUndefined()
+  expect(other.laterRunAt).toBeUndefined()
+  pool.release(next)
+  expect(pool.selectors.get(key)).toBe(run)
+})
+
 test("native admission: completed replay entries are bounded; active entries are preserved", () => {
   const { pool, run } = owner({}, { perAccount: 2, perProcess: 2 })
   run.terminalSeen(nativeFields(message(uint(1, 0), uint(2, 0))))
@@ -387,7 +430,7 @@ test("native protocol: a step silent after its first call fails at idle, before 
     await new Promise(() => {})
   })())
   await until(() => run.error)
-  expect(run.error).toMatchObject({ status: 502, message: "Cursor went quiet: no message for 0 s, its last message tool call (try again)" })
+  expect(run.error).toMatchObject({ status: 502, message: "Cursor went quiet: no message for 0 s, its last message tool call; stream timed out (try again)" })
   expect(Date.now() - started).toBeLessThan(1000)
 })
 
@@ -429,7 +472,7 @@ test("native protocol: a quiet Run's error says its checkpoint was a repeat, its
     await new Promise(() => {})
   })())
   await until(() => run.error)
-  expect(run.error.message).toBe("Cursor went quiet: no message for 0 s, its last message checkpoint #2 of the Run, number 2 of step 1, 2 in a row, after thinking ×2, text (try again)")
+  expect(run.error.message).toBe("Cursor went quiet: no message for 0 s, its last message checkpoint #2 of the Run, number 2 of step 1, 2 in a row, after thinking ×2, text; stream timed out (try again)")
 })
 
 test("native protocol: a checkpoint after the caller's results is the first of the next step (plugins#550)", async () => {
@@ -442,7 +485,7 @@ test("native protocol: a checkpoint after the caller's results is the first of t
     await new Promise(() => {})
   })())
   await until(() => run.error)
-  expect(run.error.message).toBe("Cursor went quiet: no message for 0 s, its last message checkpoint #4 of the Run, the first of step 2, after nothing else (try again)")
+  expect(run.error.message).toBe("Cursor went quiet: no message for 0 s, its last message checkpoint #4 of the Run, the first of step 2, after nothing else; stream timed out (try again)")
 })
 
 test("native protocol: Wire trace writes a failed Run, never a cancelled one, and only while on (plugins#550)", async () => {
@@ -467,6 +510,37 @@ test("native protocol: Wire trace writes a failed Run, never a cancelled one, an
     setWireTrace("")
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// plugins#635: InteractionQuery {id 1, web_search_request_query 2 {args 1
+// {search_term 1, tool_call_id 2}}} is read as a web search on both paths'
+// readers; any other query, or one that can't be read, is not
+test("web search: only a web_search_request_query is read, and its answer is an approval (plugins#635)", async () => {
+  const { webSearchQuery, webSearchAnswer } = await import("./native-session.mjs")
+  const args = bin(1, message(text(1, "term"), text(2, "ws1")))
+  for (const parse of [nativeFields, _internal.fields]) {
+    expect(webSearchQuery(message(uint(1, 3), bin(2, args)), parse)).toEqual({ id: 3, args: true })
+    expect(webSearchQuery(message(uint(1, 3), bin(2, Buffer.alloc(0))), parse)).toEqual({ id: 3, args: false })
+    // web_fetch_request_query, ask_question: not a search
+    expect(webSearchQuery(message(uint(1, 3), bin(9, args)), parse)).toBeNull()
+    expect(webSearchQuery(message(uint(1, 3), bin(3, args)), parse)).toBeNull()
+    // a oneof: the last field is the query
+    expect(webSearchQuery(message(uint(1, 3), bin(2, args), bin(9, args)), parse)).toBeNull()
+    // no query at all, or a search that isn't a message
+    expect(webSearchQuery(uint(1, 3), parse)).toBeNull()
+    expect(webSearchQuery(message(uint(1, 3), uint(2, 1)), parse)).toBeNull()
+  }
+  expect(webSearchQuery(Buffer.from([0x0a, 0x7f]))).toBeNull()
+  // AgentClientMessage {interaction_response 6 {id 1, web_search_request_response 2 {approved 1 {}}}}
+  const yes = webSearchAnswer(_internal.pb, { id: 3, args: true })
+  expect(readWire(yes).map((f) => f.no)).toEqual([6])
+  expect(number(nest(yes, 6), 1)).toBe(3)
+  expect(readWire(nest(nest(yes, 6), 2)).map((f) => f.no)).toEqual([1])
+  expect(nest(nest(nest(yes, 6), 2), 1)).toHaveLength(0)
+  // no args: rejected {reason 1}, as cursor-agent answers it
+  const no = webSearchAnswer(_internal.pb, { id: 4, args: false })
+  expect(readWire(nest(nest(no, 6), 2)).map((f) => f.no)).toEqual([2])
+  expect(nest(nest(nest(nest(no, 6), 2), 2), 1).toString()).toBe("Missing web search arguments")
 })
 
 test("Wire trace: scrub takes out what could be an email, id or token (plugins#550)", async () => {

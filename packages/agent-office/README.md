@@ -65,8 +65,9 @@ bun bin/agent-office.mjs --json   # 一次性快照，适合让 Agent 在聊天�
 | Pi · omp | `~/.pi/agent/sessions/*/*.jsonl`, `~/.omp/agent/sessions/*/*.jsonl`，以及 `~/.omp/profiles/*/agent/sessions` |
 | Grok Build | `~/.grok/sessions/*/*/updates.jsonl` + `summary.json` |
 | Qoder · WorkBuddy · CodeBuddy | 各自的 `projects/*/*.jsonl`（Claude Code 格式） |
+| Cursor（编辑器 · CLI） | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl`；有 `chats/*/*/meta.json` 的是 Cursor CLI，其余是编辑器 |
 
-`*_HOME` / `*_CONFIG_DIR` 覆盖变量都支持。Claude 子 Agent、Kimi 子 Agent、Grok 子 Agent 会标为子 Agent，并带父会话；OMP profiles 带 profile 名。其他 Agent（Cursor、OpenCode、Copilot 等）在通过 magpie 的模型工作时，仍会由异步网关钩子看到。
+`*_HOME` / `*_CONFIG_DIR` 覆盖变量都支持。Claude 子 Agent、Kimi 子 Agent、Grok 子 Agent 会标为子 Agent，并带父会话；OMP profiles 带 profile 名。其他 Agent（OpenCode 等）在通过 magpie 的模型工作时，仍会由异步网关钩子看到。
 
 ## 状态与办公室
 
@@ -136,7 +137,7 @@ bun bin/agent-office.mjs --json   # 一次性快照，适合让 Agent 在聊天�
 | `side` | 显示分组侧栏 |
 | `lang` | `auto` 或九种语言代码 |
 | `cleared` | { 会话 key: 时间 }：被「清除」的会话，文件再动就回来 |
-| `remote` | 网关部分也记录其他电脑的请求 |
+| `remote` | 网关部分也记录其他电脑和网关密钥的请求（也可在页面右上角 **设置** 里直接勾选） |
 | `approvalAfterSec` | 只有网关记录时，工具运行多久算等你批准（90） |
 
 ## 独立 CLI

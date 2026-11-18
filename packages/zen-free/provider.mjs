@@ -236,13 +236,15 @@ function normalizeTools(body, protocol) {
     throw new Error("tools must be an array");
   }
   body.tools ??= [];
-  const present = new Set(
-    body.tools.map((tool) => (protocol === "chat" ? tool?.function?.name : tool?.name)),
-  );
-  const declared = new Set([...present].filter((name) => typeof name === "string"));
+  const nameOf = (tool) => (protocol === "chat" ? tool?.function?.name : tool?.name);
+  const declared = new Set(body.tools.map(nameOf).filter((name) => typeof name === "string"));
   if (protocol === "chat" && Array.isArray(body.functions)) {
     for (const tool of body.functions) if (typeof tool?.name === "string") declared.add(tool.name);
   }
+  // renamed first, so a core tool the agent offers under a refused form
+  // (DSH's edit and read) still has its stand-in beside the renamed one
+  const renamed = renameRefused(body, protocol);
+  const present = new Set(body.tools.map(nameOf));
   for (const name of CORE_TOOLS) {
     if (present.has(name)) continue;
     const parameters = {
@@ -260,7 +262,7 @@ function normalizeTools(body, protocol) {
           : { type: "function", ...definition, parameters },
     );
   }
-  return { declared, renamed: renameRefused(body, protocol) };
+  return { declared, renamed };
 }
 
 // Tool names Zen's free tier refuses to serve under, whatever else the
@@ -279,7 +281,16 @@ function normalizeTools(body, protocol) {
 //     request bisected on 2026-10-30 (Ebony-Vinyl/dsh-our-free-model#709),
 //     served whole with only those two names changed, as jdld-ybd saw DSH
 //     refused while other agents were served from the same address
-//     (plugins#632).
+//     (plugins#632);
+//   - ZCode 3.17.2's CreateWorkflow offered beside GetWorkflowRun, and its
+//     AmendWorkflow beside FillWorkflowHole (either alone was served): a
+//     real 55-tool ZCode request bisected on 2026-11-04, served whole with
+//     only those four names changed (plugins#693).
+//   - a name with "run_code" in it, in any case, the underscore needed
+//     (DSH's ptc tool, the only one its main request offers; run_code_v2,
+//     host_run_code and RUN_CODE were refused too, while exec_program,
+//     runCode, run-code and code_run were served): alonewolfsy-web,
+//     2026-11-04, plugins#704.
 //
 // Such a tool goes to Zen under another name (the ones those bisections
 // were served under), in the agent's past calls and tool_choice too, and a
@@ -293,16 +304,67 @@ const REFUSED_TOGETHER = [
   },
   { names: ["subagent_fork"], as: { subagent_fork: "conversation_delegate" } },
   { names: ["read_image", "working_directory"], as: { working_directory: "workspace_directory" } },
+  {
+    names: ["CreateWorkflow", "GetWorkflowRun"],
+    as: { CreateWorkflow: "workflow_create", GetWorkflowRun: "workflow_inspect" },
+  },
+  {
+    names: ["AmendWorkflow", "FillWorkflowHole"],
+    as: { AmendWorkflow: "workflow_amend", FillWorkflowHole: "workflow_answer" },
+  },
 ];
-const REFUSED_WORD = /terminal/i;
+// A name refused together with its own parameters: the same parameters
+// under another name are served, and so is the name with none. DSH's edit
+// and read, bisected by SuperWheel against Zen on 2026-11-16 (plugins#632):
+// `edit` or `read` with their own parameters and a neutral description
+// were refused, `foo` with the same parameters was served. A rule renames
+// the tool only when it has every parameter the rule lists.
+const REFUSED_WITH_PARAMETERS = [
+  { name: "edit", parameters: ["file_path", "old_string", "new_string"], as: "text_replace" },
+  { name: "read", parameters: ["file_path", "offset", "limit"], as: "file_view" },
+];
+// Tool descriptions Zen refuses on their own, under any name (the same
+// bisection: each of these under a neutral name `foo` was refused, and a
+// shorter wording was served). Such a description goes reworded, with the
+// same meaning; it is matched whole, after trimming.
+const REFUSED_DESCRIPTIONS = new Map([
+  [
+    "Edit an existing UTF-8 text file by replacing literal text.",
+    "Replace an exact piece of text in a UTF-8 file that already exists.",
+  ],
+  [
+    "Read a UTF-8 text file and return line-numbered content.",
+    "Read a UTF-8 text file. Each line comes back with its number.",
+  ],
+  [
+    "Load the full instructions for a skill. Call it before acting on a task that names or clearly matches a skill in the session skill catalog.",
+    "Open a skill's whole instructions. Use it first when a task names a skill from the session's skill catalog, or plainly fits one.",
+  ],
+]);
 
-function servedName(name, taken) {
+// A word refused wherever it stands in a name, in any case, goes as
+// another word, in the found word's case: all capitals, each part
+// capitalised, or lower case.
+const REFUSED_WORDS = [
+  { word: /terminal/gi, as: "console" },
+  { word: /run_code/gi, as: "exec_program" },
+];
+
+function inCaseOf(found, word) {
+  if (found === found.toUpperCase()) return word.toUpperCase();
+  if (found[0] === found[0].toUpperCase())
+    return word.split("_").map((part) => part[0].toUpperCase() + part.slice(1)).join("_");
+  return word;
+}
+
+function servedName(name, taken, parameters) {
   for (const rule of REFUSED_TOGETHER)
     if (Object.hasOwn(rule.as, name) && rule.names.every((other) => taken.has(other))) return rule.as[name];
-  if (!REFUSED_WORD.test(name)) return undefined;
-  return name.replace(new RegExp(REFUSED_WORD.source, "gi"), (word) =>
-    word === word.toUpperCase() ? "CONSOLE" : word[0] === "T" ? "Console" : "console",
-  );
+  for (const rule of REFUSED_WITH_PARAMETERS)
+    if (rule.name === name && rule.parameters.every((key) => parameters?.has(key))) return rule.as;
+  let served = name;
+  for (const { word, as } of REFUSED_WORDS) served = served.replace(word, (found) => inCaseOf(found, as));
+  return served === name ? undefined : served;
 }
 
 // renameRefused gives each refused tool its served name and answers the
@@ -313,10 +375,24 @@ function renameRefused(body, protocol) {
   const taken = new Set(
     [...body.tools.map(get), ...functions.map((fn) => fn?.name)].filter((name) => typeof name === "string"),
   );
+  // each tool's parameter names, and a refused description reworded
+  const parametersOf = new Map();
+  for (const tool of body.tools) {
+    const definition = protocol === "chat" ? tool?.function : tool;
+    if (!definition || typeof definition !== "object") continue;
+    const schema = protocol === "anthropic" ? definition.input_schema : definition.parameters;
+    const properties = schema && typeof schema === "object" ? schema.properties : undefined;
+    if (typeof definition.name === "string" && properties && typeof properties === "object")
+      parametersOf.set(definition.name, new Set(Object.keys(properties)));
+    if (typeof definition.description === "string") {
+      const reworded = REFUSED_DESCRIPTIONS.get(definition.description.trim());
+      if (reworded) definition.description = reworded;
+    }
+  }
   const served = new Map(); // agent's name -> served name
   const renamed = new Map(); // served name -> agent's name
   for (const name of taken) {
-    const wanted = servedName(name, taken);
+    const wanted = servedName(name, taken, parametersOf.get(name));
     if (!wanted) continue;
     let alias = wanted;
     for (let i = 2; taken.has(alias) || renamed.has(alias); i++) alias = `${wanted}_${i}`;

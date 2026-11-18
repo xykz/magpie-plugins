@@ -34,6 +34,8 @@ export type ThreadMeta = {
   cursorFast?: boolean;
   /** Cursor Agent: Auto-review, the client auto-approves safe tool permissions */
   cursorAutoReview?: boolean;
+  /** 1.2: last URL shown in the Preview tab (the target, not the proxy URL) */
+  previewUrl?: string | null;
 };
 
 export type { Mode };
@@ -53,6 +55,15 @@ export class ThreadsStore {
     const p = this.writeQ.then(fn, fn);
     this.writeQ = p.catch(() => {});
     return p;
+  }
+  /** Resolves once no meta / timeline write is queued or in flight (tests remove the data dir only after this) */
+  async idle(): Promise<void> {
+    for (;;) {
+      const q = this.writeQ;
+      await q;
+      await new Promise((r) => setTimeout(r, 0)); // writes queued by the settling ones join the chain first
+      if (q === this.writeQ) return;
+    }
   }
   constructor(dataDir: string) {
     this.dir = join(dataDir, "threads");

@@ -33,12 +33,17 @@ export function fakeLoomy() {
     pwdAttempts: [], // what byPwd was asked, decoded: {loginid, password, rcode, type, expire}
     chatCalls: [],
     chatRefusal: null, // set to an upstream message to answer 400 instead
+    chatCode: null, // set to {code, desc} to answer the chat 200 with it
     imageCalls: [],
     imageStatus: null, // set to a status to answer it instead of drawing
+    // set to {status, type, body} to answer every gateway path with it before
+    // the session is looked at, as a proxy or firewall on the way does
+    denied: null,
     firstLoginCalls: 0,
     dailyBalance: 3000, // the day's first first-login refreshes it to 5000
     recordsReads: 0,
     modelsReads: 0,
+    modelsCode: null, // set to a business code to answer the models read 200 with it
     // onboarding: done[key]=true once its complete call lands (idempotent)
     onboardingDone: {},
     onboardingQueries: 0,
@@ -54,12 +59,15 @@ export function fakeLoomy() {
       state.pwdAttempts = []
       state.chatCalls = []
       state.chatRefusal = null
+      state.chatCode = null
       state.imageCalls = []
       state.imageStatus = null
+      state.denied = null
       state.firstLoginCalls = 0
       state.dailyBalance = 3000
       state.recordsReads = 0
       state.modelsReads = 0
+      state.modelsCode = null
       state.onboardingDone = {}
       state.onboardingQueries = 0
       state.onboardingCompletes = 0
@@ -171,24 +179,39 @@ export function fakeLoomy() {
     port: 0,
     async fetch(req) {
       const url = new URL(req.url)
+      if (state.denied) {
+        const d = state.denied
+        return new Response(d.body, { status: d.status, headers: { "content-type": d.type ?? "text/html" } })
+      }
       const token = req.headers.get("token") ?? ""
       const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "")
-      // chat: Bearer only. draw: both (the client's image service keeps the
-      // token header). everything else: token only.
+      // a refused session answers HTTP 200 with the business code, as the
+      // real gateway does on every path, chat included (measured 2026-11-16:
+      // a made-up token on /api/v1/chat/completions, /api/v1/models and
+      // /api/v2/points/records got 200 {"code":"100002","desc":"登录已失效，
+      // 请重新登录"}, and no token at all 200 {"code":"100002","desc":"缺少
+      // token"}), never a 401
+      // auth is per plane, because the client's own traffic is: chat carries
+      // `Authorization: Bearer` only, draw carries both, everything else
+      // (models, the two points paths, onboarding) carries bare `token` and no
+      // Authorization at all. A refused session answers HTTP 200 with the
+      // business code on every path, chat included (measured 2026-11-16).
       const isChat = url.pathname === "/api/v1/chat/completions"
       const isDraw = url.pathname === "/api/v1/images/generations"
+      const refused = () => json(200, { code: "100002", desc: "登录已失效，请重新登录", trace_id: "t", data: {} })
       if (isChat) {
-        if (bearer !== state.session) return json(401, { code: "100002", desc: "session refused" })
+        if (bearer !== state.session) return refused()
         if (token) return json(400, { code: "100004", desc: "the chat plane sends no token header" })
       } else if (isDraw) {
-        if (bearer !== state.session || token !== state.session) return json(401, { code: "100002", desc: "session refused" })
+        if (bearer !== state.session || token !== state.session) return refused()
       } else {
-        if (token !== state.session) return json(401, { code: "100002", desc: "session refused" })
+        if (token !== state.session) return refused()
         if (bearer) return json(400, { code: "100004", desc: `Authorization is not sent on ${url.pathname}` })
       }
 
       if (url.pathname === "/api/v1/models") {
         state.modelsReads++
+        if (state.modelsCode) return json(200, { code: state.modelsCode, desc: "系统繁忙" })
         return json(200, {
           data: [
             // the live catalogue's own spelling: context_length /
@@ -211,6 +234,7 @@ export function fakeLoomy() {
         const body = await req.json().catch(() => ({}))
         state.chatCalls.push({ body, headers: Object.fromEntries(req.headers) })
         if (state.chatRefusal) return json(400, { error: { message: state.chatRefusal, type: "invalid_request_error" } })
+        if (state.chatCode) return json(200, { ...state.chatCode, trace_id: "t", data: {} })
         const reply = body.stream
           ? new Response(
               [

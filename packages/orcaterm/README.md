@@ -141,8 +141,10 @@ is in that page's HTML — so only do that behind something that restricts who c
 bind accepts the page from this machine's own interface addresses, so reaching it by LAN address
 works; every other origin is refused.
 
-The token is renewed before it expires through `OAuthRefreshToken`, so a normal session never asks
-you to scan again.
+The token is renewed before it expires through `OAuthRefreshToken`. magpie renews it when the
+account is used (a request, a usage read) in the last 90 minutes of the token's two hours: OrcaTerm
+drops the sign-in together with an expired token, after which renewal is `SESSION_EXPIRED` for good
+and only a new scan helps (#675). An account nothing touches for the whole two hours still expires.
 
 ### Paste the cookie pair (fallback)
 
@@ -255,6 +257,28 @@ Two consequences worth knowing:
   written into the conversation as text so nothing is lost, but the agent does the calling itself.
 - **No images.** `image_url` parts become an `[image]` note.
 
+The models still write calls into the answer text sometimes — DeepSeek's `<｜｜DSML｜｜ invoke name="…">`
+blocks, or the `<tool_call>` shape — because the request declares no tools for them to be a call to.
+That block is not an answer: the text stops where it begins, and the turn ends with an error frame
+(the stream) or a 502 (a request that isn't streamed). Sending it on as prose is what the agent then
+reads as its reply, and what the user sees as a turn that stops inside a tag.
+
+What magpie can do with that error depends on when it arrives. Its gateway holds a stream for
+another account only until the first content has gone out, so a reply that opens with the call fails
+over, while one that streamed prose first reaches the agent as a mid-stream error and no failover
+happens — and the same prompt tends to produce the same call on the next account too. A 502 is a
+passing status there, so the same account is asked again before another is tried.
+
+A call being shown rather than written — inside a code fence or in backticks — is prose, not a call,
+and the reply goes on. The rule is trae's, so a client quoting a file, a log or a page about the
+format is not answered with an error.
+
+An `ask` is unwrapped the same way, to its `question` with the `options` under it one per line, and
+in every shape it arrives in: a complete object, a hand-written one with a bare line break inside the
+question, one the stream ended inside, and one appended after prose — where a `completion`'s envelope
+is dropped as bookkeeping but an ask's is the part the user has to answer. Only an `ask` is read this
+way; another action's `question` is a note, not an answer.
+
 Token counts are not reported: the upstream returns none, and an estimate passed off as real usage
 would make both cost and context accounting wrong. A caller that asks for `include_usage` gets the
 answer without a usage block.
@@ -289,6 +313,7 @@ bun test
 | `audit.test.mjs` | invalid callback bodies; envelope whitespace and examples; EOF error frames; JSON error codes; reader cleanup; read failures and cancellation |
 | `identity.test.mjs` | stable identity across QR re-sign-ins with rotated tokens or changed nicknames; distinct users staying separate; token user ID fallback; refusing missing identity; renewal and account-scoped backfill preserving credentials and metadata |
 | `leak.test.mjs` | #564: the reported envelope, hand-written envelopes that aren't JSON, an envelope sent as thinking or kept in the history, a new upstream conversation on every request, and nothing added to another provider's request |
+| `renew.test.mjs` | #675: under magpie's renewal rule, an account used once an hour is renewed before its 2h token expires, and a fresh token is not renewed again |
 | `review.test.mjs` | the cases the reviews turned up: a reply containing `{"action": …}` is not truncated (including one character at a time, and one that ends mid-envelope); the JSON 429 is a 429; pacers are per account; only nine models are listed; a chat makes exactly one request and it is not `/conversation`; and `/cb` refuses a foreign `Origin`, a rebinding page, and a `state` it did not issue |
 
 `chunks.test.mjs`'s cancel case fails if `releaseUpstream()` is removed, so the leak stays fixed.
@@ -303,7 +328,9 @@ GLM、Kimi。provider id：`orcaterm`。
 > 这可能不符合腾讯云的服务条款，接口也可能随时变更。使用风险（包括账号受限）由使用者自行承担。
 
 - **登录**：首选**微信扫码**（`magpie plugin login orcaterm` 第一项），拿到的是 OrcaTerm 自己的
-  OAuth accessToken —— 两小时有效、自动续期、只能用于 OrcaTerm。备选是粘贴 `uin` + `skey`：
+  OAuth accessToken —— 两小时有效、只能用于 OrcaTerm。到期前 90 分钟内账号被用到（请求、读用量）时
+  magpie 会自动续期；令牌一旦过期，OrcaTerm 会连同登录会话一起作废，续期只会返回 `SESSION_EXPIRED`，
+  只能重新扫码（#675）。两小时内完全没被用到的账号仍会过期。备选是粘贴 `uin` + `skey`：
   这两个是**腾讯云控制台的完整会话 cookie**，不是 OrcaTerm 专用令牌 —— 拿到它们就能在腾讯云范围内
   以你的身份操作，包括你的服务器和账单。**不要用持有生产资源的账号**，想试就用一个名下没有东西的独立账号。
 - **条款**：OrcaTerm 用户协议 2.3 保留所有未明示授权的权利，2.1 把服务限定为 OrcaTerm 本身；

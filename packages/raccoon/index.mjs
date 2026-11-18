@@ -6,11 +6,11 @@
 // (read-only; desktopAuthCandidates lists where). Chats are OpenAI-compatible
 // chat completions at /api/web/llm/v2/chat/completions.
 
-import { randomUUID, randomBytes } from "node:crypto"
+import { createHash, randomUUID, randomBytes } from "node:crypto"
 import { createServer } from "node:http"
-import { readFileSync, statSync } from "node:fs"
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 // extras: the phone-side grant, the check-in triage, the vision whitelist,
 // extra_body.thinking, the max_tokens floor and the refresh_conflict heal.
@@ -694,16 +694,23 @@ async function balanceOf(token) {
   }
 }
 
-// availablePoints is the account's balance. /points/v1/balance answers 403,
-// to the vendor's own web page too (plugins #520), so a failure there reads
-// the same number from /office/v3/setting_info. Balance stays first while it
-// may come back: setting_info is the call the clients make on opening, and it
-// can hand out the day's credits. An expired sign-in is said as such, not
-// read again.
+// availablePoints is the account's balance and the vendor's own daily bucket.
+// /points/v1/balance answers 403, to the vendor's own web page too (plugins
+// #520), so a failure there reads the same number from
+// /office/v3/setting_info. Balance stays first while it may come back:
+// setting_info is the call the clients make on opening, and it can hand out
+// the day's credits. An expired sign-in is said as such, not read again.
+// `daily_points` is the daily-grant pool the vendor keeps itself (300/day,
+// each grant lasting 7 days). It includes remainders of grants already past
+// expire_at but not swept yet, so it is the authoritative "free credits still
+// left"; the bills only say when the next slice expires.
 async function availablePoints(token, read) {
   const { points, error } = read ?? (await balanceOf(token))
   const n = Number(points?.available_points)
-  if (Number.isFinite(n)) return Math.floor(n)
+  if (Number.isFinite(n)) {
+    const d = Number(points?.daily_points)
+    return { avail: Math.floor(n), daily: Number.isFinite(d) ? Math.floor(d) : null }
+  }
   const first = error ?? new Error("balance has no available_points")
   let info
   try {
@@ -714,7 +721,7 @@ async function availablePoints(token, read) {
   }
   const m = Number(info?.available_points)
   if (!Number.isFinite(m)) throw first
-  return Math.floor(m)
+  return { avail: Math.floor(m), daily: null }
 }
 
 // topBalance holds, per account and per set of grants, the highest balance a
@@ -722,9 +729,46 @@ async function availablePoints(token, read) {
 // grant total to measure spending against, so the window's total is that
 // highest balance and what was spent since is what it has gone down by
 // (plugins #1030: 9,965 then 9,964 read 0 / 9,965 then 0 / 9,964). A new or
-// expired grant changes the set and starts it again. Kept in memory: a
-// restarted host starts from the balance it reads.
+// expired grant changes the set and starts it again. It is kept on disk too
+// (plugins #1182: what was spent read 0 again after every restart), one
+// entry per account, so a restarted host goes on from the same top.
 const topBalance = new Map()
+
+const topBalanceFile = () =>
+  process.env.RACCOON_TOP_BALANCE_FILE ||
+  join(process.env.MAGPIE_CONFIG_DIR || join(homedir(), ".config", "magpie"), "raccoon-top-balance.json")
+
+function readTops() {
+  try {
+    const raw = JSON.parse(readFileSync(topBalanceFile(), "utf8"))
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
+  } catch {
+    return {}
+  }
+}
+
+// savedTop is the top a past host saw for this account and set of grants,
+// or 0 when it saw none (or the file can't be read).
+function savedTop(account, grants) {
+  const e = readTops()[account]
+  const n = Number(e?.top)
+  return e?.grants === grants && Number.isFinite(n) && n > 0 ? n : 0
+}
+
+// saveTop writes through a temp file and a rename, so a host reading it
+// mid-write never sees half of it. A failed write keeps the memory copy.
+function saveTop(account, grants, top) {
+  try {
+    const file = topBalanceFile()
+    const all = readTops()
+    if (all[account]?.grants === grants && all[account]?.top === top) return
+    all[account] = { grants, top }
+    mkdirSync(dirname(file), { recursive: true })
+    const tmp = `${file}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify(all))
+    renameSync(tmp, file)
+  } catch {}
+}
 
 // queryUsage reads the account's credits, splitting the day's grant from the
 // permanent balance (the vendor's own `daily_points` bucket). The reading of
@@ -737,19 +781,15 @@ const topBalance = new Map()
 // version does throughout.
 async function queryUsage(token, account = "") {
   const read = await balanceOf(token)
-  const [avail, entitlement, bills] = await Promise.all([
+  const [pool, entitlement, bills] = await Promise.all([
     availablePoints(token, read),
     apiGetJson("/api/web/auth/v1/entitlement_info", token).catch(() => null),
     allBills(token).catch(() => null),
   ])
-  const entrance = read.points
-  const saidDaily = entrance?.daily_points
-  const dailyKnown = saidDaily != null && saidDaily !== "" && Number.isFinite(Number(saidDaily))
-  const daily = dailyKnown ? Math.max(0, Math.floor(Number(saidDaily))) : null
-  const now = Date.now()
 
-  // entitlement_info answers 403 too (plugins #520): an unread plan is left
-  // unsaid, not read as Free.
+  const avail = pool.avail
+  const daily = pool.daily
+  const now = Date.now()
   const office = entitlement?.office ?? entitlement?.code ?? {}
   const proEnable = office?.pro_enable === true || entitlement?.code?.pro_enable === true
   const planType = office?.active_plan?.type || office?.plan_type || ""
@@ -803,13 +843,16 @@ async function queryUsage(token, account = "") {
   }
   // A balance a little over every grant the bills list (plugins #936: 9,623
   // against 9,600 of grants, none expired) holds credits that come back
-  // outside income bills. That remainder is counted into the window, so the
-  // card still shows one. A balance far over the bills is left balance-only:
-  // the bills don't explain it.
+  // outside income bills. That remainder is counted into the window, so
+  // the card still shows one. A balance far over the bills is left
+  // balance-only: the bills don't explain it.
   if (grantedFromBills > 0 && avail > grantedFromBills && avail - grantedFromBills <= avail / 10) {
-    const key = `${account}\n${grantKeys.sort().join("\n")}`
-    const top = Math.max(avail, topBalance.get(key) ?? 0)
+    const grants = createHash("sha256").update(grantKeys.sort().join("\n")).digest("hex")
+    const key = `${account}\n${grants}`
+    if (!topBalance.has(key)) topBalance.set(key, savedTop(account, grants))
+    const top = Math.max(avail, topBalance.get(key))
     topBalance.set(key, top)
+    saveTop(account, grants, top)
     grantedFromBills = top
   }
   const runsOutAt = soonestExpMs ? new Date(soonestExpMs).toISOString() : null
@@ -1564,6 +1607,7 @@ export const RaccoonAuthPlugin = async (args = {}) => {
 }
 
 export const _internal = {
+  topBalance,
   browserSignIn,
   desktopAuthPath,
   desktopAuthCandidates,

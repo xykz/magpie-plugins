@@ -33,6 +33,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createGate } from "./lib/gate.mjs";
+import { processAlive } from "./lib/proc.mjs";
 import { NODE_TOO_OLD_MESSAGE, requireNode } from "./lib/pathscan.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -68,15 +69,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ESRCH = gone; EPERM = exists but we may not signal it (common on Windows), counts as alive
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
+const pidAlive = processAlive;
 
 // A failed log write (directory deleted, disk full) must never make the host's flow throw
 function makeLogger(p) {
@@ -266,6 +259,7 @@ function installExitHook() {
 }
 
 function createHost(port) {
+  const gatePort = port;
   const p = paths();
   const log = makeLogger(p);
   // Gate key: written to session.js; even if leaked it only buys one navigation to the daemon
@@ -331,6 +325,9 @@ function createHost(port) {
           p.dataRoot,
           "--parent-pid",
           String(process.pid),
+          // the preview proxy refuses the gate's port
+          "--gate-port",
+          String(gatePort),
         ],
         {
           // The token goes through an environment variable, not the command line (command lines are visible to other users on the machine)

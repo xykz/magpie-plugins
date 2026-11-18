@@ -219,9 +219,9 @@ const PERSONAL_RESETS = {
   data: {
     customerId: 0, targetType: "PERSONAL", organizationId: null, projectId: null,
     lastFiveHourResetTime: "2026-10-06 21:14:03", lastWeekResetTime: null,
-    fiveHourResets: [{ recordId: 0, grantType: "DIRECT", expireTime: "2026-11-02 23:59:59", available: true }],
+    fiveHourResets: [{ recordId: 0, grantType: "DIRECT", expireTime: "2027-11-02 23:59:59", available: true }],
     weekResets: [
-      { recordId: 0, grantType: "DIRECT", expireTime: "2026-10-30 23:59:59", available: true },
+      { recordId: 0, grantType: "DIRECT", expireTime: "2027-10-30 23:59:59", available: true },
       { recordId: 0, grantType: "DIRECT", expireTime: "2026-10-04 23:59:59", available: false },
     ],
   },
@@ -241,9 +241,9 @@ test("a Coding Plan of a person's own shows its resets, each with its end, as th
     signIn: "kept",
     plan: "GLM Coding Pro",
     windows: [NO_SESSION],
-    resets: { count: 2, byWindow: true, fiveHour: 1, weekly: 1, until: "2026-10-30T15:59:59.000Z", each: [
-      { until: "2026-10-30T15:59:59.000Z", window: "weekly" },
-      { until: "2026-11-02T15:59:59.000Z", window: "fiveHour" },
+    resets: { count: 2, byWindow: true, fiveHour: 1, weekly: 1, until: "2027-10-30T15:59:59.000Z", each: [
+      { until: "2027-10-30T15:59:59.000Z", window: "weekly" },
+      { until: "2027-11-02T15:59:59.000Z", window: "fiveHour" },
     ] },
   })
   const asked = calls.find((c) => c.url.pathname === "/api/biz/customer-package-reset/list")
@@ -255,9 +255,9 @@ test("a Coding Plan of a person's own shows its resets, each with its end, as th
   list = { code: 200, data: { fiveHourResets: [], weekResets: [{ available: false, expireTime: "2026-10-04 23:59:59" }] } }
   expect((await usage(auth)).resets).toBeUndefined()
   // one with no end is listed last, with none
-  list = { code: 200, data: { fiveHourResets: [{ available: true }], weekResets: [{ available: true, expireTime: "2026-10-30 23:59:59" }] } }
-  expect((await usage(auth)).resets).toEqual({ count: 2, byWindow: true, fiveHour: 1, weekly: 1, until: "2026-10-30T15:59:59.000Z", each: [
-    { until: "2026-10-30T15:59:59.000Z", window: "weekly" },
+  list = { code: 200, data: { fiveHourResets: [{ available: true }], weekResets: [{ available: true, expireTime: "2027-10-30 23:59:59" }] } }
+  expect((await usage(auth)).resets).toEqual({ count: 2, byWindow: true, fiveHour: 1, weekly: 1, until: "2027-10-30T15:59:59.000Z", each: [
+    { until: "2027-10-30T15:59:59.000Z", window: "weekly" },
     { window: "fiveHour" },
   ] })
 })
@@ -271,7 +271,7 @@ test("a team seat: the team plan's windows, name, end and resets, its key found 
     if (url.origin !== "https://bigmodel.cn") return
     if (p === "/api/biz/team/subscribe/product/querySubscribeDetail" && headers.Authorization === TOKEN && org === "t1" && proj === "tp1")
       return ok({ hasSubscription: true, status: "EFFECTIVE", memberGrantStatus: "VALID", productId: "prod-1", productName: "GLM Coding Team Pro",
-        subscribeEndTime: "2026-12-31 23:59:59" })
+        subscribeEndTime: "2027-12-31 23:59:59" })
     if (p === "/api/biz/v1/organization/t1/projects/tp1/api_keys" && headers.Authorization === TOKEN && org === "t1" && proj === "tp1") {
       if (method === "POST") {
         made = JSON.parse(body)
@@ -282,8 +282,8 @@ test("a team seat: the team plan's windows, name, end and resets, its key found 
     if (p === "/api/biz/v1/organization/t1/projects/tp1/api_keys/copy/tk") return ok({ secretKey: "ts" })
     if (p === "/api/biz/customer-package-reset/list" && headers.Authorization === TOKEN && org === "t1" && proj === "tp1" && url.searchParams.get("targetType") === "TEAM")
       return ok({
-        fiveHourResets: [{ available: true, expireTime: "2026-11-30 23:59:59" }, { available: true, expireTime: 1790000000 }, { available: false, expireTime: 1 }],
-        weekResets: [{ available: true, expireTime: "2026-12-31 23:59:59" }],
+        fiveHourResets: [{ available: true, expireTime: "2027-11-30 23:59:59" }, { available: true, expireTime: 1800000000 }, { available: false, expireTime: 1 }],
+        weekResets: [{ available: true, expireTime: "2027-12-31 23:59:59" }],
       })
     if (p === "/api/monitor/usage/quota/limit") {
       if (headers.Authorization !== "tk.ts" || url.searchParams.get("type") !== "2" || headers["Set-Language"] !== "zh") return ok({ limits: [] })
@@ -297,13 +297,13 @@ test("a team seat: the team plan's windows, name, end and resets, its key found 
   const state = { site: "bigmodel", base: "https://open.bigmodel.cn/api/anthropic", token: TOKEN, org: "t1", project: "tp1", plan: "GLM Coding Team Pro" }
   expect(await usage(oauth(state), sets)).toEqual({
     signIn: "kept",
-    plan: "GLM Coding Team Pro", until: "2026-12-31T15:59:59.000Z", renew: "off",
+    plan: "GLM Coding Team Pro", until: "2027-12-31T15:59:59.000Z", renew: "off",
     // a team's resets say so, and each its own end, soonest first, as the
     // built-in's zhipuTeamResets did
-    resets: { count: 3, byWindow: true, fiveHour: 2, weekly: 1, until: new Date(1790000000 * 1000).toISOString(), team: true, each: [
-      { until: new Date(1790000000 * 1000).toISOString(), window: "fiveHour" },
-      { until: "2026-11-30T15:59:59.000Z", window: "fiveHour" },
-      { until: "2026-12-31T15:59:59.000Z", window: "weekly" },
+    resets: { count: 3, byWindow: true, fiveHour: 2, weekly: 1, until: new Date(1800000000 * 1000).toISOString(), team: true, each: [
+      { until: new Date(1800000000 * 1000).toISOString(), window: "fiveHour" },
+      { until: "2027-11-30T15:59:59.000Z", window: "fiveHour" },
+      { until: "2027-12-31T15:59:59.000Z", window: "weekly" },
     ] },
     windows: [
       { name: "5 hours", used: 42, display: "420 / 1000", amount: 420, limit: 1000, resetsAt: new Date(reset).toISOString(), span: 5 * 3600 },
@@ -356,31 +356,35 @@ test("a model ZCode's config gives no limits has none made up", () => {
   expect(_internal.entry({ id: "GLM-9", context: 300_000, output: 8_000, efforts: [] }).limit).toEqual({ context: 300_000, output: 8_000 })
 })
 
-// The ZCode app's own list of manual-claim gift plans: GET /billing/preview
-// is read with the usage card, and a plan it lists that the balance does not
-// hold is named on the card, to be claimed in the ZCode app (the claim needs
-// the app's captcha attestation, see claimHint). Both fixtures are real
-// responses: one account's preview while the day's ZCode Trust Build was
-// still unclaimed, and one after it had claimed it. Reading the card never asks
-// the claim endpoint. The window's name is the fixed sentence magpie
-// translates; the count and the plan's own name are the display.
-const PREVIEW_CLAIMABLE = {
+// The ZCode app's list of claimable gift plans is its marketing feed
+// (touch; see checkin.test.mjs). The v3.17 client reads the feed alone —
+// the old preview polling is gone — and the rewards center's gifts are
+// the rewards website's, claimed in the client. Two fixtures: the day's
+// ZCode Trust Build still in the feed, and the feed after it was claimed.
+// Reading the card never asks the claim endpoint. The window's name is
+// the fixed sentence magpie translates; the count and the plan's own
+// name are the display.
+const TOUCH_TRUST = {
   server_time: 1791216750,
-  plans: [{
-    user_plan_id: "upl_2107141892427358208", plan_id: "zcode-v3-start-plan-trust-1006", name: "ZCode Trust Build",
-    description: "ZCode Global Build", priority: 110, status: "active", starts_at: 1791216750, ends_at: 1791302400,
-    entitlements: [{ entitlement_id: "zcode-v3-start-plan-trust-1006", show_name: "GLM-5.3-Flash", meter: "model_usage",
-      unit_type: "token", capabilities: ["model:glm-5.3-flash"], grant_units: 100000000, period: "one_time", priority: 110, effective_at: 0 }],
+  deliveries: [{
+    campaign_id: "2101141259813175296", priority: 100, resource_position: "banner",
+    banner: {
+      layout: "",
+      background: { type: "zcode_plan", args: { zcode_plan: { plan_id: "zcode-v3-start-plan-trust-1006", name: "ZCode Trust Build", grant_units: 100000000, period: "one_time" } } },
+      buttons: [
+        { text: { format: "", content: "领取" }, action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-trust-1006" } } },
+        { text: { format: "", content: "关闭" }, action: { type: "close" } },
+      ],
+    },
   }],
 }
-const PREVIEW_CLAIMED = { server_time: 1791276990, plans: [] }
 const TRUST_BUILD = { name: "Gift plans to claim in the ZCode app", used: 0, aside: true, display: "1 · ZCode Trust Build" }
 
-// the Start Plan's own card, with the preview answering what preview says
-async function startCard(now, token, preview) {
+// the Start Plan's own card, with the feed answering what the app reads
+async function startCard(now, token, touch) {
   const calls = serve(({ url }) => {
     if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(startBalance(now, "active"))
-    if (url.pathname === "/api/v1/zcode-plan/billing/preview") return preview(calls)
+    if (url.pathname === "/api/v1/marketing/touch") return touch(calls)
   })
   const auth = oauth({ site: "zai", jwt: token, device: "11111111-2222-4333-8444-555555555555" })
   return { u: await usage(auth), calls }
@@ -389,7 +393,7 @@ async function startCard(now, token, preview) {
 test("a gift plan ZCode holds but has not granted is named on the card, to claim in the app", async () => {
   const now = Math.trunc(Date.now() / 1000)
   const token = jwt(now + 86400)
-  const { u, calls } = await startCard(now, token, () => ok(PREVIEW_CLAIMABLE))
+  const { u, calls } = await startCard(now, token, () => ok(TOUCH_TRUST))
   expect(u.windows).toEqual([
     { name: "GLM-5.1", used: 25, display: "250000 / 1000000", amount: 250000, limit: 1000000, resetsAt: new Date((now + 3600) * 1000).toISOString(), span: 86400,
       models: ["GLM-5.1", "GLM-5.1-Trial"] },
@@ -397,15 +401,18 @@ test("a gift plan ZCode holds but has not granted is named on the card, to claim
   ])
   // it is no allowance: set aside, so routing, caps and the menu bar pass it over
   expect(u.windows.at(-1).aside).toBe(true)
-  // the preview went out as ZCode's own client asks it
-  const p = calls.find((c) => c.url.pathname.endsWith("/preview"))
-  expect(p.method).toBe("GET")
-  expect(p.url.searchParams.get("app_version")).toBe("3.16.3")
-  expect(p.url.searchParams.get("platform")).toBe(`${process.platform}-${process.arch}`)
-  expect(p.headers.Authorization).toBe("Bearer " + token)
-  expect(p.headers["X-Device-Mid"]).toBe("11111111-2222-4333-8444-555555555555")
+  // the feed went out as ZCode's own client asks it
+  const t = calls.find((c) => c.url.pathname.endsWith("/marketing/touch"))
+  expect(t.method).toBe("GET")
+  expect(Number(t.url.searchParams.get("seq"))).toBeGreaterThanOrEqual(0)
+  expect(t.headers.Authorization).toBe("Bearer " + token)
+  expect(t.headers["X-Device-Mid"]).toBe("11111111-2222-4333-8444-555555555555")
+  expect(t.headers["X-ZCode-App-Version"]).toBe("3.17.2")
+  expect(t.headers["X-Client-Language"]).toBeTruthy()
   // nothing claims it here
   expect(calls.some((c) => c.url.pathname.endsWith("/claim"))).toBe(false)
+  // the preview is not asked anymore (the v3.17 client reads the feed alone)
+  expect(calls.some((c) => c.url.pathname.endsWith("/preview"))).toBe(false)
 })
 
 // #503, 10-30: a banner plan is in the app's marketing feed and in no
@@ -415,7 +422,6 @@ test("a banner plan from the app's marketing feed is named on the card", async (
   const token = jwt(now + 86400)
   const calls = serve(({ url }) => {
     if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(startBalance(now, "active"))
-    if (url.pathname === "/api/v1/zcode-plan/billing/preview") return ok(PREVIEW_CLAIMED)
     if (url.pathname === "/api/v1/marketing/touch")
       return ok({ deliveries: [{ banner: { background: { args: { zcode_plan: { name: "ZCODE WEEKEND BUILD" } } }, buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-1030-wk" } } }] } }] })
   })
@@ -426,12 +432,12 @@ test("a banner plan from the app's marketing feed is named on the card", async (
 
 test("a claimed account's card has no line at all", async () => {
   const now = Math.trunc(Date.now() / 1000)
-  const { u } = await startCard(now, jwt(now + 86400), () => ok(PREVIEW_CLAIMED))
+  const { u } = await startCard(now, jwt(now + 86400), () => ok({ deliveries: [] }))
   expect(u.windows.map((w) => w.name)).toEqual(["GLM-5.1"])
   expect(u.error).toBeUndefined()
 })
 
-test("a preview that fails shows nothing and leaves the card as it was", async () => {
+test("a feed that fails shows nothing and leaves the card as it was", async () => {
   const now = Math.trunc(Date.now() / 1000)
   const token = jwt(now + 86400)
   const before = (await startCard(now, token, () => new Response("", { status: 404 }))).u
@@ -444,28 +450,30 @@ test("a preview that fails shows nothing and leaves the card as it was", async (
     expect(u.error).toBeUndefined()
     expect(u.windows.some((w) => w.aside)).toBe(false)
   }
-  // an expired sign-in is no preview request either
+  // an expired sign-in is no feed request either
   const calls = serve(() => undefined)
   expect((await usage(oauth({ site: "zai", jwt: jwt(now - 60) }))).error).toContain("sign-in has expired")
-  expect(calls.some((c) => c.url.pathname.endsWith("/preview"))).toBe(false)
+  expect(calls.some((c) => c.url.pathname.endsWith("/marketing/touch"))).toBe(false)
 })
 
 test("the card's error stays the error: no line is added over it", async () => {
   const now = Math.trunc(Date.now() / 1000)
-  const { u } = await startCard(now, jwt(now + 86400), () => ok(PREVIEW_CLAIMABLE))
+  const { u } = await startCard(now, jwt(now + 86400), () => ok(TOUCH_TRUST))
   expect(u.windows.at(-1)).toEqual(TRUST_BUILD) // a working card gets it
   const calls = serve(({ url }) => {
     if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(startBalance(now, "expired"))
-    if (url.pathname === "/api/v1/zcode-plan/billing/preview") return ok(PREVIEW_CLAIMABLE)
+    if (url.pathname === "/api/v1/marketing/touch") return ok(TOUCH_TRUST)
   })
   const over = await usage(oauth({ site: "zai", jwt: jwt(now + 86400), device: "d" }))
   expect(over).toEqual({ signIn: "kept", error: "this account has no GLM Coding Plan, and ZCode's Start Plan has ended or was never started" })
-  expect(calls.some((c) => c.url.pathname.endsWith("/preview"))).toBe(false) // nothing to put it on
+  expect(calls.some((c) => c.url.pathname.endsWith("/claim"))).toBe(false) // nothing to put it on
 })
 
 test("several claimable plans are counted", async () => {
   const now = Math.trunc(Date.now() / 1000)
-  const two = { ...PREVIEW_CLAIMABLE, plans: [PREVIEW_CLAIMABLE.plans[0], { plan_id: "zcode-v3-start-plan-trust-1007", name: "ZCode Trust Build", status: "active" }] }
+  const first = TOUCH_TRUST.deliveries[0]
+  const second = { ...first, campaign_id: "2101141259813175297", banner: { ...first.banner, background: { type: "zcode_plan", args: { zcode_plan: { plan_id: "zcode-v3-start-plan-trust-1007", name: "ZCode Trust Build", grant_units: 100000000, period: "one_time" } } }, buttons: [{ text: { format: "", content: "领取" }, action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-trust-1007" } } }, { text: { format: "", content: "关闭" }, action: { type: "close" } }] } }
+  const two = { server_time: TOUCH_TRUST.server_time, deliveries: [first, second] }
   const { u } = await startCard(now, jwt(now + 86400), () => ok(two))
   expect(u.windows.at(-1)).toEqual({ name: "Gift plans to claim in the ZCode app", used: 0, aside: true, display: "2 · ZCode Trust Build" })
 })
@@ -478,14 +486,14 @@ test("a coding account's line goes after its coding and gift windows", async () 
     if (url.pathname === "/api/biz/subscription/list") return ok([{ productName: "GLM Coding Pro", status: "VALID" }])
     if (url.pathname === "/api/monitor/usage/quota/limit") return ok({ level: "pro", limits: [{ type: "CREDIT_LIMIT", unit: 3, number: 5, percentage: 25 }] })
     if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(startBalance(now, "active"))
-    if (url.pathname === "/api/v1/zcode-plan/billing/preview") return ok(PREVIEW_CLAIMABLE)
+    if (url.pathname === "/api/v1/marketing/touch") return ok(TOUCH_TRUST)
   })
   const auth = oauth({ site: "zai", key: "k", jwt: token, device: "d" })
   const u = await usage(auth)
   expect(u.plan).toBe("GLM Coding Pro")
   expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "GLM-5.1-Trial · Start Plan", "Gift plans to claim in the ZCode app"])
   expect(u.windows.at(-1)).toEqual(TRUST_BUILD)
-  expect(calls.filter((c) => c.url.pathname.endsWith("/preview"))).toHaveLength(1)
+  expect(calls.filter((c) => c.url.pathname.endsWith("/marketing/touch"))).toHaveLength(1)
 })
 
 // #503: the same card line from the real marketing/touch reply
@@ -502,4 +510,20 @@ test("the real banner feed names its plan once on the card", async () => {
   const u = await usage(oauth({ site: "zai", jwt: token, device: "11111111-2222-4333-8444-555555555555" }))
   expect(u.windows.at(-1)).toEqual({ name: "Gift plans to claim in the ZCode app", used: 0, aside: true, display: "1 · ZCODE WEEKEND BUILD" })
   expect(calls.some((c) => c.url.pathname.endsWith("/claim"))).toBe(false)
+})
+
+test("a reset the list flags available but whose end has passed is not counted (nathan_ift_us on X: two cards shown, none owned)", async () => {
+  const list = { code: 200, data: {
+    fiveHourResets: [{ recordId: 0, grantType: "DIRECT", expireTime: "2020-11-08 23:59:59", available: true }],
+    weekResets: [{ recordId: 0, grantType: "DIRECT", expireTime: "2020-11-08 23:59:59", available: true }],
+  } }
+  serve(({ url }) => {
+    if (url.pathname === "/api/biz/subscription/list") return ok([])
+    if (url.pathname === "/api/monitor/usage/quota/limit") return ok({ level: "pro", limits: [] })
+    if (url.pathname === "/api/biz/customer-package-reset/list") return new Response(JSON.stringify(list))
+  })
+  const auth = oauth({ site: "bigmodel", base: "https://open.bigmodel.cn/api/anthropic", key: "glm-key" })
+  expect((await usage(auth)).resets).toBeUndefined()
+  list.data.weekResets.push({ available: true, expireTime: "2099-01-01 23:59:59" })
+  expect((await usage(auth)).resets).toMatchObject({ count: 1, fiveHour: 0, weekly: 1 })
 })

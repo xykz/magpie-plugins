@@ -546,6 +546,86 @@ async function bodyText(body) {
   return await new Response(body).text()
 }
 
+// ---- the thread a request belongs to ----------------------------------------------
+//
+// Zed's editor names every completion's thread and prompt: CompletionBody's
+// thread_id is the agent thread's id (a UUID made once per thread) and
+// prompt_id one made again for each message the user sends, the same
+// through the tool calls that answer it (zed crates/cloud_llm_client
+// CompletionBody, crates/agent thread.rs build_completion_request and
+// advance_prompt_id). The plugin sent neither, so to Zed's cloud every
+// request was a thread of its own; a Gemini 4 Argon conversation of 180k to
+// 230k tokens read no cache on any of 11 requests (plugins#731), where Zed
+// bills Argon's implicit cache hits for its own editor's threads.
+//
+// SESSION carries the conversation magpie (or OpenCode) names a request by,
+// from the chat.headers hook to the loader's fetch. It goes no further.
+const SESSION = "x-magpie-zed-session"
+
+// SALT is what the ids are derived with, so they say nothing of the session
+// or the words they were made from. New in each process.
+const SALT = crypto.randomBytes(16).toString("hex")
+
+// uuidOf is a version 4 UUID made of a hash's first 16 bytes: the shape of
+// the ids Zed's editor sends.
+function uuidOf(s) {
+  const b = Buffer.from(crypto.createHash("sha256").update(SALT + "|" + s).digest().subarray(0, 16))
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = b.toString("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+// textOf is the words a message's content says: a string, or its text parts
+// (Anthropic's and Chat's text blocks, Responses' input_text, Gemini's
+// parts). Tool results, images and calls say none.
+function textOf(content) {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .map((p) => (p && typeof p === "object" && typeof p.text === "string" && !p.thought && p.type !== "tool_result" ? p.text : ""))
+    .join("")
+}
+
+// prompts is what each message the user wrote says, in order, in the
+// request's own API: a turn carrying only tool results (Anthropic's user
+// turn of tool_result blocks, Gemini's functionResponse parts, Chat's tool
+// role, Responses' function_call_output) is the answer to a call, not a
+// message the user sent.
+function prompts(wire, req) {
+  let turns = []
+  if (wire === "gemini") turns = (Array.isArray(req.contents) ? req.contents : []).filter((c) => (c?.role ?? "user") === "user").map((c) => textOf(c.parts))
+  else if (wire === "responses") {
+    if (typeof req.input === "string") turns = [req.input]
+    else turns = (Array.isArray(req.input) ? req.input : []).filter((m) => m?.role === "user" && (m.type ?? "message") === "message").map((m) => textOf(m.content))
+  } else turns = (Array.isArray(req.messages) ? req.messages : []).filter((m) => m?.role === "user").map((m) => textOf(m.content))
+  return turns.filter((t) => t.trim())
+}
+
+// threadOf is the request's thread_id and prompt_id, as Zed's editor sends
+// them: the thread from the session magpie (or OpenCode) names, else from the
+// conversation's first user message, which every later turn repeats; the
+// prompt from the thread and how many messages the user has sent in it, so
+// the tool calls answering one message share its prompt_id and the next
+// message gets a new one. The account (its user id) is part of both, so one
+// conversation two accounts answer is a thread of each's own. {} when the
+// request names neither a session nor a user message.
+function threadOf(wire, req, session, who) {
+  const said = prompts(wire, req)
+  const key = session ? "session|" + session : said.length ? "first|" + said[0] : ""
+  if (!key) return {}
+  const thread = uuidOf("zed-thread|" + who + "|" + key)
+  return { thread_id: thread, prompt_id: uuidOf("zed-prompt|" + thread + "|" + said.length) }
+}
+
+// sessionOf takes the session a chat.headers hook named off the headers,
+// with the header: it goes no further than here.
+function sessionOf(headers) {
+  if (!headers) return ""
+  const h = new Headers(headers)
+  return String(h.get(SESSION) ?? "").trim().slice(0, 128)
+}
+
 // wireOf is the API a request was written in, from the path the AI SDK
 // sent it to, and the model named in a Gemini path.
 function wireOf(url) {
@@ -664,6 +744,17 @@ function providerRequest(wire, req, model) {
         const edits = Array.isArray(cm?.edits) ? cm.edits.filter((e) => e?.type === "compact_20260112") : []
         if (edits.length) req.context_management = { ...cm, edits }
         else delete req.context_management
+      }
+      // Zed's cloud parses thinking.display into its own enum too, which has
+      // only omitted and summarized: Claude Code's "updates" was answered 400
+      // "unknown variant `updates`, expected `omitted` or `summarized`"
+      // (gogoing1024, #708). "highlights" goes as summarized, the thinking
+      // still shown; "updates" or any other is left out, as Claude Code
+      // itself sends it again after Anthropic's API refuses one.
+      const th = req.thinking
+      if (th && typeof th === "object" && "display" in th && th.display !== "omitted" && th.display !== "summarized") {
+        if (th.display === "highlights") th.display = "summarized"
+        else delete th.display
       }
       // Zed's Anthropic request has no stream field: the cloud always streams
       delete req.stream
@@ -1032,6 +1123,7 @@ function responsesWhole(events) {
 function chatWhole(events) {
   let out = null
   const choices = []
+  const open = new Map() // "choice:index" -> the call being written there
   for (const ev of events) {
     out ??= { id: ev.id, object: "chat.completion", created: ev.created, model: ev.model }
     if (ev.usage) out.usage = ev.usage
@@ -1042,7 +1134,17 @@ function chatWhole(events) {
       if (d.reasoning_content) ch.message.reasoning_content = (ch.message.reasoning_content ?? "") + d.reasoning_content
       for (const t of d.tool_calls ?? []) {
         const calls = (ch.message.tool_calls ??= [])
-        const tc = (calls[t.index ?? 0] ??= { id: "", type: "function", function: { name: "", arguments: "" } })
+        // a new id at an index in use is a new call, not more of the open
+        // one: two calls at one index ran together as {"a"}{"b"}
+        // (plugins#930). No id, or the same one, goes on with it.
+        const key = `${c.index ?? 0}:${t.index ?? 0}`
+        let tc = open.get(key)
+        if (!tc || (t.id && tc.id && t.id !== tc.id)) {
+          tc = { id: "", type: "function", function: { name: "", arguments: "" } }
+          if (calls[t.index ?? 0]) calls.push(tc)
+          else calls[t.index ?? 0] = tc
+          open.set(key, tc)
+        }
         if (t.id) tc.id = t.id
         if (t.function?.name) tc.function.name += t.function.name
         if (t.function?.arguments) tc.function.arguments += t.function.arguments
@@ -1111,8 +1213,10 @@ async function complete(s, url, init) {
   if (!req || typeof req !== "object") return errorResponse(w.wire, 400, "an unreadable request")
   const id = w.model ?? String(req.model ?? "")
   const vendor = vendors.get(id) ?? WIRE_VENDOR[w.wire]
+  // read before providerRequest moves anything: the turns as the caller wrote them
+  const ids = threadOf(w.wire, req, sessionOf(init?.headers), s.userId ?? "")
   const { req: pr, stream = w.stream } = providerRequest(w.wire, req, id)
-  const body = JSON.stringify({ provider: vendor, model: id, provider_request: pr })
+  const body = JSON.stringify({ ...ids, provider: vendor, model: id, provider_request: pr })
   let res
   let renewed = false
   let moved = false
@@ -1241,6 +1345,13 @@ export async function ZedAuthPlugin({ client } = {}) {
         models: { ...Object.fromEntries(MODELS.map((m) => [m.id, entry(m)])), ...(was.models ?? {}) },
       }
     },
+    // the conversation a request belongs to, for the fetch below to name
+    // its thread by as Zed's editor does (threadOf). Zed's requests only.
+    "chat.headers": async (input, output) => {
+      const id = input?.model?.providerID ?? input?.provider?.info?.id
+      if (id !== PROVIDER || !input?.sessionID || !output?.headers) return
+      output.headers[SESSION] = String(input.sessionID).slice(0, 128)
+    },
     provider: {
       id: PROVIDER,
       // the models the account may call, as Zed's /models lists them now
@@ -1288,7 +1399,7 @@ export async function ZedAuthPlugin({ client } = {}) {
             if (!s) throw new Error("not signed in to Zed")
             s.save = save
             const url = input instanceof Request ? input.url : String(input)
-            if (input instanceof Request) init = { method: input.method, body: await input.text(), signal: input.signal, ...init }
+            if (input instanceof Request) init = { method: input.method, headers: input.headers, body: await input.text(), signal: input.signal, ...init }
             return complete(s, url, init)
           },
         }
@@ -1302,4 +1413,4 @@ export async function ZedAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { said, eventError, stateOf, parseModels, entry, model, providerRequest, wireOf, refusal, failedStatus, decrypt, padded, signedInWith, complete, vendors, tokens, lists, orgOf, planOf, picked, who, planName, usage }
+export const _internal = { said, eventError, stateOf, parseModels, entry, model, providerRequest, wireOf, refusal, failedStatus, decrypt, padded, signedInWith, complete, vendors, tokens, lists, orgOf, planOf, picked, who, planName, usage, threadOf, prompts, SESSION }

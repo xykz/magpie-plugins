@@ -46,7 +46,8 @@ authorization page: `device_id` and `machine_id` (32 hex). Every
 request then sends that same device. The relays saw requests dropped when the
 device was new each time. A Trae CN `device_id` is 16 digits since 0.2.16, the
 shape of the ids Trae's device service gives its clients (15 or 16 digits);
-Trae Global's stays 19.
+Trae Global's stays 19. The daily check-in goes on a 15-digit id made from it
+(see Daily check-in).
 
 ### Enterprise (SaaS) accounts
 
@@ -64,6 +65,20 @@ fields are kept with the sign-in; nothing sends them.
 **Not tried with a real enterprise account.** Which hosts and fields an
 enterprise sign-in sends back is not known yet; if yours doesn't work, open an
 issue with what the sign-in page showed.
+
+One enterprise sign-in has since been seen to name
+`console.enterprise.trae.cn` as the account's host, and its usage is read
+from that console (see Usage). The tenant and login-type fields are still
+kept and never sent.
+
+Such a seat chats on that console, where a chat bills the seat pool. Not
+every tenant's console takes chats: one that answers 4245 marks the
+account, and from then on it chats on the consumer gateway, which takes
+the same login but spends the login's own credits (#1127, #1155).
+
+The international deployment has an enterprise console too, at
+`console.enterprise.trae.ai`, and the same reading is done there — **not
+verified**, see Usage.
 
 ### The international realm's region
 
@@ -99,8 +114,13 @@ agent's `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`:
     title. One conversation answered by two accounts (magpie failing over, or
     rotating, inside it) is named twice then, as two conversations, so Trae
     never reads one account's conversation as another's; that costs the two
-    halves of such a conversation their single row. `request_id` is the
-    request's own, fresh on every one.
+    halves of such a conversation their single row. The id is a salted hash,
+    so it says nothing of the words it was made from; the salt is this
+    machine's own, made once in `~/.config/magpie/trae-session-salt`
+    (`MAGPIE_TRAE_SESSION_SALT` names another file), so a conversation keeps
+    its `session_id` when magpie restarts the plugin (on any update). If that
+    file can't be read or made, each run of the plugin has a salt of its own,
+    as before 0.2.32. `request_id` is the request's own, fresh on every one.
 - **Headers:** TRAE SOLO CN 0.1.69's (`x-ide-version`/`x-app-version`
   0.1.69, version code 20260917; Trae offers a model only to clients new
   enough for it): `Authorization: Cloud-IDE-JWT …`, `X-Cloudide-Token`,
@@ -117,7 +137,9 @@ agent's `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`:
     `prompt_cache_hit_tokens` and `cached_tokens` are read as cache reads
     too. A `token_usage` that names no cache count at all goes on with
     `magpie_cache_unknown: true`, so magpie shows the cache as unknown,
-    not as a 0% miss (0.2.26).
+    not as a 0% miss (0.2.26). So does one that counts 0 read and 0
+    written: Trae answers that while it bills the turn at its cache price
+    (0.2.31).
     `done`'s `finish_reason` `length`/`max_tokens` is OpenAI's `length`.
   - Queue events are ignored.
   - A `{"reasoning_content": …}` object written into the text is reasoning,
@@ -219,7 +241,20 @@ function does (`glm-5v-turbo`, `kimi-k2.5`, `minimax-m2.7`,
 `qwen-3.6-plus`, each answering through `solo_coder`). Left out are the
 IDE's helpers (`usage` other than
 `chat_completion`: summary, fast_apply…), configs switched off and the
-custom-model slots. Context is the list's `context_window_tokens.dev`,
+custom-model slots. An enterprise's own built-in models
+(`config_source` 2, "Enterprise-builtin" in Trae CN's picker) are listed
+since 0.2.41 (#1258), unless the admin switched one off (`status` false); a
+personal custom model (`config_source` 3) is not, its key being in the
+user's IDE only. A chat with an enterprise model carries `config_source`
+2, `is_custom_model` true, and the `model_name` and `provider` of its
+`model_detail_list` entry (its `__dev` one, else the first) at the top of the
+body, as Trae CN 3.4.20's own `llm_utils_chat` request does (0.2.43; 0.2.41
+put them under `user_message_context.model_info`, and an enterprise seat got
+4001 "the param is invalid" on every function; 0.2.42 read `provider` off the
+config, where Trae's list doesn't carry it, sent no `model_name`, and got
+4023 "something went wrong") — **not verified with a real enterprise seat**. A refused chat's error names
+the model, the functions tried and the host, and says when the account's
+list doesn't have the model. Context is the list's `context_window_tokens.dev`,
 output the `__dev` model's `max_tokens`. A model with a `__max` model and
 a bigger `context_window_tokens.max` is listed again as its Max,
 `<id>-max` ("… (Max)"), with that window and the `__max` model's
@@ -243,8 +278,13 @@ which levels it takes — its `reasoning_effort_config`, with the options
 names as `reasoning_effort`, so a level an agent picks is sent as Trae
 spells it: the plugin offers each model's own levels as `variants`
 (`low`/`high`/`xhigh` for `light`/`high`/`extra_high`; `medium` and `max`
-keep their names, offered only where the entry names them, as for DeepSeek
-V4.1 Flash's `max` in Trae's app), and sends nothing
+keep their names where the entry names them). A model whose top level is
+`extra_high` and that names no `max` — TRAE CN's DeepSeek-V4.1-Flash,
+GLM-5.3 and Kimi-K3, 轻/高/极高 in Trae's app — is offered `max` too, sent
+as `extra_high` (as `xhigh` is): 极高 is that model's max, so in a magpie
+routing group it ranges up to max beside members that have one, and a
+group set to max sends it `extra_high`. An entry naming Trae's own `max`
+keeps it, with `extra_high` as `xhigh`. The plugin sends nothing
 for a level the model doesn't name, or for a model whose entry names none —
 Trae then serves it at its own default. An entry naming levels this map
 can't spell offers none, rather than being sent one Trae would reject. A
@@ -349,6 +389,36 @@ page the realm bills on:
   total, with the share, which magpie shows as used or left like
   WorkBuddy's.
 
+**Trae CN, an enterprise (SaaS) account** — Trae's enterprise console, which
+bills in yuan rather than in the credits the consumer page counts:
+
+- **Source:** `console.enterprise.trae.cn/trae/gtm/tob/api/v1/config/get_personal_quota`
+  for the allowance and `…/get_user_model_usage` for the spend, both POST
+  with an empty body; `…/get_personal_core_data` for the period's
+  `ResetTime`; and the consumer credits page above for the second row.
+- **What it adds up:** the seat pool in yuan (`seat_pool_currency_quota`;
+  the console's pay-as-you-go sentinel is no limit), and the models' own
+  `total_cost_currency` summed — the console gives no total of its own. The
+  console answers an empty body with the current period's spend, which is
+  what the pool resets on; a real account's sum matches its usage page. Only
+  the account's own seat is counted: an administrator's answer carries every
+  seat in the tenant.
+- **What it shows:** a Seat Usage window, `¥used / ¥total` and the share,
+  resetting when the console says the period does, then a Credits window of
+  the consumer page's allowance, marked `aside`. A spend page that fails
+  leaves the row saying `? / ¥total` rather than reading as nothing spent.
+- **Which accounts:** the sign-in named `console.enterprise.trae.cn` as the
+  account's host. A personal account, and any account whose usage pages
+  answer nothing, is read as before.
+- **Why both:** the consumer page answers an enterprise account too, with a
+  credits allowance that real calls have been measured not to touch — two
+  calls through magpie moved the console's spend by ￥0.0002 each and left
+  the credits at 4.4 of 4700. The seat pool is what a request spends, so
+  the credits row is `aside`: magpie shows it without routing on it. Whether
+  the credits are a fallback the seat pool exhausts first is not known — no
+  account has spent its pool to find out. A failure on the credits page or
+  on the period leaves the seat pool standing.
+
 **Trae Global** — the dollar billing's entitlements:
 
 - **Source:** `POST api-sg-central.trae.ai/trae/api/v1/pay/user_current_entitlement_list`
@@ -358,6 +428,39 @@ page the realm bills on:
   (`basic_usage_amount`, `bonus_usage_amount`).
 - **What it shows:** one Dollar Usage window, the dollars used of the
   allowance, resetting when the pack ends.
+
+**Trae Global, an enterprise (SaaS) account** — the international
+deployment's own enterprise console, which bills in dollars:
+
+- **Source:** `console.enterprise.trae.ai/trae/gtm/tob/api/v1/config/get_personal_quota`
+  for the allowance, `…/get_user_model_usage` for the spend and
+  `…/get_personal_core_data` for the period, all POST with an empty body —
+  the three pages Trae CN's console has.
+- **What it adds up:** the seat pool (`seat_pool_currency_quota`; the
+  console's pay-as-you-go sentinel is no limit) and the models' own
+  `total_cost_currency` summed.
+- **What it shows:** one Seat Usage window, `$used / $total` and the share,
+  resetting when the console says the period does. The international realm
+  has no consumer credits page, so there is no second row.
+- **Which accounts:** the sign-in named `console.enterprise.trae.ai` as the
+  account's host. Any other account is read as before.
+
+**Not verified.** No international enterprise account was available to try
+this against, and `console.enterprise.trae.ai` answers another realm's token
+with 请先登录 — exactly as it answers no token at all, so whether it refuses
+the token or wants a console session of its own is not known either. What
+the paths and fields are was read off the international console's own build,
+which names `seat_pool_currency_quota`, the models' `total_cost_currency`
+and `ResetTime` as Trae CN's console does; whether such an account's console
+answers at all is not known. The Trae CN path above is the one that has been
+run against a real account.
+
+Because that is not known, this console is not allowed to mark the sign-in:
+its 401 is reported as the read's error and the account stays signed in,
+where Trae CN's console — measured to take the IDE's own token — does mark
+it. A console that wants a session of its own would otherwise mark every
+international enterprise account expired, and signing in again would not
+clear it.
 
 A 200 carrying an error code is shown as Trae's own message rather than as
 an empty answer.
@@ -427,14 +530,21 @@ answered it 9074 even with the client's headers.
   files — harmless if they differ, since a folder that isn't there, or a
   key that isn't named, is simply not read. A client started with its own
   `--user-data-dir` is not found: there is no list of those to read.
-- **Every other account's device (0.2.16):** its own device id, in the
-  client's shape. Trae CN answered a claim on the plugin's 19-digit id
-  9074, while the same account and token on a 16-digit id were taken
-  (magpie-community/plugins#194). An account signed in since 0.2.16 has a
-  16-digit id and checks in on it. One signed in before checks in on a
-  16-digit id made from its own device id and uid: the same id every day,
-  never rotated, and no other account's. Its chat requests and renewals
-  keep the 19-digit device it signed in with.
+- **Every other account's device (0.2.16, 15 digits since 0.2.30):** its
+  own device id, in the shape Trae CN takes. Trae CN answered a claim on the
+  plugin's 19-digit id 9074, while the same account and token on a
+  16-digit id were taken (magpie-community/plugins#194). On 2026-11-05 it
+  answered 16 digits 9074 too (plugins#709): with the plugin's own
+  headers and body, the same token and account, seconds apart, the
+  account's own 16-digit id got 9074 and a 15-digit one, even a random
+  one nothing had registered, was taken — on three accounts, from two
+  machines on two ISPs, and with wild-work's headers alike. So since
+  0.2.30 every account checks in on a 15-digit id made from its own device
+  id and uid (one already 15 digits goes as it is): the same id every day,
+  never rotated, never starting with 0, and no other account's. Its chat
+  requests and renewals keep the device it signed in with (16 digits, or
+  19 before 0.2.16): nothing measured asks for another there, and the
+  device is bound into the renewed sign-in.
 - **What comes back:** Trae's answer as it is. A 401 or code 1001 marks
   the account for a new sign-in. Code 9095 means this device has checked
   in today, and that holds for the day. Code 9074 means Trae did not take
@@ -448,10 +558,30 @@ answered it 9074 even with the client's headers.
   client on this machine is the one thing seen to change a 9074, but it
   hasn't been tried on a real account, so it isn't named in the message;
   nor is it named when the claim already rode a client's device, where it
-  would only tell the user to do what they did. No device id is ever
-  changed or rotated to get round a 9095 or a 9074, and no account is
-  given another account's device or its own client's device unless a
-  client is signed in as that account.
+  would only tell the user to do what they did. The account's own device
+  is never rotated: a 9095 is the day's answer, and a 9074 gets the one
+  claim more below, on the one id made from the uid, and nothing after
+  it. No account is given another account's device or its own client's
+  device unless a client is signed in as that account.
+- **A 9074 with no client here is claimed once more (0.2.29):** an
+  account no Trae CN client on this machine is signed in as gets one more
+  claim, at once, after a 9074, in the request that tools checking Trae
+  CN accounts in with no client send: luckymiaow/trae-mate's (MIT), as
+  iJetLi/dsh-providers-hub sends it too. Body `{}`, `x-user-region: CN`,
+  User-Agent `VSCode 1.107.1 (TRAE SOLO CN)`, its market, LSCBD and
+  session headers, and a 15-digit device id made from the uid alone
+  (trae-mate's `device_map.rs`), with none of the IDE's device headers.
+  On plugins#722 the account this plugin's claim got 9074 on checks in
+  daily through providers-hub, and on plugins#709 wild-work, which also
+  sends body `{}`, `x-user-region: CN` and a 15-digit id, had every claim
+  taken first time, so its 8-second retry never ran: waiting is not what
+  changes a 9074. plugins#709's bisect then found the id's length to be
+  what decides (16 refused, 15 taken, headers and body changing nothing),
+  and since 0.2.30 the first claim goes on 15 digits (above). This request
+  is kept as the fallback, since it wasn't measured with a 16-digit id, and
+  goes only once: a second 9074 is the day's answer,
+  no other code is claimed again, and an account whose own client's
+  device the claim rode is not. Not yet tried on a real Trae CN account.
 - **Which device, said (0.2.25):** a 9074 or 9095 message ends with
   the device the claim went on: this machine's Trae CN client's, signed in
   as the account, or magpie's own for it, with how many client profiles

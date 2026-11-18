@@ -7,7 +7,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { getEventListeners } from "node:events"
 import { CursorAuthPlugin, _internal } from "./index.mjs"
-import { NATIVE_LIMITS, nativeSessions, setWireTrace } from "./native-session.mjs"
+import { NATIVE_LIMITS, nativeSessions, setWebSearch, setWireTrace } from "./native-session.mjs"
 import { message, bin, text, uint, readWire, nest, number, string, envelope, update, end, tool, setBlob, getBlob, checkpoint, abortExec, readResult } from "./native-test-wire.mjs"
 
 const savedFetch = globalThis.fetch
@@ -53,10 +53,11 @@ const choice = (response) => response.body.choices[0]
 // make the second call or final answer succeed.
 async function agent(options = {}) {
   const firstID = options.omitZeroID ? 0 : 7
-  const a = { histories: [], runs: [], started: [], events: [], dashboardRequests: [], results: [], closes: [], unavailable: [], kv: [], errors: [], sessions: new Set(), timers: [], closedStreams: 0 }
+  const a = { histories: [], runs: [], started: [], events: [], dashboardRequests: [], results: [], closes: [], unavailable: [], kv: [], errors: [], allowed: [], answers: [], sessions: new Set(), timers: [], closedStreams: 0 }
   a.server = http2.createServer()
   a.server.on("session", (s) => { a.sessions.add(s); s.on("error", () => {}); s.on("close", () => a.sessions.delete(s)) })
-  a.server.on("stream", (stream) => {
+  a.server.on("stream", (stream, headers) => {
+    a.allowed.push(headers["x-cursor-agent-allowed-tools"])
     stream.on("error", () => {})
     stream.on("close", () => a.closedStreams++)
     stream.respond({ ":status": 200, "content-type": "application/connect+proto" })
@@ -110,6 +111,28 @@ async function agent(options = {}) {
         send(update(1, text(1, options.toolDisplay.slice(0, at))))
         send(update(1, text(1, options.toolDisplay.slice(at))))
       }
+      if (options.search) {
+        // plugins#635: Cursor's own web search, as cursor-agent's agent.v1
+        // has it: the call (ToolCall.web_search_tool_call, 18) being
+        // written, then InteractionQuery {id 1, web_search_request_query 2
+        // (or another kind's field), args: search_term 1, tool_call_id 2}
+        // as AgentServerMessage.interaction_query (7); the search is run
+        // once the client answers (AgentClientMessage.interaction_response, 6)
+        const q = options.search
+        const args = message(text(1, q.term), text(2, "ws1"))
+        const call = (n, result) => update(n, message(text(1, "ws1"), bin(2, bin(18, message(bin(1, args), ...(result ? [bin(2, result)] : []))))))
+        send(call(7))
+        if (q.shell) send(envelope(bin(2, message(uint(1, 78), bin(12, text(1, "synthetic shell request"))))))
+        send(envelope(bin(7, message(uint(1, 3), bin(q.query ?? 2, bin(1, args))))))
+        a.searched = () => {
+          send(call(3, bin(1, bin(1, message(text(1, q.ref), text(2, "https://" + q.ref + ".invalid"))))))
+          if (q.fail) return stream.end(envelope(Buffer.from(JSON.stringify({ error: { code: "resource_exhausted", message: "synthetic failure" } })), 2))
+          send(update(1, text(1, "searched answer")))
+          send(update(14, message(uint(1, 5), uint(2, 3))))
+          stream.end(end())
+        }
+        return
+      }
       if (options.unsupportedExec) { send(envelope(bin(2, message(uint(1, 77), bin(12, text(1, "synthetic shell request")))))); return }
       if (options.thinkingOnly) return
       if (options.conflictingCount) {
@@ -149,6 +172,7 @@ async function agent(options = {}) {
     const advance = () => {
       const expected = phase === 0 && options.parallel ? [firstID, 8] : [phase === 0 ? firstID : 8]
       if (!expected.every((id) => closed.has(id))) return
+      if (options.stepUsages?.[phase]) send(update(31, options.stepUsages[phase]))
       if (phase === 0 && !options.parallel && !options.finalAfterFirst) {
         marker = received.get(firstID).content[0].text
         phase = 1
@@ -170,6 +194,7 @@ async function agent(options = {}) {
       if (options.halfFinal) { send(update(1, text(1, "half said"))); return }
       send(update(4, text(1, "native final thinking")))
       send(update(1, text(1, marker)))
+      if (options.stepUsages?.[2]) send(update(31, options.stepUsages[2]))
       const usage = options.turnUsage ?? (options.zeroUsage ? message(uint(1, 0), uint(2, 0), uint(5, 0)) : message(uint(1, 23), uint(2, 7), uint(3, 10), uint(4, 0), uint(5, 4)))
       send(update(14, usage))
       state(false, true) // late state after TurnEnded must still be retained
@@ -209,6 +234,7 @@ async function agent(options = {}) {
               continue
             }
             const id = number(close.data, 1)
+            if (options.search && id === 78) { a.closes.push(id); continue }
             if (options.unsupportedExec && id === 77 || (options.name === "unregistered" || options.provider === "foreign" || options.approval) && id === firstID) {
               send(update(1, text(1, "continued after unavailable")))
               send(update(14, message(uint(1, 5), uint(2, 3))))
@@ -220,6 +246,9 @@ async function agent(options = {}) {
             closed.add(id)
             a.closes.push(id)
             advance()
+          } else if (fs.some((f) => f.no === 6)) {
+            a.answers.push(nest(b, 6))
+            a.searched?.()
           } else if (fs.some((f) => f.no === 3)) {
             const kv = nest(b, 3)
             const id = number(kv, 1)
@@ -312,6 +341,7 @@ test("native accounting: a multi-step turn's final step reports its own share, t
   const final = await a.ask(account, continueWith(next, second.body, ["two"]))
   expect(final.status).toBe(200)
   expect(a.runs).toHaveLength(1)
+  expect(number(a.runs[0], 37)).toBe(1) // emit_model_call_usage
   const u = final.body.usage, d = u.magpie_deferred
   // three model calls: none is more than half the turn
   expect(u.prompt_tokens).toBeLessThan(1105934 / 2)
@@ -322,6 +352,37 @@ test("native accounting: a multi-step turn's final step reports its own share, t
   expect(u.prompt_tokens_details.cache_write_tokens + d.cache_write_tokens).toBe(70156)
   expect(u.completion_tokens + d.completion_tokens).toBe(2100)
   expect(u.completion_tokens_details.reasoning_tokens).toBeLessThanOrEqual(u.completion_tokens)
+})
+
+test("native accounting: ModelCallCompletedUpdate (31) gives the final step its exact context and defers the rest (#156)", async () => {
+  // Three model calls: 50K -> 55K -> 61K context; TurnEndedUpdate sums all three (166K).
+  const stepUsages = [
+    message(text(1, "mc-1"), uint(2, 50000), uint(3, 600), uint(4, 25000), uint(5, 24990), uint(6, 200)),
+    message(text(1, "mc-2"), uint(2, 55000), uint(3, 800), uint(4, 50000), uint(5, 4990), uint(6, 300)),
+    message(text(1, "mc-3"), uint(2, 61000), uint(3, 700), uint(4, 55000), uint(5, 5980), uint(6, 400)),
+  ]
+  const turnUsage = message(uint(1, 166000), uint(2, 2100), uint(3, 130000), uint(4, 35960), uint(5, 900))
+  const a = await agent({ stepUsages, turnUsage }), account = auth(), chat = initial()
+  const first = await a.ask(account, chat)
+  const next = continueWith(chat, first.body, ["one"])
+  const second = await a.ask(account, next)
+  const final = await a.ask(account, continueWith(next, second.body, ["two"]))
+  expect(final.status).toBe(200)
+  expect(a.runs).toHaveLength(1)
+  expect(number(a.runs[0], 37)).toBe(1)
+  expect(final.body.usage).toEqual({
+    prompt_tokens: 61000,
+    completion_tokens: 700,
+    total_tokens: 61700,
+    prompt_tokens_details: { cached_tokens: 55000, cache_write_tokens: 5980 },
+    completion_tokens_details: { reasoning_tokens: 400 },
+    magpie_deferred: {
+      prompt_tokens: 105000,
+      completion_tokens: 1400,
+      cached_tokens: 75000,
+      cache_write_tokens: 29980,
+    },
+  })
 })
 
 test("native retention: Task parent awaiting results permits a child sharing session with different first user", async () => {
@@ -476,7 +537,7 @@ test("native retention: cross-account continuation rebuilds history without writ
   expect(owner.state).toBe("awaiting-results")
 })
 
-for (const kind of ["same first user", "different tools", "pending ancestor", "new input"]) test(`native retention: busy owner with ${kind} falls back without cancelling its live parent`, async () => {
+for (const kind of ["same first user", "different tools", "pending ancestor"]) test(`native retention: busy owner with ${kind} falls back without cancelling its live parent`, async () => {
   const a = await agent(), account = auth(), chat = initial()
   const first = await a.ask(account, chat)
   const owner = [...nativeSessions.entries][0]
@@ -487,7 +548,6 @@ for (const kind of ["same first user", "different tools", "pending ancestor", "n
     branch.messages.push(choice(first).message, { role: "user", content: "child request includes a pending parent Task" })
     marker = "Tool use was interrupted and did not produce a result."
   }
-  if (kind === "new input") { branch = continueWith(chat, first.body, ["already-provided"]); branch.messages.push({ role: "user", content: "branch on new input" }); marker = "already-provided" }
   rebuilt(await a.ask(account, branch), marker)
   expect(owner.state).toBe("awaiting-results")
   expect(owner.error).toBeUndefined()
@@ -498,6 +558,58 @@ for (const kind of ["same first user", "different tools", "pending ancestor", "n
   expect(second.status).toBe(200)
   expect(a.results).toHaveLength(1)
   expect(a.runs).toHaveLength(2)
+})
+
+// Claude Code's reminders: a tool result with text beside it reaches the
+// plugin as the tool message, then a user message (magpie's chat.go).
+const withNewInput = (chat, reply, values, text) => {
+  const next = continueWith(chat, reply, values)
+  next.messages.push({ role: "user", content: text })
+  return next
+}
+
+test("native retention: new input past a busy owner gets an owner of its own and leaves the parent's reservation", async () => {
+  const a = await agent({ finalAfterFirst: true }), account = auth(), chat = initial()
+  const first = await a.ask(account, chat)
+  const parent = [...nativeSessions.entries][0]
+  const key = parent.account + ":" + parent.selector
+  const branch = withNewInput(chat, first.body, ["already-provided"], "branch on new input")
+  const res = await a.ask(account, branch)
+  expect(res.status).toBe(200)
+  expect(choice(res).message.content).toContain("rebuilt:already-provided")
+  expect(res.diagnostic).toMatch(/^same-run;/)
+  expect(nativeSessions.entries.size).toBe(2)
+  expect(nativeSessions.selectors.get(key)).toBe(parent)
+  expect(parent.state).toBe("awaiting-results")
+  expect(parent.error).toBeUndefined()
+  expect(parent.transportClosed).not.toBe(true)
+  expect(a.results).toEqual([])
+  expect(a.runs).toHaveLength(2)
+  const second = await a.ask(account, continueWith(chat, first.body, ["parent result"]))
+  expect(second.status).toBe(200)
+  expect(second.diagnostic).toMatch(/^same-run;/)
+  expect(choice(second).message.content).toBe("parent result")
+  expect(a.results).toHaveLength(1)
+  expect(a.runs).toHaveLength(2)
+})
+
+test("native retention: an owner past a busy reservation is resumed by its own calls' results", async () => {
+  const a = await agent({ finalAfterFirst: true, toolRuns: [1, 2] }), account = auth(), chat = initial()
+  const first = await a.ask(account, chat)
+  const parent = [...nativeSessions.entries][0]
+  const branch = withNewInput(chat, first.body, ["already-provided"], "the user hasn't heard from you")
+  const step = await a.ask(account, branch)
+  expect(step.status).toBe(200)
+  expect(choice(step).finish_reason).toBe("tool_calls")
+  const own = [...nativeSessions.entries].find((e) => e !== parent)
+  expect(choice(step).message.tool_calls[0].id).toContain(own.identity)
+  const next = await a.ask(account, continueWith(branch, step.body, ["its own result"]))
+  expect(next.status).toBe(200)
+  expect(next.diagnostic).toMatch(/^same-run;/)
+  expect(choice(next).message.content).toBe("its own result")
+  expect(a.results.map((r) => r.content[0].text)).toEqual(["its own result"])
+  expect(a.runs).toHaveLength(2)
+  expect(parent.state).toBe("awaiting-results")
 })
 
 for (const bound of ["perAccount", "perProcess"]) test(`native retention: ${bound} capacity selects production stateless fallback`, async () => {
@@ -536,7 +648,11 @@ test("native retention: terminal old handles do not wedge a new user turn", asyn
   const final = await a.ask(account, next)
   expect(final.status).toBe(200)
   next.messages.push(choice(final).message, { role: "user", content: "new turn after terminal owner" })
-  rebuilt(await a.ask(account, next), "finished-tool")
+  // every old call has its result, so the new turn gets a native owner of its own
+  const fresh = await a.ask(account, next)
+  expect(fresh.status).toBe(200)
+  expect(choice(fresh).message.content).toContain("rebuilt:finished-tool")
+  expect(fresh.diagnostic).toMatch(/^same-run;/)
   expect(a.runs).toHaveLength(2)
   expect(a.results).toHaveLength(1)
 })
@@ -1489,6 +1605,159 @@ test("native accounting: missing E1 stays bounded past authoritative E2 and a la
   expect(a.errors).toEqual([])
 })
 
+test("native accounting: a parent lost after an owner past its reservation started never collects that owner's event", async () => {
+  const a = await agent({ rebuildUsage: NATIVE_FINAL_USAGE })
+  const account = auth(), chat = initial()
+  const first = await a.ask(account, chat)
+  expect(first.body.usage).toMatchObject({ total_tokens: 0, magpie_native: { accounting: "pending" } })
+  const parent = [...nativeSessions.entries][0]
+  const earlier = eventFor(a, 0, EARLIER_USAGE)
+  const key = _internal.usageKey(account.access, earlier.conversationId)
+  await afterEvent(earlier)
+  const branch = withNewInput(chat, first.body, ["already-provided"], "new input past the busy parent")
+  const second = await a.ask(account, branch)
+  expect(second.diagnostic).toMatch(/^same-run;/)
+  expect(second.body.usage).toMatchObject({ prompt_tokens: 215, completion_tokens: 5, total_tokens: 220 })
+  expect(second.body.usage.magpie_deferred).toBeUndefined()
+  // the branch's own event shows; the parent's never does
+  const later = eventFor(a, 1, LATER_USAGE)
+  await afterEvent(later)
+  a.events.push(later)
+  await parent.cancel("the parent is lost after its branch began")
+  // owed once, at the branch's start, and bounded before it
+  expect(_internal.owed.get(key)?.n).toBe(1)
+  expect(Math.max(..._internal.owed.get(key).groups.map((g) => g.before))).toBeLessThanOrEqual(a.started[1])
+  NATIVE_LIMITS.perProcess = 0
+  const thirdChat = { ...branch, messages: [...branch.messages, choice(second).message, { role: "user", content: "E3 while the parent's event is missing" }] }
+  const third = await a.ask(account, thirdChat)
+  expect(third.status).toBe(200)
+  expect(third.diagnostic).toMatch(/^stateless;/)
+  expect(third.body.usage.magpie_deferred).toBeUndefined()
+  expect(_internal.owed.get(key)?.n).toBe(1)
+  a.events.push(earlier)
+  const fourth = await a.ask(account, thirdChat)
+  expect(fourth.body.usage.magpie_deferred).toEqual(EARLIER_DEFERRED)
+  expect(_internal.owed.has(key)).toBe(false)
+  expect(a.results).toEqual([])
+  expect(a.errors).toEqual([])
+})
+
+// A session that ends while a parent still waits out resultWait: nothing
+// after the unreserved Run would collect what the parent owes at abandon.
+test("native accounting: a parent waiting behind an owner past its reservation is collected by that owner, once", async () => {
+  const a = await agent({ rebuildUsage: NATIVE_FINAL_USAGE })
+  const account = auth(), chat = initial()
+  const first = await a.ask(account, chat)
+  const parent = [...nativeSessions.entries][0]
+  const earlier = eventFor(a, 0, EARLIER_USAGE)
+  const key = _internal.usageKey(account.access, earlier.conversationId)
+  await afterEvent(earlier)
+  a.events.push(earlier) // stamped before the branch begins, as all 61 were
+  const branch = withNewInput(chat, first.body, ["already-provided"], "the user hasn't heard from you")
+  const second = await a.ask(account, branch)
+  expect(second.diagnostic).toMatch(/^same-run;/)
+  expect(parent.state).toBe("awaiting-results")
+  expect(second.body.usage).toMatchObject({ prompt_tokens: 215, completion_tokens: 5, magpie_deferred: EARLIER_DEFERRED })
+  expect(_internal.owed.has(key)).toBe(false)
+  // the session ends here: the parent runs out its result wait, owing nothing more
+  parent.fail({ status: 410, message: "native tool-result deadline expired" }, "expired")
+  expect(_internal.owed.has(key)).toBe(false)
+  NATIVE_LIMITS.perProcess = 0
+  const later = await a.ask(account, { ...branch, messages: [...branch.messages, choice(second).message, { role: "user", content: "after the parent expired" }] })
+  expect(later.diagnostic).toMatch(/^stateless;/)
+  expect(later.body.usage.magpie_deferred).toBeUndefined()
+  expect(a.results).toEqual([])
+  expect(a.errors).toEqual([])
+})
+
+// Cursor adds each step to a Run's one event as the step ends, seconds
+// later at times. A parent holding an earlier debt it collected hands it
+// over with its step: the later Run asks at once for that debt, and must
+// not take the parent's event before its last step is in it.
+test("native accounting: a handed-over parent's event is collected only once its last step is in it", async () => {
+  const partial = { inputTokens: 5, outputTokens: 2, cacheReadTokens: 40, cacheWriteTokens: 0 }
+  const whole = { inputTokens: 6, outputTokens: 4, cacheReadTokens: 90, cacheWriteTokens: 1 }
+  let parentEvent = null
+  const a = await agent({ toolRuns: [1, 2], rebuildUsage: NATIVE_FINAL_USAGE, dashboard: async (fake) => {
+    const events = [...fake.events]
+    // the parent's last step shows 600 ms after the branch began
+    if (parentEvent) events.push({ ...parentEvent, tokenUsage: fake.runs.length >= 3 && Date.now() - fake.started[2] >= 600 ? whole : partial })
+    return Response.json({ usageEventsDisplay: events })
+  } })
+  const account = auth(), chat = initial()
+  // R0 hands off and is lost: it owes E0
+  const first = await a.ask(account, chat)
+  await [...nativeSessions.entries][0].cancel("R0 is lost")
+  const earlier = eventFor(a, 0, EARLIER_USAGE)
+  const key = _internal.usageKey(account.access, earlier.conversationId)
+  expect(_internal.owed.get(key)?.n).toBe(1)
+  await afterEvent(earlier)
+  a.events.push(earlier)
+  // the next turn's owner collects E0 in the background, then waits on its own call
+  const turn = { ...chat, messages: [...continueWith(chat, first.body, ["R0 result"]).messages, { role: "user", content: "next turn" }] }
+  const step = await a.ask(account, turn)
+  expect(step.diagnostic).toMatch(/^same-run;/)
+  expect(choice(step).finish_reason).toBe("tool_calls")
+  const parent = [...nativeSessions.entries].find((e) => e.state === "awaiting-results")
+  for (const deadline = Date.now() + 3000; _internal.owed.has(key) && Date.now() < deadline;) await new Promise((r) => setTimeout(r, 10))
+  expect(_internal.owed.has(key)).toBe(false)
+  parentEvent = eventFor(a, 1, partial)
+  await afterEvent(parentEvent)
+  const branch = withNewInput(turn, step.body, ["already-provided"], "the user hasn't heard from you")
+  const second = await a.ask(account, branch)
+  expect(second.diagnostic).toMatch(/^same-run;/)
+  expect(parent.state).toBe("awaiting-results")
+  // E0 and the parent's whole event: 118 + 97 in, 3 + 4 out
+  expect(second.body.usage).toMatchObject({ prompt_tokens: 215, completion_tokens: 5, magpie_deferred: { prompt_tokens: 215, completion_tokens: 7, cached_tokens: 190, cache_write_tokens: 8 } })
+  expect(_internal.owed.has(key)).toBe(false)
+  parent.fail({ status: 410, message: "native tool-result deadline expired" }, "expired")
+  expect(_internal.owed.has(key)).toBe(false)
+  expect(a.results).toEqual([])
+  expect(a.errors).toEqual([])
+})
+
+// Owed at the branch's start, the parent can still be resumed by its own
+// result: its final, the whole turn's, must not count that step again.
+const PARENT_STEP_USAGE = { inputTokens: 5, outputTokens: 2, cacheReadTokens: 4, cacheWriteTokens: 0 }
+const sumOf = (u) => {
+  const d = u.magpie_deferred ?? { prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0, cache_write_tokens: 0 }
+  return { prompt: u.prompt_tokens + d.prompt_tokens, output: u.completion_tokens + d.completion_tokens, cached: u.prompt_tokens_details.cached_tokens + d.cached_tokens }
+}
+for (const when of ["after the branch collected it", "before anything collected it"]) test(`native accounting: a parent resumed ${when} counts its step once`, async () => {
+  const a = await agent({ finalAfterFirst: true, rebuildUsage: NATIVE_FINAL_USAGE })
+  const account = auth(), chat = initial()
+  const first = await a.ask(account, chat)
+  const parent = [...nativeSessions.entries][0]
+  const step = eventFor(a, 0, PARENT_STEP_USAGE)
+  const key = _internal.usageKey(account.access, step.conversationId)
+  await afterEvent(step)
+  const collected = when === "after the branch collected it"
+  if (collected) a.events.push(step)
+  const second = await a.ask(account, withNewInput(chat, first.body, ["already-provided"], "the user hasn't heard from you"))
+  expect(second.diagnostic).toMatch(/^same-run;/)
+  if (collected) {
+    expect(second.body.usage.magpie_deferred).toEqual({ prompt_tokens: 9, completion_tokens: 2, cached_tokens: 4, cache_write_tokens: 0 })
+    expect(_internal.owed.has(key)).toBe(false)
+  } else {
+    expect(second.body.usage.magpie_deferred).toBeUndefined()
+    expect(_internal.owed.get(key)?.n).toBe(1)
+  }
+  const resumed = await a.ask(account, continueWith(chat, first.body, ["parent result"]))
+  expect(resumed.diagnostic).toMatch(/^same-run;/)
+  expect(choice(resumed).message.content).toBe("parent result")
+  expect(parent.state).toBe("complete")
+  // the turn's TurnEnded: 13 uncached + 10 read in, 7 out
+  expect(sumOf(resumed.body.usage)).toEqual(collected ? { prompt: 14, output: 5, cached: 6 } : { prompt: 23, output: 7, cached: 10 })
+  expect(_internal.owed.has(key)).toBe(false)
+  if (!collected) a.events.push(step) // its event shows only now
+  NATIVE_LIMITS.perProcess = 0
+  const later = await a.ask(account, { ...chat, messages: [...continueWith(chat, first.body, ["parent result"]).messages, choice(resumed).message, { role: "user", content: "next turn" }] })
+  expect(later.diagnostic).toMatch(/^stateless;/)
+  expect(later.body.usage.magpie_deferred).toBeUndefined()
+  expect(a.results).toHaveLength(1)
+  expect(a.errors).toEqual([])
+})
+
 test("native accounting: an event exactly at native start remains unknown and bounded debt expires", async () => {
   NATIVE_LIMITS.perProcess = 0
   const clock = Date.now
@@ -1605,7 +1874,11 @@ for (const path of ["native", "stateless"]) {
     const sse = await sseOf(response)
     expect(Date.now() - started).toBeLessThan(1000)
     expect(sse).toContain("native planning one")
-    expect(sse).toContain("Cursor went quiet: no message for 0 s, its last message thinking (try again)")
+    expect(sse).toContain("Cursor went quiet: no message for 0 s, its last message thinking; stream timed out (try again)")
+    const errors = sse.split("\n\n").filter((s) => s.startsWith("data: {")).map((s) => JSON.parse(s.slice(6)).error).filter(Boolean)
+    expect(errors).toHaveLength(1)
+    expect(errors[0].message).toMatch(piRetries)
+    expect(errors[0].message).toMatch(magpiePassing)
     expect(sse).not.toContain("[DONE]")
     await until(() => a.closedStreams === 1)
   })
@@ -1620,6 +1893,11 @@ for (const path of ["native", "stateless"]) {
     const sse = await sseOf(response)
     const [, beats] = sse.match(/Cursor went quiet: (\d+) heartbeats and nothing else for \d+ s, its last message thinking/) ?? []
     expect(Number(beats)).toBeGreaterThan(0)
+    const errors = sse.split("\n\n").filter((s) => s.startsWith("data: {")).map((s) => JSON.parse(s.slice(6)).error).filter(Boolean)
+    expect(errors).toHaveLength(1)
+    expect(errors[0].message).toMatch(piRetries)
+    expect(errors[0].message).toMatch(magpiePassing)
+    expect(sse).not.toContain("[DONE]")
     await until(() => a.closedStreams === 1)
   })
 }
@@ -1643,8 +1921,8 @@ for (const path of ["native", "stateless"]) {
       const chat = initial({ stream: true, messages: [{ role: "user", content: "prompt " + secret }] })
       const sse = await sseOf(await a.ask(account, chat, { input }))
       expect(sse).toMatch(path === "native"
-        ? /Cursor went quiet: \d+ heartbeats and nothing else for \d+ s, its last message checkpoint #1 of the Run, the first of step 1, after blob request ×2, thinking \(try again\)/
-        : /Cursor went quiet: \d+ heartbeats and nothing else for \d+ s, its last message checkpoint #1 of the Run, after blob request ×2, thinking \(try again\)/)
+        ? /Cursor went quiet: \d+ heartbeats and nothing else for \d+ s, its last message checkpoint #1 of the Run, the first of step 1, after blob request ×2, thinking; stream timed out \(try again\)/
+        : /Cursor went quiet: \d+ heartbeats and nothing else for \d+ s, its last message checkpoint #1 of the Run, after blob request ×2, thinking; stream timed out \(try again\)/)
       await until(() => a.closedStreams === 1)
       const files = readdirSync(join(dir, "cursor-traces"))
       expect(files).toHaveLength(1)
@@ -1686,6 +1964,119 @@ test("native: Wire trace is off unless the option is on (plugins#550)", async ()
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// plugins#635: the web-search test switch. Off, Cursor's own search is
+// turned away as before: not allowed in the header, and its query fails a
+// native Run or goes unanswered on a stateless one. On, the search alone is
+// let through and approved, and the Run's trace is saved, in shape only.
+const NO_SEARCH = "mcp_tool_call,get_mcp_tools_tool_call"
+const searchFixture = (secret, extra = {}) => ({ search: { term: "term " + secret, ref: "ref-" + secret, ...extra } })
+const traces = (dir) => {
+  try {
+    return readdirSync(join(dir, "cursor-traces"))
+  } catch {
+    return []
+  }
+}
+for (const path of ["native", "stateless"]) {
+  test(`${path}: with the web-search switch off, Cursor's search is refused as before (plugins#635)`, async () => {
+    Object.assign(NATIVE_LIMITS, { idle: 150 })
+    if (path === "stateless") NATIVE_LIMITS.perProcess = 0
+    const a = await agent(searchFixture("off"))
+    const dir = mkdtempSync(join(tmpdir(), "cursor-search-"))
+    try {
+      const input = { directory: dir, magpie: { option: () => false } }
+      const result = await a.ask(auth(), initial(), { input })
+      expect(result.status).toBe(502)
+      expect(result.body.error.message).toContain(path === "native" ? "unsupported native interaction query" : "Cursor went quiet")
+      expect(a.allowed.length).toBeGreaterThan(0)
+      expect(a.allowed.every((h) => h === NO_SEARCH)).toBe(true)
+      expect(a.answers).toEqual([])
+      expect(readdirSync(dir)).toEqual([])
+    } finally {
+      setWebSearch("")
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  for (const outcome of ["succeeds", "fails"]) test(`${path}: with the web-search switch on, the search is approved, other tools refused, and a Run that ${outcome} saves its trace with no text (plugins#635)`, async () => {
+    if (path === "stateless") NATIVE_LIMITS.perProcess = 0
+    const secret = "SECRET-" + randomUUID()
+    const a = await agent(searchFixture(secret, { shell: true, fail: outcome === "fails" }))
+    const dir = mkdtempSync(join(tmpdir(), "cursor-search-"))
+    try {
+      const account = auth()
+      // Wire trace stays off: the switch alone saves the trace
+      const input = { directory: dir, magpie: { option: (id, key) => id === "cursor" && key === "web_search_test" } }
+      const chat = initial({ messages: [{ role: "user", content: "prompt " + secret }] })
+      const result = await a.ask(account, chat, { input })
+      if (outcome === "succeeds") {
+        expect(result.status).toBe(200)
+        expect(choice(result).message.content).toBe("searched answer")
+      } else expect(result.status).toBeGreaterThanOrEqual(400)
+      expect(a.allowed[0]).toBe(NO_SEARCH + ",web_search_tool_call")
+      // InteractionResponse {id 3, web_search_request_response 2 {approved 1 {}}}
+      expect(a.answers).toHaveLength(1)
+      expect(number(a.answers[0], 1)).toBe(3)
+      expect(readWire(a.answers[0]).map((f) => f.no)).toEqual([1, 2])
+      expect(readWire(nest(a.answers[0], 2)).map((f) => f.no)).toEqual([1])
+      expect(nest(nest(a.answers[0], 2), 1)).toHaveLength(0)
+      // Cursor's shell is still turned away
+      expect(a.unavailable).toHaveLength(1)
+      expect(a.closes).toContain(78)
+      await until(() => traces(dir).length > 0)
+      const files = traces(dir)
+      expect(files).toHaveLength(1)
+      const raw = readFileSync(join(dir, "cursor-traces", files[0]), "utf8")
+      for (const word of [secret, "searched answer", "synthetic shell", "invalid", account.access, account.accountId, "synthetic-", "Bearer", "fixture-session"]) expect(raw).not.toContain(word)
+      const t = JSON.parse(raw)
+      expect(t).toMatchObject({ trace: 1, path, model: "fixture-model" })
+      if (outcome === "succeeds") expect(t.error).toBeUndefined()
+      else expect(t.error.status).toBeGreaterThanOrEqual(400)
+      expect(t.frames.some((f) => f.dir === "in" && f.kind === "message #7")).toBe(true)
+      expect(t.frames.some((f) => f.event === "web search")).toBe(true)
+      expect(t.frames.some((f) => f.dir === "out" && f.fields?.[0]?.[0] === 6)).toBe(true)
+    } finally {
+      setWebSearch("")
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${path}: with the web-search switch on, a Run in which Cursor never searched saves nothing (plugins#635)`, async () => {
+    if (path === "stateless") NATIVE_LIMITS.perProcess = 0
+    const a = await agent({ finalOnly: true })
+    const dir = mkdtempSync(join(tmpdir(), "cursor-search-"))
+    try {
+      const input = { directory: dir, magpie: { option: (id, key) => id === "cursor" && key === "web_search_test" } }
+      const result = await a.ask(auth(), initial(), { input })
+      expect(result.status).toBe(200)
+      expect(a.allowed[0]).toBe(NO_SEARCH + ",web_search_tool_call")
+      expect(traces(dir)).toEqual([])
+    } finally {
+      setWebSearch("")
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${path}: with the web-search switch on, another interaction query is refused as before and saves nothing (plugins#635)`, async () => {
+    Object.assign(NATIVE_LIMITS, { idle: 150 })
+    if (path === "stateless") NATIVE_LIMITS.perProcess = 0
+    // InteractionQuery.web_fetch_request_query (9)
+    const a = await agent(searchFixture("fetch", { query: 9 }))
+    const dir = mkdtempSync(join(tmpdir(), "cursor-search-"))
+    try {
+      const input = { directory: dir, magpie: { option: (id, key) => id === "cursor" && key === "web_search_test" } }
+      const result = await a.ask(auth(), initial(), { input })
+      expect(result.status).toBe(502)
+      expect(result.body.error.message).toContain(path === "native" ? "unsupported native interaction query" : "Cursor went quiet")
+      expect(a.answers).toEqual([])
+      expect(traces(dir)).toEqual([])
+    } finally {
+      setWebSearch("")
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
 
 test("stateless: a call with no count, then silence, is an error, not a step of tool calls (#2672)", async () => {
   Object.assign(NATIVE_LIMITS, { idle: 150, perProcess: 0 })

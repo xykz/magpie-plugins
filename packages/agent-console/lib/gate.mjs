@@ -15,14 +15,20 @@
 //   1. The plugin host's server() creates the key and token; once the gate binds its port it writes page/session.js (port and key only).
 //   2. The plugin page (sandbox iframe) reads session.js and navigates itself to http://127.0.0.1:<port>/open?k=<key>.
 //      This is an ordinary navigation: no Origin header, and the gate returns no CORS headers, so other pages can't read the response.
-//   3. The gate checks the key, starts (or reuses) the daemon and 302s to http://127.0.0.1:<daemonPort>/?<theme params>#t=<token>.
+//   3. The gate checks the key, starts (or reuses) the daemon and 302s to its own wrapper page
+//      http://127.0.0.1:<port>/app?<theme params>#t=<token>&p=<daemonPort>, which frames http://127.0.0.1:<daemonPort>/#t=<token> (1.3).
 //      The token lives only in the # fragment: fragments aren't sent to servers and don't appear in Referer or daemon logs;
 //      after the navigation the window belongs to the daemon's origin (opaque inside the plugin iframe), and the initiating page can't read its URL.
 //
 // The gate itself: every request checks Host (blocks DNS rebinding); any request with an Origin header is refused (navigations only);
-// everything except GET /open is 404.
+// everything except GET /open and GET /app is 404.
+//
+// 1.3: /open no longer sends the frame to the daemon's random port directly but to the gate's own /app page (lib/wrapper.mjs),
+// which shows the daemon page in a child iframe. After sleep/wake or a daemon restart, a reload of the frame lands on this
+// stable port instead of a dead one, and the wrapper sends it back through the Magpie page to a fresh daemon.
 import http from "node:http";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { parseTry, wrapperCsp, wrapperHtml } from "./wrapper.mjs";
 
 // Constant-time compare against timing attacks; hash to the same length first.
 function tokenEqual(a, b) {
@@ -58,9 +64,16 @@ export function failureHtml(error) {
 
 /**
  * The Magpie plugin page boot.js came from (?back=), so the daemon page can go back through it after the plugin host restarts
- * (fresh session.js → new gate → new daemon). Only a loopback Magpie plugin page is accepted, so the daemon page can't be turned
- * into an open redirect; it travels in the 302's # fragment next to the token and never reaches a server.
- * Keep in sync with web/src/api/backToMagpie.ts.
+ * (fresh session.js → new gate → new daemon). Only a Magpie plugin page on loopback (`magpie web`: 127.0.0.1, localhost,
+ * [::1]) is accepted, so the daemon page can't be turned into an open redirect; it travels in the 302's # fragment next to
+ * the token and never reaches a server.
+ * Magpie's desktop window is never a back target, on any OS: wails://localhost (macOS / Linux) can't be navigated to from
+ * this http page at all, and http://wails.localhost (Windows) only exists inside WebView2's request interception, which
+ * Wails sets up with the plain AddWebResourceRequestedFilter (no request source kinds): it doesn't see requests from the
+ * sandboxed plugin frame once that frame is on 127.0.0.1 (an out-of-process iframe), so the navigation goes to the real
+ * network, fails, and leaves WebView2's own gray error page in the frame with none of our script to recover (1.3.5/1.3.6).
+ * Without a back URL the wrapper asks Magpie to show its Try again card instead, which rebuilds the frame from the window.
+ * Keep in sync with web/src/api/backToMagpie.ts and lib/wrapper.mjs SAFE_BACK_SRC.
  */
 export function safeBackUrl(raw) {
   if (typeof raw !== "string" || !raw || raw.length > 2048) return null;
@@ -69,7 +82,9 @@ export function safeBackUrl(raw) {
   if (u.protocol !== "http:" && u.protocol !== "https:") return null;
   if (u.username || u.password) return null;
   const hostname = u.hostname.toLowerCase();
-  if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "[::1]") return null;
+  // Exact loopback hosts only: never 127.0.0.1.evil… / wails.localhost (see above)
+  const loopback = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+  if (!loopback) return null;
   if (!/^\/_magpie\/plugin\/[A-Za-z0-9_-]{1,128}\/(?:page\/)?index\.html$/.test(u.pathname)) return null;
   return `${u.protocol}//${u.host}${u.pathname}${u.search}`;
 }
@@ -106,6 +121,17 @@ export function createGate({ port, key, token, ensureDaemon, host = "127.0.0.1" 
       return;
     }
     const url = new URL(req.url ?? "/", `http://${host}:${port}`);
+    if (url.pathname === "/app" && req.method === "GET") {
+      // Static: no secret in it; the token reaches it only in the # fragment
+      const nonce = randomBytes(16).toString("base64");
+      res.writeHead(200, {
+        ...SAFE_HEADERS,
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": wrapperCsp(nonce),
+      });
+      res.end(wrapperHtml(nonce));
+      return;
+    }
     if (url.pathname !== "/open" || req.method !== "GET") {
       respond(res, 404, "Not found");
       return;
@@ -135,9 +161,12 @@ export function createGate({ port, key, token, ensureDaemon, host = "127.0.0.1" 
     for (const name of ["theme", "lang", "tokens"]) {
       if (url.searchParams.has(name)) query.set(name, url.searchParams.get(name));
     }
+    // The wrapper's retry counter (see lib/wrapper.mjs), only in its exact shape
+    const tries = url.searchParams.get("ac_try");
+    if (parseTry(tries)) query.set("ac_try", tries);
     const back = safeBackUrl(url.searchParams.get("back"));
-    const fragment = `t=${encodeURIComponent(token)}` + (back ? `&b=${encodeURIComponent(back)}` : "");
-    const location = `http://127.0.0.1:${daemon.port}/?${query}#${fragment}`;
+    const fragment = `t=${encodeURIComponent(token)}&p=${daemon.port}` + (back ? `&b=${encodeURIComponent(back)}` : "");
+    const location = `http://127.0.0.1:${port}/app?${query}#${fragment}`;
     res.writeHead(302, { ...SAFE_HEADERS, location });
     res.end();
   }

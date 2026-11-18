@@ -41,6 +41,21 @@ magpie plugin login joycode
 
 **视觉（image_url）为实验性**：按接口 `features` 声明能力，实际图片请求尚未验收。
 
+## 已验证的长上下文
+
+只有账号目录 `extJson.contextWindowByPlatform["JoyCode Desktop"]` 明确提供有效的更大窗口时，插件才对已验证的精确模型 ID 提高 `limit.context`。取目录窗口和验证上限的较小值，向下取整到 100,000 Token；其他模型和离线回退不变，也不覆盖原本更大的目录声明。输出上限仍使用 `respMaxTokens`。
+
+| 模型 ID | 保守的 context 声明 | 真实网关验证 |
+|---|---:|---|
+| `GLM-5.3` | 900,000 | 输入 900,074 Token，输出 64 Token，正常完成；约 1,000k 填充加指令返回 `Prompt exceeds max length` |
+| `GPT-6.1 Sol` | 900,000 | 输入 900,064 Token，输出 25 Token，正常完成；约 1,000k 填充加指令返回 `context_length_exceeded` |
+| `GPT-6 Astra` | 900,000 | 最大成功输入 921,497 Token；约 922,008 Token 填充加指令返回 `context_length_exceeded` |
+| `DeepSeek-V4.1-Flash` | 1,000,000 | 输入 1,000,073 Token，输出 150 Token，正常结束；更大请求明确报总窗口 1,048,576 Token |
+
+2026-11-04 经本机 magpie 的 `/v1/responses` / `/v1/chat/completions` 请求 JoyCode，用合成文本中三个分散的随机标记验证返回内容。两者均返回全部正确标记和正常终止事件。GPT 使用 `low`，两者输出预算为 256 Token。这是当前账号、通道和请求参数下的输入能力实测，不是所有账号的保证，也没有验证最大输出预算下的边界或复杂长上下文推理质量。`limit.context` 使用不高于成功输入长度的保守值，并非声称测得模型精确总窗口；宿主仍需为输出和额外提示预留空间。
+
+`Claude-Opus-5-hq` 接收并计量约 900k 输入，但返回 `stop_reason: refusal`、没有文本，不能视为功能验证通过，暂不提高其窗口。其他 GPT、Claude、DeepSeek 别名不能继承上述实测结论。长上下文会增加实际 Token 用量，且缓存命中也可能计入账号额度。
+
 ## 消息转发策略
 
 根据 2026-10-30 的 JoyCode 实测，仅对 Responses 协议做以下兼容：GPT-6 Astra、GPT-6.1 Sol 的显式 `none` / `minimal` 转为 `low`；GPT-6 Sol、GPT-5.6 Sol 仅将 `minimal` 转为 `low`，保留上游接受的 `none`。其他 reasoning 参数、有效或未指定的强度、未知模型和其他协议均不变。启用低档推理可能增加用量。此表基于当前账号目录，不自动覆盖未来新增模型。
@@ -65,7 +80,7 @@ flatten 模式会把 Chat Completions 消息压平成 `system + 单条 user prom
 
 ## 已知限制
 
-- **额度展示**：通过 IDE 同款 `get_newpoint_ide` 接口读取套餐、已用/总积分、剩余积分和有效期文字，可在账号及用量页面刷新。有效期文字不等同于额度重置时间，因此不推算重置倒计时。多个积分池分别显示，不相加；额度窗口仅作展示，由上游判定具体模型能否继续使用。
+- **额度展示**：通过 IDE 同款 `get_newpoint_ide` 接口读取套餐、已用/总积分、剩余积分和有效期文字，可在账号及用量页面刷新。套餐行上的「有效期至」会解析成中国时区当天 23:59:59：账号卡片上悬停用量会显示「N 积分 将于 … 过期」，同时写入套餐到期时间。没有套餐行时，套餐到期时间取各积分池里最早的一份，每条用量仍显示自己的过期时间。这不是额度重置，所以不会出现「重置于」，也不推算重置倒计时。无法解析的文字仍只留在用量说明里。多个积分池分别显示，不相加；额度窗口仅作展示，由上游判定具体模型能否继续使用。
 - **ptKey 失效**：表现为账号被标记「需要重新登录」，重新 `magpie plugin login joycode` 即可。
 - **签名 key 轮换**：签名 key 是内嵌在每份 JoyCode IDE 里的公开协议常量，不是密钥。若 JoyCode 轮换它，从新版 `extension.js` 重新提取后，可通过环境变量 `JOYCODE_SIGN_KEY` 覆盖，无需改代码。
 - 登录方式默认 `loginType: PIN_JD_CLOUD`；如果你的账号是京东云企业域登录且请求被拒，改 `index.mjs` 顶部的 `LOGIN_TYPE` 常量。
@@ -79,3 +94,11 @@ bun test                # 浏览器登录、额度映射、模型倍率回归测
 相关文档：[magpie 插件开发](https://usemagpie.ai/docs/zh/plugins)。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 这是非官方适配插件，与京东或 magpie 官方无隶属关系。JoyCode 图标及商标归其权利人所有；代码的 MIT 许可不授予这些品牌资产的权利。
+
+2026-11-04 补测：`GPT-6.1 Sol` 和 `GLM-5.3` 的 900k 档均找回全部标记，分别耗时 15.95 秒和 98.31 秒；两者的 1,000k 档均被上游拒绝，因此取已验证的 900k 档，不声称精确边界。`GLM-5.3-jcloud`、`GLM-5.3-agent` 未测试，不继承 `GLM-5.3` 的窗口。
+
+## Responses 流完整性
+
+插件逐事件检查 Responses SSE：空完成返回 `empty_response`，未收到终止事件即 EOF 返回 `incomplete_response`，JoyCode 流内业务错误转为标准错误事件。正常文本、拒绝、工具输出以及明确的 incomplete/failed 状态保留；不等待完整回复才透传。是否重试及重试次数由 magpie 决定，插件不额外重发请求。
+
+2026-11-04 使用 magpie 0.1.2392 隔离验证了空完成从静默成功变为明确错误，以及上游恢复后的重试成功。真实短工具结果续答在本机通道 2.96 秒返回 `OK`。这是已复现路径的修复；历史异常未保存原始 SSE，尚不能据此认定全部历史根因。

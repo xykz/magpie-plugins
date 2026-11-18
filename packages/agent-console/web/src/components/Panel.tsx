@@ -8,8 +8,11 @@ import { Icon } from "./Icons";
 import { DiffView, type DiffHunk } from "./Timeline";
 import { ConfirmDialog } from "./Dialog";
 import { toast } from "./Toast";
-import { errMsg, t, tf } from "../i18n/index.js";
+import { errMsg, revealLabel, rpcMessage, t, tf } from "../i18n/index.js";
 import { TerminalPanel } from "./TerminalPanel";
+import { PreviewPanel } from "./PreviewPanel";
+import { Menu, type MenuItem } from "./Menu";
+import { MENTION_MIME, joinProjectPath, type MentionDraft } from "../composer/mentions";
 import { copyText } from "./Markdown";
 import hljs from "highlight.js/lib/common";
 
@@ -19,6 +22,7 @@ export function Panel() {
     { tab: "changes", label: t("panel.changes") },
     { tab: "files", label: t("panel.files") },
     { tab: "terminal", label: t("panel.terminal") },
+    { tab: "preview", label: t("preview.tab") },
   ];
   return (
     <>
@@ -42,6 +46,7 @@ export function Panel() {
         {ui.panelTab === "changes" && <ChangesPanel />}
         {ui.panelTab === "files" && <FilesPanel />}
         {ui.panelTab === "terminal" && <TerminalPanel />}
+        {ui.panelTab === "preview" && ui.panelOpen && <PreviewPanel />}
       </div>
     </>
   );
@@ -205,7 +210,7 @@ function ChangesPanel() {
           );
         })}
       </div>
-      <div className="chg-diff">
+      <div className="chg-diff" data-quote-root="panel" data-quote-src={selPath ?? undefined}>
         {diff?.loading && <div className="pn-empty">{t("panel.loadingDiff")}</div>}
         {diff?.tooLarge && <div className="pn-empty">{t("panel.diffTooLarge")}</div>}
         {diff?.error && <div className="pn-empty">{diff.error}</div>}
@@ -230,6 +235,10 @@ function ChangesPanel() {
 }
 
 // ---------- files panel ----------
+/** Context menu "Add to chat": the composer listens for this */
+export function insertMention(m: MentionDraft): void {
+  window.dispatchEvent(new CustomEvent("ac-insert-mention", { detail: m }));
+}
 type TreeEntry = { name: string; path: string; isDir: boolean };
 
 function FilesPanel() {
@@ -245,6 +254,7 @@ function FilesPanel() {
   const [dirs, setDirs] = useState<Record<string, TreeEntry[] | "loading" | string>>({});
   const [sel, setSel] = useState<string | null>(null);
   const [file, setFile] = useState<{ text?: string; language?: string; binary?: boolean; tooLarge?: boolean; error?: string; loading?: boolean } | null>(null);
+  const [ctx, setCtx] = useState<{ x: number; y: number; entry: TreeEntry } | null>(null);
 
   const loadDir = useCallback(async (dir: string) => {
     if (!projectId) return;
@@ -314,6 +324,17 @@ function FilesPanel() {
           style={{ paddingLeft: 8 + depth * 14 }}
           onClick={() => toggle(e)}
           title={e.path}
+          draggable
+          onDragStart={(ev) => {
+            // 1.2: drag into the composer → a path chip; other drop targets get the absolute path as text
+            ev.dataTransfer.effectAllowed = "copy";
+            ev.dataTransfer.setData(MENTION_MIME, JSON.stringify({ projectId: project.id, rel: e.path, isDir: e.isDir }));
+            ev.dataTransfer.setData("text/plain", joinProjectPath(project.path, e.path));
+          }}
+          onContextMenu={(ev) => {
+            ev.preventDefault();
+            setCtx({ x: ev.clientX, y: ev.clientY, entry: e });
+          }}
         >
           {e.isDir ? (
             <>
@@ -333,8 +354,28 @@ function FilesPanel() {
     ));
   };
 
+  const ctxItems: MenuItem[] = ctx
+    ? [
+        { kind: "item", label: t("mention.add"), onClick: () => insertMention({ projectId: project.id, rel: ctx.entry.path, isDir: ctx.entry.isDir }) },
+        { kind: "sep" },
+        { kind: "item", label: t("common.copyPath"), onClick: () => { void copyText(joinProjectPath(project.path, ctx.entry.path)); toast(t("common.copiedPath")); } },
+        { kind: "item", label: t("mention.copyRel"), onClick: () => { void copyText(ctx.entry.path); toast(t("common.copiedPath")); } },
+        { kind: "sep" },
+        // 1.3.8 (issue #3): a file is selected in its folder, a folder is opened (the daemon keeps it inside the project)
+        {
+          kind: "item",
+          label: revealLabel(),
+          onClick: () => {
+            ws.call("files.reveal", { projectId: project.id, path: ctx.entry.path })
+              .catch((e) => toast(t("panel.revealFail") + rpcMessage(e), true));
+          },
+        },
+      ]
+    : [];
+
   return (
     <>
+      {ctx && <Menu x={ctx.x} y={ctx.y} items={ctxItems} onClose={() => setCtx(null)} />}
       <div className="ft-crumbs">
         {sel ? (
           <>
@@ -350,7 +391,7 @@ function FilesPanel() {
       </div>
       <div className="ft-tree">{renderDir(".", 0)}</div>
       {sel && (
-        <div className="ft-view">
+        <div className="ft-view" data-quote-root="panel" data-quote-src={sel}>
           {file?.loading && <div className="pn-empty">{t("panel.reading")}</div>}
           {file?.binary && <div className="pn-empty">{t("panel.binary")}</div>}
           {file?.tooLarge && <div className="pn-empty">{t("panel.tooLarge")}</div>}

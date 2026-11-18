@@ -62,6 +62,131 @@ Refreshing:
   with `invalid_grant` (HTTP 400). Any other failure keeps the sign-in, and
   the current token is used while it lasts.
 
+## Generation and media tools in Magpie
+
+The same plugin also exports `MiniMaxCodeToolsPlugin`. Magpie serves its tools
+through the Library's MiniMax MCP server and `/mcp/magpie/tools`. Connect
+that server to your agent to use the tools with any of its chat models.
+
+| Tools | What they do |
+|---|---|
+| `web_search` | Native web/news/video/place/shopping search |
+| `generate_image` | Text-to-image and image editing from reference URLs |
+| `submit_video_generation`, `query_video_generation` | Submit H3, H3 Max or Hailuo video tasks, then check their progress |
+| `synthesize_speech`, `batch_text_to_audio`, `get_voice_list` | Speech synthesis and voice selection |
+| `batch_text_to_music` | Music and song generation |
+| `describe_images`, `videos_understand`, `audios_understand`, `listen_audio` | Image, video and audio understanding, and transcription |
+| `search_images`, `reverse_image_search` | Find image references |
+| `enhance_image`, `remove_image_background` | Upscale images and remove backgrounds |
+| `get_asset_url` | Get a fresh download URL for a generated asset's `node_id` |
+| `list_tools`, `tool_schema`, `call_tool` | Discover and call the account's current Matrix tools and read their live schemas |
+
+## Native Magpie image, video, and web search
+
+This plugin also registers MiniMax Code as a backend for Magpie's built-in
+media and search, so you can use them from Settings and drop the named tools
+from an agent's catalog if you only need those three capabilities. The named
+tools above stay available.
+
+Once you are signed in to MiniMax Code (China) or MiniMax Code (Global):
+
+- **Image generation** (Settings → Models → Images → Image generation, served
+  at `/mcp/magpie/image`): choose **MiniMax Image**. Text-to-image uses the
+  same Matrix `generate_image` API as the named tool (a `requests` array, then
+  `get_asset_url` for the download URL). Magpie sends edits as multipart
+  form data; the image bytes, and any `data:` URL, are uploaded through MiniMax Code's `upload_temp_url` flow
+  before `generate_image`. HTTPS URLs are passed through. `generate_image`
+  takes no mask, so a mask edit is refused (HTTP 400). A size such as
+  `1024x1024` is mapped to MiniMax's `area` (so it does not fall through to
+  the vendor's 4K default). Right after a generation, `get_asset_url` may
+  first answer a watermarked `/visible/` URL (#974); the plugin waits a
+  few seconds and asks again for the original.
+- **Video generation** (Settings → Models → Images → Video generation, served
+  through Magpie's videos API): choose **MiniMax H3**, **MiniMax H3 Max**, or
+  **MiniMax Hailuo 2.3**. A job is submitted with `submit_video_generation` and
+  polled with `query_video_generation`, using those real model ids. Text-to-video
+  works out of the box. A first or last frame given as a `data:` URL is
+  uploaded the same way; an HTTPS URL is passed through.
+- **Web search** (Settings → Models → Web search → Search APIs, served at
+  `/mcp/magpie/web-search`): enable **MiniMax Code** or **MiniMax Code (Global)**
+  in the search API list. Searches use `/mavis/api/v1/mcp/web_search` with the
+  signed-in account, the same API as the `web_search` tool. No separate API key
+  is needed.
+
+The image and video models also appear on the MiniMax Code provider's model
+list (they give images or video, not chat). Leave chat on M3 / M2.7.
+
+Magpie's Library can already give skills to the **MiniMax Code** desktop app
+when Magpie detects that app on the machine. That target lives in Magpie
+itself, not in this plugin.
+
+On the combined MCP server these are named `minimax_generate_image`,
+`minimax_submit_video_generation`, and so on. In the Library's routed server,
+the separator is `minimax__generate_image`.
+
+The sixteen named Matrix tools are advertised by default. The plugin option
+`compactTools` (default `false`) leaves them out of the tool list when set
+to `true`, and keeps only `list_tools`, `tool_schema`, `call_tool`, and
+`web_search`, with those four descriptions and schemas unchanged. `call_tool`
+still checks arguments against the account's live catalog. Turn it on with:
+
+```sh
+magpie plugin options @magpie-community/opencode-minimax-auth '{"compactTools": true}'
+```
+
+Each named tool shows a schema bundled with the plugin, so loading it asks
+no network. A call is checked against the schema in the account's live
+catalog, read on each call, so a parameter MiniMax added since the bundled
+copy still goes through. `tool_schema` prints the live schema.
+
+Webpage reading is available through Magpie's search MCP server, whose
+`web_fetch` protects loopback and private network addresses.
+
+Account-backed tools accept `site`: `minimax-code` (China, the default) or
+`minimax-code-global`. These tools read the chosen site's default account
+from Magpie's `plugin-auth.json` on each call: the one stored under the bare
+site id, else the first `site#…` key by name, as Magpie picks for a request
+that names no account. To choose a particular account,
+set `account` to its full stored key, such as `minimax-code#xxxxxx`. The
+selected account's tokens are renewed by the same refresh logic as chat.
+A missing account asks you to sign in; the selected account stays fixed
+during a call and its authentication retry.
+
+Tool requests use the same redirect handling as chat: redirects within
+the same host are followed, while a redirect to another host returns a
+site/proxy hint and preserves the account's refresh token.
+
+The gateway status (`base_resp.status_code`) and the tool payload status
+(`code`) are checked independently. A successful gateway response can
+still carry a plan-limit error from the tool, even when the account has
+credits available; that error is returned to the caller.
+
+Inputs use HTTPS media URLs. Upload local reference files to a reachable
+URL before passing them. Generated results include `node_id` and
+`file_name`; pass the node id to `get_asset_url` and download the returned
+URL. A URL can expire while its asset is still available: ask for a fresh
+URL with the same node id.
+
+Video generation is asynchronous: keep the returned task id and model,
+then pass both to `query_video_generation`. Generation uses the selected
+account's plan or credits according to MiniMax's billing. Choose the model
+and parameters before submitting. Transport failures are reported so the
+caller can check the outcome before deciding whether to submit again.
+
+The tool definitions ship with the package; each execution also resolves
+the tool against the selected account's live catalog. Availability and
+provider failures come from that catalog. Use `tool_schema` and
+`call_tool` when a newly added Matrix capability needs its current
+parameters. Connector calls honor the host's cancellation signal. Magpie
+currently limits an MCP tool call to 55 seconds, so a long synchronous
+image or audio request may outlast that limit; video uses separate
+submission and query calls.
+
+Magpie loads `magpie.mjs` through `exports["./server"]` to expose these
+tools with its account store. OpenCode 1.x loads `opencode.mjs`, and
+OpenCode 2.x loads the shared adapter. Both OpenCode entry points expose
+the two chat providers.
+
 ## Requests
 
 Chats are Anthropic messages (`@ai-sdk/anthropic`) sent to
@@ -74,9 +199,39 @@ Chats are Anthropic messages (`@ai-sdk/anthropic`) sent to
 - `X-Mavis-Session-Id`. This is the conversation's id when magpie or
   OpenCode passes one, and a fixed id for the plugin's run otherwise.
 
+A chat asks for its answer uncompressed (`accept-encoding: identity`).
+MiniMax answers a chat it is asked to compress as one gzip member, flushed
+when the answer is done: the events of a streamed answer then all arrive at
+once, and the first token waits for the last. Asked uncompressed, it sends
+the events as they come.
+
 A refusal that says the credits or quota ran out goes on as a 429. The 402,
 403 or 429 statuses count, when the body says so. That way magpie can move
 the conversation to another account.
+
+## The international site from mainland China
+
+`minimax-code-global` needs a network outside mainland China. From a
+mainland-China network, MiniMax's edge answers `agent.minimax.io` with a
+307 to `agent.minimaxi.com`, the China site, which doesn't take the
+international site's sign-in (the two sites' tokens don't work on each
+other's hosts). The plugin doesn't follow a redirect to another host: the
+usage card, the check-in, the chats (a 502) and the sign-in say where the
+request was sent and to set a proxy outside mainland China for the
+provider. No refresh token is spent on it, and the sign-in is kept. The
+China site (`minimax-code`) is unaffected.
+
+## The China site's account host
+
+The China site's account API (the usage card, the check-in, the account
+and its membership) is on `agent.minimaxi.com`, and `agent.minimax.cn`
+serves the same API with the same sign-in. A call `agent.minimaxi.com`
+gives no HTTP answer to (a TLS error such as "unable to get issuer
+certificate", a refused or reset connection) is sent once to
+`agent.minimax.cn`. Any answer from `agent.minimaxi.com` — a 401, another
+status, an error in the body, a redirect — and a timeout are kept as they
+are, never sent again. When both hosts can't be reached, the error names
+both and why.
 
 ## Models
 
@@ -111,9 +266,15 @@ The usage card shows:
   when the soonest of them runs out, from the credit details MiniMax's own
   client lists (`/minimax-cloud/api/v1/credit/details`); beside an M Plan
   it is aside, since the plan's windows come first;
-- the plan: Free, or the M Plan's tier and when it ends;
-- for an M Plan, its windows (5 hours, 7 days, and any model's own) from
-  `coding_plan/remains`.
+- the plan: Free, or the subscription's name as the console says it (else
+  its tier) and when it ends; none when the
+  site has no membership API (the international site answers both of its
+  calls with 404), and the card goes on with the credits;
+- for a plan, its windows (5 hours, 7 days, and any model's own) from the
+  console's `token_plan/remains_percent`, so what MiniMax granted the account
+  is what shows: `126 / 150 %` left for its `总额度 150% · 已用 24%`, and
+  Unlimited for a window it doesn't limit. `coding_plan/remains` is the
+  fallback.
 
 These are read the way MiniMax Code reads them, with its signed account API.
 

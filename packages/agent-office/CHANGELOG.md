@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.5 · 2026-11-10
+
+### Added
+
+- Cursor shows in the office: its editor's agent chats as "Cursor" and cursor-agent's as "Cursor CLI", read from `~/.cursor/projects/*/agent-transcripts` (`CURSOR_DATA_DIR`, and cursor-agent's `chats/*/*/meta.json` under `CURSOR_CONFIG_DIR`). What was asked, the tools it calls and its answer show; Cursor's requests go to Cursor's servers, so there are no token counts. The editor writes no end-of-turn line, so its chat counts as done 30 seconds after its last answer. Asked by WaiooT on X.
+
+## 0.3.4 · 2026-11-06
+
+### Fixed
+
+- Settings' Language, Scene and Quality pickers are read with their value ("Scene, Office"), wheeling past the end of a picker's list no longer closes it, and a picker opened from the keyboard near the foot of Settings stays open. The page's scrollbars are magpie's thin rounded thumb. By frederick-wang (#778, #773).
+
+## 0.3.3 · 2026-11-06
+
+### Changed
+
+- Settings' Language, Scene and Quality pickers are in-page menus instead of native `<select>`s: they open below the button, or above it when there is less room, stay inside the window, and work with the arrow keys, Home, End, Enter, Space, Tab and Escape (Escape closes the picker before Settings). The saved options are the same. By frederick-wang (#771, #744).
+
+## 0.3.2 · 2026-11-05
+
+### Added
+
+- Settings has a switch, "Include agents from other computers and gateway keys", for `remote`. It stays off by default. While it is off, an empty office that had such requests says they were ignored because the switch is off, in all nine languages. By frederick-wang, from QingJ01/magpie-agent-office#5 (#741).
+
+### Changed
+
+- The Settings button's chevron is drawn as an SVG that sits on the label's centre line and turns over while the menu is open; the Language, Scene and Quality pickers draw the same chevron. By frederick-wang (#740).
+
+### Fixed
+
+- The page's asset stamps match their files again. Since 0.3.0 four of them were stale, so a same-version cache could pair the new page with an old model.js, scene.js, scene3d.js or app.js.
+
 ## 0.3.1 · 2026-11-03
 
 ### Fixed

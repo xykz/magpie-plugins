@@ -9,21 +9,21 @@ from upstream never has to merge past a fork edit. What this fork adds on top
 of them is written down here, in a file of its own.
 
 Package versions are upstream's three numbers, plus one of this fork's: a fork
-release is `<upstream version>-fork.<n>`, so `0.2.16-fork.1` is the first fork
-release of the version upstream published as `0.2.16`, and `0.2.16-fork.2` is
+release is `<upstream version>-fork.<n>`, so `0.2.36-fork.1` is the first fork
+release of the version upstream published as `0.2.36`, and `0.2.36-fork.2` is
 that same release with one more fork change on it. `n` counts fork releases
 only; it starts at 1 and goes up by one each time. When upstream publishes a
 new version, the base — upstream's three numbers — moves, and `n` starts again
-at 1 (`0.2.17-fork.1`), which semver already orders after every
-`0.2.16-fork.*`.
+at 1 (`0.2.37-fork.1`), which semver already orders after every
+`0.2.36-fork.*`.
 
 The suffix earns its keep: semver has no fourth number, and the three-number
 form a fork reused would read to magpie as an older version than the upstream
-release it is based on. `-fork.<n>` is a pre-release, so `0.2.16-fork.1` sorts
-*before* `0.2.16` — right, because upstream's release is the one without this
-fork's changes — and before `0.2.17`, so upstream moving on is still seen as an
+release it is based on. `-fork.<n>` is a pre-release, so `0.2.36-fork.1` sorts
+*before* `0.2.36` — right, because upstream's release is the one without this
+fork's changes — and before `0.2.37`, so upstream moving on is still seen as an
 update. For the same reason this fork does not use build metadata
-(`0.2.16+1`): semver compares `0.2.16+1` and `0.2.16+2` as equal, so the second
+(`0.2.36+1`): semver compares `0.2.36+1` and `0.2.36+2` as equal, so the second
 fork release would look like the first.
 
 A consequence to know: a version with a suffix is a *pinned* spec to magpie
@@ -35,6 +35,14 @@ The base is the version upstream had when the fork change went in, not
 whatever `packages/*/package.json` said last: this fork merges upstream's
 releases and re-reads them, and a merge that brings upstream's own version
 bump in must be followed by moving the base up (and `n` back to 1).
+
+The package's entry points are upstream's, not this fork's: `main` is
+`./opencode.mjs` (a five-line re-export of the named plugin, for OpenCode 1.x)
+and `exports["."]` is `./opencode2.mjs` (the `{id, setup}` default, for
+OpenCode 2.x, carried byte for byte from `scripts/opencode2.mjs` and checked as
+such by `scripts/check.mjs`). A fork release keeps both in `files` beside the
+modules it adds; `index.mjs` stays where it was and is what the two re-export,
+so neither a fork edit nor an upstream release has to touch the other.
 
 ## One switch per plugin, and what each of them turns on
 
@@ -195,9 +203,9 @@ rather than send a different client.
 it to an empty string to leave magpie's own alone.
 
 The one thing it does not change is the version it reports of itself:
-`packages/raccoon/package.json` is `0.1.5-fork.3`, upstream's number with this
-fork's suffix (above) — the package is not renamed, so what a vendor sees is
-still upstream's own name.
+`packages/raccoon/package.json` is upstream's number with this fork's suffix
+(above) — `0.1.13-fork.1` as this is written — and the package is not renamed,
+so what a vendor sees is still upstream's own name.
 
 ## `raccoon`: what the app's request shape is
 
@@ -696,16 +704,16 @@ later) and both take `--dry-run` and `--install`.
 这个文件里。
 
 版本号是上游那三段加上 fork 自己的一位：一次 fork 发版写成
-`<上游版本>-fork.<n>`，`0.2.16-fork.1` 就是上游发的 `0.2.16` 之上的第一次
-fork 发版，`0.2.16-fork.2` 是同一版上又多了一处 fork 改动。`n` 只数 fork
+`<上游版本>-fork.<n>`，`0.2.36-fork.1` 就是上游发的 `0.2.36` 之上的第一次
+fork 发版，`0.2.36-fork.2` 是同一版上又多了一处 fork 改动。`n` 只数 fork
 自己的发版，从 1 开始，每改一次加一。上游发了新版本，base 跟着走、`n` 重回
-1（`0.2.17-fork.1`）—— semver 本来就把它排在所有 `0.2.16-fork.*` 之后。
+1（`0.2.37-fork.1`）—— semver 本来就把它排在所有 `0.2.36-fork.*` 之后。
 
 这个后缀是有用的：semver 没有第四段，而 fork 若沿用三段式自己加号，magpie
 会把那个号读成比它基于的上游版本更旧的版本。`-fork.<n>` 是预发布，因此
-`0.2.16-fork.1` 排在 `0.2.16` **之前** —— 这是对的，不带 fork 改动的才是上游
-那一版 —— 又排在 `0.2.17` 之前，所以上游一旦前进仍然算更新。同理本 fork
-不用 build metadata（`0.2.16+1`）：semver 认为 `0.2.16+1` 与 `0.2.16+2`
+`0.2.36-fork.1` 排在 `0.2.36` **之前** —— 这是对的，不带 fork 改动的才是上游
+那一版 —— 又排在 `0.2.37` 之前，所以上游一旦前进仍然算更新。同理本 fork
+不用 build metadata（`0.2.36+1`）：semver 认为 `0.2.36+1` 与 `0.2.36+2`
 相等，第二次 fork 发版会看起来和第一次是同一个。
 
 有个后果要知道：带后缀的版本对 magpie 是**固定**（`Pinned`）的 spec，所以
@@ -715,6 +723,13 @@ fork 发版从不自动更新 —— Plugins 页会提示有更新，由人来�
 base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.json` 上次写的
 那个：本 fork 会合并上游发布再重读它们，若某次合并带进了上游自己的版本号提升，
 就必须顺手把 base 抬上去（并把 `n` 归 1）。
+
+三个包的入口都用上游那一套，不用 fork 自己的：`main` 是 `./opencode.mjs`
+（五行，把具名插件再导出一次，给 OpenCode 1.x），`exports["."]` 是
+`./opencode2.mjs`（`{id, setup}` 的默认导出，给 OpenCode 2.x，从
+`scripts/opencode2.mjs` 逐字节复制，`scripts/check.mjs` 校验两者一致）。fork
+发版把这两个文件连它自己新增的模块一起列进 `files`；`index.mjs` 位置不动，
+正是这两个文件要再导出的东西 —— 于是 fork 的改动与上游的发版互不碰面。
 
 ### 三个插件各一个开关，开关管的是请求形状
 

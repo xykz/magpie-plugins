@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
+import { processStatus } from "./proc.mjs"
 
 // A lock that holds across processes, not just within one. magpie asks each
 // account's row separately and may do it in a process of its own, so an
@@ -16,18 +17,19 @@ import { dirname } from "node:path"
 // is still alive. Any other error is not proof either way, and the caller
 // falls back to the lock's age.
 function alive(pid) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    if (error?.code === "ESRCH") return false
-    if (error?.code === "EPERM") return true
-    return undefined
-  }
+  const state = processStatus(pid).state
+  return state === "dead" ? false : state === "unknown" ? undefined : true
 }
 
-async function abandoned(path) {
-  const locked = (await stat(path)).mtimeMs
+// abandoned says whether the lock at path was left behind by a holder that is
+// gone, or null when there is no lock any more: the holder let go between our
+// open and this look, and the lock is free to try again (#650).
+export async function abandoned(path) {
+  let locked
+  try { locked = (await stat(path)).mtimeMs } catch (error) {
+    if (error?.code === "ENOENT") return null
+    throw error
+  }
   let pid
   try { pid = Number((await readFile(path, "utf8")).trim()) } catch { return Date.now() - locked > 10000 }
   // An empty lock is one just created by another process, not one abandoned:
@@ -76,7 +78,11 @@ export async function take(file, { timeout = 180000, poll = 250, busy = "Another
       }
     } catch (error) {
       if (error.code !== "EEXIST") throw error
-      if (await abandoned(path)) { await rm(path, { force: true }); continue }
+      const left = await abandoned(path)
+      // Gone already: open again, and remove nothing, since by now the file
+      // may be a new holder's.
+      if (left === null) continue
+      if (left) { await rm(path, { force: true }); continue }
       // Say that someone is waiting, so a holder that is only keeping the lock
       // warm lets go now instead of making this process sit out its leisure.
       await writeFile(`${file}.want`, String(process.pid), { mode: 0o600 }).catch(() => {})

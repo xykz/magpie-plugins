@@ -10,10 +10,11 @@
 // (/trae/api/…) as the account, for magpie's daily check-in (每日签到:
 // /trae/api/v2/ug/checkin_credits/status, then /claim).
 import { createDecipheriv, createHash, generateKeyPairSync, randomBytes, randomUUID, randomInt, sign } from "node:crypto"
+import { linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { createServer, STATUS_CODES } from "node:http"
 import { homedir, release, version as osVersion } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 // SEES is a fallback model that takes images, as Trae's lists mark it
 // (multimodal: true)
@@ -40,7 +41,19 @@ const SITES = {
       web: "https://www.trae.cn", // the authorization page
       auth: "https://api.trae.cn", // tokens, the account, credits
       api: "https://trae-api-cn.mchost.guru", // the models
+      console: "https://console.enterprise.trae.cn", // an enterprise (SaaS) account's usage, in yuan
     },
+    // the console an enterprise (SaaS) sign-in names as its account's host,
+    // which is what tells an enterprise account apart: it bills there, not
+    // on the consumer credits page. Kept apart from hosts.console so a test
+    // can point the requests at a fake and still sign in as an enterprise
+    // account.
+    consoleHost: "console.enterprise.trae.cn",
+    // Trae CN's console was measured to take the IDE's own token: the plugin's
+    // own headers against get_personal_quota answer 200, and a 401 from it
+    // really is a lapsed sign-in. The international console could not be
+    // measured (see its realm below), so it is not allowed to say so.
+    consoleTakesIdeToken: true,
     clientId: "ono9krqynydwx5", // Trae CN's IDE
     // the clients' own renewal, which binds the JWT to a device: ExchangeToken
     // under /trae/api/v3/oauth, signed with the device's P-256 key
@@ -86,9 +99,20 @@ const SITES = {
       "DeepSeek-V4-Flash": { name: "DeepSeek V4 Flash" },
     },
     // the model host for an account: Trae CN's own hosts serve no models,
-    // so only a host that is one is taken, else the one gateway
+    // so only a host that is one is taken, else the one gateway.
+    //
+    // The enterprise console an enterprise (SaaS) sign-in names is the
+    // seat's own model host, and a chat there bills the seat pool. Not every
+    // tenant's seat takes chats there: #1127's (shadow1606) answered every
+    // llm_utils_chat with 4245, for every function and model, while
+    // #1155's (kenanor) chats there. A seat the console turns away is
+    // marked (consoleChat: false, kept with the sign-in) and chats on the
+    // consumer gateway, which takes the same login but bills the login's
+    // own credits — so the gateway is the fallback, never the first ask.
+    // The plugin's hostOf applies the mark; this is the host before it.
     apiOf: (a) => {
       const h = traeHost(a?.api)
+      if (h && new URL(h).hostname.toLowerCase() === SITES["trae-cn"].consoleHost) return a?.consoleChat === false ? SITES["trae-cn"].hosts.api : SITES["trae-cn"].hosts.console
       return h && SITES["trae-cn"].modelHost(h) ? h : SITES["trae-cn"].hosts.api
     },
     // whether a host named by a sign-in is one of the model hosts: an https
@@ -126,6 +150,56 @@ const SITES = {
       label: "credits",
       host: (site) => site.hosts.auth,
       body: { require_usage: true, req_source: 0 },
+      // an enterprise (SaaS) account bills in yuan on Trae's console, not on
+      // the consumer credits page: its allowance is the seat pool the
+      // console names, and what it spent is the models' own cost — two of
+      // the console's pages, not one. A personal account is read as before.
+      //
+      // The consumer page answers such an account too, with a credits
+      // allowance that real calls have been measured not to touch (two calls
+      // through magpie moved the console's spend by ￥0.0002 each and left
+      // the credits at 4.4 of 4700). It is shown beside the seat pool so the
+      // card holds both numbers, but marked aside: the seat pool is what a
+      // request spends, so the credits must not read as allowance magpie can
+      // route on. Whether they are a fallback the seat pool exhausts first
+      // is not known — no account has spent its pool to find out.
+      ent: {
+        quota: { path: "/trae/gtm/tob/api/v1/config/get_personal_quota" },
+        spent: { path: "/trae/gtm/tob/api/v1/config/get_user_model_usage" },
+        // the console's own period, which is the seat pool's: the usage page
+        // says "席位额度将于 <ResetTime> 重置" from exactly this call, while
+        // get_personal_quota names the allowance and no date at all
+        core: { path: "/trae/gtm/tob/api/v1/config/get_personal_core_data" },
+        read: ({ quota, spent, core, credits: page }, a, signIn, { credits, round }) => {
+          const q = seatPoolOf(quota)
+          if (!q) return { error: "Trae CN usage: the console named no seat pool", signIn, user: a.name }
+          const out = { plan: "Enterprise", user: a.name || a.uid, signIn }
+          const windows = []
+          if (q.unlimited) out.balance = "unlimited"
+          else if (q.limit > 0) windows.push(seatUsageWindow(q, seatSpentOf(spent, quota?.user_model_quota?.user_id), entResetOf(core), yuan, "CNY"))
+          const c = page ? credits(page) : null
+          if (c && !c.unlimited && c.limit > 0) {
+            const w = {
+              name: "Credits",
+              used: Math.max(0, Math.min(100, (c.used / c.limit) * 100)),
+              display: `${round(c.used)} / ${round(c.limit)}`,
+              amount: round(c.used),
+              limit: round(c.limit),
+              unit: "credits",
+              aside: true,
+            }
+            if (c.until) w.resetsAt = new Date(c.until).toISOString()
+            if (c.until && c.lapsing > 0) Object.assign(w, { runsOutAt: new Date(c.until).toISOString(), runsOut: round(c.lapsing) })
+            windows.push(w)
+          }
+          if (windows.length) out.windows = windows
+          // a pool of nothing and no credits row leave the card nothing to
+          // show: it says what the console and the page answered rather
+          // than standing empty (#1143)
+          else if (!out.balance) return { error: `Trae CN usage: the console gives this seat a pool of ¥${q.limit}, and the credits page ${!page ? "could not be read" : c?.unlimited ? "says unlimited" : "shows no allowance"}`, signIn, user: a.name || a.uid }
+          return out
+        },
+      },
       read: (v, a, signIn, { credits, round }) => {
         const c = credits(v)
         const out = { plan: v.is_credits_billing ? "Credits" : "Free", user: a.name || a.uid, signIn }
@@ -137,6 +211,7 @@ const SITES = {
           // English balance line beside it (yetone/magpie#694)
           const w = { name: "Credits", used: Math.max(0, Math.min(100, (c.used / c.limit) * 100)), amount: round(c.used), limit: round(c.limit), unit: "credits" }
           if (c.until) w.resetsAt = new Date(c.until).toISOString()
+          if (c.until && c.lapsing > 0) Object.assign(w, { runsOutAt: new Date(c.until).toISOString(), runsOut: round(c.lapsing) })
           out.windows = [w]
         }
         return out
@@ -165,7 +240,18 @@ const SITES = {
       us: "https://coreva-normal.trae.ai", // the models, US
       pay: "https://api-sg-central.trae.ai", // usage
       usPay: "https://api-us-east.trae.ai", // usage, the US deployment
+      console: "https://console.enterprise.trae.ai", // an enterprise (SaaS) account's usage, in dollars
     },
+    // the console an enterprise (SaaS) sign-in names as its account's host,
+    // as on Trae CN: it bills there, not on the dollar billing's page. Kept
+    // apart from hosts.console for the same reason as Trae CN's.
+    consoleHost: "console.enterprise.trae.ai",
+    // Not measured: no international enterprise account could be found, and
+    // console.enterprise.trae.ai answers a foreign realm's token with 请先登录
+    // exactly as it answers no token at all, so whether it refuses the token
+    // or wants a console session is unknown. Until an account says otherwise,
+    // its 401 is a failed read, never a lapsed sign-in.
+    consoleTakesIdeToken: false,
     clientId: "ono9krqynydwx5",
     appId: "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8",
     ideVersion: "3.5.51", // named to the international IDE's current build
@@ -221,6 +307,36 @@ const SITES = {
       // Forbidden here
       host: (site, a) => (/^US(?:[-_ ]|$)/i.test(String(a?.region ?? "")) || /api-us/i.test(String(a?.api ?? "")) ? site.hosts.usPay : site.hosts.pay),
       body: {},
+      // An enterprise (SaaS) account bills on Trae's enterprise console
+      // here too, on the same three pages Trae CN's console has and in
+      // dollars. The international deployment has no consumer credits page
+      // (its own page is the dollar billing's), so the card is the seat
+      // pool alone.
+      //
+      // NOT VERIFIED against a real account: no international enterprise
+      // account was available, and console.enterprise.trae.ai answers
+      // another realm's token with 请先登录 — as it answers no token at all,
+      // so whether it refuses the token or wants a console session is not
+      // known either. The paths and fields below are the CN console's shape
+      // read off the international console's own build, which names
+      // seat_pool_currency_quota, the models' total_cost_currency and
+      // ResetTime exactly as Trae CN's does. Whether such an account's
+      // console answers at all is not known.
+      ent: {
+        quota: { path: "/trae/gtm/tob/api/v1/config/get_personal_quota" },
+        spent: { path: "/trae/gtm/tob/api/v1/config/get_user_model_usage" },
+        core: { path: "/trae/gtm/tob/api/v1/config/get_personal_core_data" },
+        read: ({ quota, spent, core }, a, signIn) => {
+          const q = seatPoolOf(quota)
+          if (!q) return { error: "Trae Global usage: the console named no seat pool", signIn, user: a.name }
+          const out = { plan: "Enterprise", user: a.name || a.uid, signIn }
+          if (q.unlimited) out.balance = "unlimited"
+          else if (q.limit > 0) out.windows = [seatUsageWindow(q, seatSpentOf(spent, quota?.user_model_quota?.user_id), entResetOf(core), DOLLARS, "usd")]
+          // a pool of nothing leaves the card nothing to show (#1143)
+          else return { error: `Trae Global usage: the console gives this seat a pool of $${q.limit}`, signIn, user: a.name || a.uid }
+          return out
+        },
+      },
       read: (v, a, signIn, { round }) => {
         const d = dollarUsageOf(v)
         if (!d) return { error: "Trae Global usage: no entitlement pack in the answer", signIn, user: a.name }
@@ -314,26 +430,38 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // gives the IDE a 15- or 16-digit one (iCubeAuthInfo://icube-dc:<id>, see
 // clientDevice), and Trae CN answers a check-in claim on a 19-digit id
 // 9074 where the same account and token on a 16-digit one are taken
-// (magpie-community/plugins#194). Trae's global site keeps the 19 digits
-// it was signed in with: nothing says its ids are shaped otherwise.
+// (magpie-community/plugins#194). The check-in no longer goes on it: since
+// plugins#709 Trae CN refuses 16 digits there too, and ugDevice makes the
+// claim's 15-digit id. Trae's global site keeps the 19 digits it was signed
+// in with: nothing says its ids are shaped otherwise.
 const newDevice = (site) => ({ deviceId: digits(site?.id === "trae-cn" ? 16 : 19), machineId: randomBytes(16).toString("hex"), ...newDeviceKey() })
 
 // ugDevice is the device id a Trae CN account's check-in goes on when this
-// machine's client isn't signed in as it: its own when that already has a
-// client's shape (15 or 16 digits), else, for an account signed in before
-// 0.2.16 with 19 digits, a 16-digit id made from its own device id and
-// uid. That one is the same on every check-in of the account, never
-// rotated and never another account's: it is the account's own device in
-// the shape Trae CN takes (#194), not a new device to get past a refusal,
-// and a 9095 (this device is in for today) on it stays the day's answer.
-// The chat's pages and the renewal keep the device the account signed in
-// with.
+// machine's client isn't signed in as it: its own when that is already 15
+// digits, else a 15-digit id made from its own device id and uid. On
+// 2026-11-05 (plugins#709) Trae CN answered the plugin's claim on an
+// account's own 16-digit id 9074, and the same account, token, headers and
+// body, seconds later, on a 15-digit id (a random one nothing had
+// registered) were taken: on three accounts, from two machines on two
+// ISPs, with magpie's headers and with wild-work's alike, 16 digits was
+// refused every time and 15 taken every time. The client-less tools that
+// check in (trae-mate, providers-hub, wild-work) all send 15 digits too.
+// #194 had found 19 refused and 16 taken; a server-side change between
+// the two is the plain reading. The id is the same on every check-in of
+// the account, never rotated and never another account's, and its first
+// digit is never 0 (a 0 would make it 14 digits as a number): it is the
+// account's own device in the shape Trae CN takes, not a new device to get
+// past a refusal, and a 9095 (this device is in for today) on it stays the
+// day's answer. The chat's pages and the renewal keep the device the
+// account signed in with (16 digits since 0.2.16, 19 before): nothing
+// measured says they want another, and the device is bound into the
+// renewed JWT.
 function ugDevice(a) {
   const id = String(a.deviceId ?? "")
-  if (/^\d{15,16}$/.test(id)) return id
+  if (/^\d{15}$/.test(id)) return id
   if (!id && !a.uid) return id
   const n = BigInt("0x" + createHash("sha256").update(`trae-cn-device\0${id}\0${a.uid ?? ""}`).digest("hex").slice(0, 30))
-  return String(1_000_000_000_000_000n + (n % 9_000_000_000_000_000n))
+  return String(100_000_000_000_000n + (n % 900_000_000_000_000n))
 }
 
 // newDeviceKey is the device's key pair, an ECDSA P-256 one as the clients
@@ -405,6 +533,8 @@ function toAuth(s, site) {
     ...(traeHost(s.host) ? { host: traeHost(s.host) } : {}),
     ...(authHostOf(s.authHost, site) ? { authHost: authHostOf(s.authHost, site) } : {}),
     ...(s.account && Object.keys(s.account).length ? { account: s.account } : {}),
+    // an enterprise seat its console turned a chat away from (4245)
+    ...(s.consoleChat === false ? { consoleChat: false } : {}),
   }
 }
 
@@ -426,6 +556,7 @@ function fromAuth(auth, site) {
     host: auth.host || "",
     authHost: authHostOf(auth.authHost, site),
     account: auth.account && typeof auth.account === "object" ? auth.account : {},
+    ...(auth.consoleChat === false ? { consoleChat: false } : {}),
   }
 }
 
@@ -805,6 +936,68 @@ function ugHeaders(a, site, extra = {}, own) {
     delete h["x-device-brand"]
   }
   return { ...h, ...extra }
+}
+
+// clientShape is the claim request that three tools which check in Trae CN
+// accounts with no Trae CN client on the machine send, and which Trae CN
+// takes: luckymiaow/trae-mate (checkin.rs build_headers, device_map.rs;
+// MIT), iJetLi/dsh-providers-hub's port of it (traeCheckinHeaders), and
+// rockswang/wild-work. All three send body {}, `x-user-region: CN` and a
+// 15-digit device id, none sends the Electron User-Agent or 0.1.69, and
+// none retries a 9074 (wild-work's 8s retry never ran: every one of its
+// claims was taken first time, plugins#709). On plugins#722 the same
+// account this plugin's claim gets 9074 on checks in daily through
+// providers-hub. This is trae-mate's request as it is: its headers, and
+// its device, market user and session ids made from the uid alone, so an
+// account checks in on the device those tools already use for it.
+// plugins#709's bisect then found the id's length to be what Trae CN
+// decides on (16 refused, 15 taken, the headers and body changing
+// nothing), so since 0.2.30 the first claim goes on 15 digits too
+// (ugDevice). This request stays as the one fallback after a 9074: the
+// bisect didn't send it with a 16-digit id, so that nothing else in it
+// matters is not measured.
+const seeded = (seed, salt, n) => {
+  const out = []
+  for (let i = 0; out.length < n; i++) {
+    const c = Buffer.alloc(4)
+    c.writeUInt32BE(i)
+    out.push(...createHash("sha256").update(`${salt}:${seed}`).update(c).digest())
+  }
+  return out.slice(0, n)
+}
+const shapeDevice = (uid) => seeded(String(uid), "devid", 15).map((b) => b % 10).join("")
+function shapeMarketUser(uid) {
+  const b = seeded(String(uid), "market", 16)
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = Buffer.from(b).toString("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+function clientShapeHeaders(a) {
+  const uid = String(a.uid)
+  return {
+    Authorization: `Cloud-IDE-JWT ${a.token}`,
+    Accept: "*/*",
+    "Accept-Encoding": "gzip, deflate",
+    "Accept-Language": "zh-CN",
+    "Content-Type": "application/json",
+    "User-Agent": "VSCode 1.107.1 (TRAE SOLO CN)",
+    "x-market-client-id": "VSCode 1.107.1",
+    "x-market-user-id": shapeMarketUser(uid),
+    "x-user-region": "CN",
+    "x-device-id": shapeDevice(uid),
+    "x-lgw-req-sdk-type": "3",
+    "package-type": "stable_cn",
+    "x-lscbd-aid": "787976",
+    "x-lscbd-platform": "windows",
+    "app-version": "0.1.45",
+    "x-tt-trace-id": `00-${randomBytes(8).toString("hex")}-01`,
+    "vscode-sessionid": Buffer.from(seeded(uid, "sess", 32)).toString("hex"),
+    "x-request-id": randomUUID(),
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "no-cors",
+    "sec-fetch-site": "none",
+  }
 }
 
 // ---- this machine's own Trae CN client ----------------------------------------------
@@ -1314,10 +1507,55 @@ const nativeTools = (tools, moonshot = false) =>
 // from the chat.headers hook to the loader's fetch. It goes no further.
 const SESSION = "x-magpie-trae-session"
 
-// SALT is what the id is derived with, so it says nothing of the words it was
-// made from. New in each process, as Trae's own session ids are one session's
-// own within a run.
-const SALT = randomBytes(16).toString("hex")
+// saltOf is what the id is derived with, so it says nothing to Trae of the
+// words it was made from. It is this machine's own, kept in a file of the
+// plugin's (saltFile) and made once, so a conversation keeps its session_id
+// when the plugin's process starts again: magpie restarts its plugins on an
+// update of magpie or of any plugin, and a salt new in each process gave
+// every conversation going on then a session of its new own — Trae counting
+// it as a conversation started anew, with nothing of the one before (baoguo
+// on magpie's Discord). The file is made under another name and linked into
+// place, so two processes starting at once both read the one that won, never
+// a half-written one. A file that can't be read or made, or holds anything
+// but a salt, is left as it is, and the process uses a salt of its own, as
+// every process did before.
+const saltFile = () => process.env.MAGPIE_TRAE_SESSION_SALT || join(homedir(), ".config", "magpie", "trae-session-salt")
+const SALT_SHAPE = /^[0-9a-f]{32}$/
+let salt = ""
+function saltOf() {
+  if (salt) return salt
+  const file = saltFile()
+  const read = () => {
+    try {
+      const s = readFileSync(file, "utf8").trim()
+      return SALT_SHAPE.test(s) ? s : null
+    } catch (e) {
+      return e?.code === "ENOENT" ? "" : null
+    }
+  }
+  let s = read()
+  if (s === "") {
+    const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
+    try {
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(tmp, randomBytes(16).toString("hex") + "\n", { mode: 0o600 })
+      try {
+        linkSync(tmp, file)
+      } catch (e) {
+        if (e?.code !== "EEXIST") throw e
+      }
+      s = read()
+    } catch {
+      s = null
+    } finally {
+      try {
+        unlinkSync(tmp)
+      } catch {}
+    }
+  }
+  salt = s || randomBytes(16).toString("hex")
+  return salt
+}
 
 // conversationID is the conversation a chat belongs to, as the UUID the
 // request's session_id wants: the session magpie or OpenCode names (its
@@ -1345,7 +1583,7 @@ function conversationID(chat, session, who = "") {
 // uuidOf is a version 4 UUID made of a hash's first 16 bytes: the shape
 // randomUUID() returns, since that is what session_id carried before.
 function uuidOf(s) {
-  const b = Buffer.from(createHash("sha256").update(SALT + "|" + s).digest().subarray(0, 16))
+  const b = Buffer.from(createHash("sha256").update(saltOf() + "|" + s).digest().subarray(0, 16))
   b[6] = (b[6] & 0x0f) | 0x40
   b[8] = (b[8] & 0x3f) | 0x80
   const h = b.toString("hex")
@@ -1380,7 +1618,7 @@ function sessionOf(headers) {
 // request asks for is sent as the Trae name that model takes, and left out
 // when it takes none of that name — Trae rejects a level a model has no entry
 // for, and serves its default when none is asked.
-function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees = false, levels = null) {
+function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees = false, levels = null, entry = null) {
   const config = max?.base ?? req.model
   const body = {
     messages: traeMessages(req, sees),
@@ -1399,6 +1637,34 @@ function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees =
   if (max?.window) {
     if (!body.max_tokens && most > 0) body.max_tokens = most
     body.user_message_context = { model_info: { prompt_max_tokens: max.window - (body.max_tokens || 0) } }
+  }
+  // an enterprise's built-in model says where its config comes from beside
+  // config_name, at the top of the body: Trae CN 3.4.20's own llm_utils_chat
+  // request (libharness, worktree/branch_name.rs, asked with the user's
+  // selected model) is usage, function, messages, conversation_id,
+  // access_type, config_name, model_name, config_source, is_custom_model,
+  // provider. Without them Trae looks the config up among its own presets
+  // and answers 4001 "the param is invalid" on every function (#1258, an
+  // enterprise seat on console.enterprise.trae.cn, 0.2.41, which sent them
+  // under user_message_context.model_info, the agent task's shape). Not yet
+  // seen answering from a real enterprise seat: a Trae preset is sent as
+  // before.
+  //
+  // model_name and provider are the entry's model detail's: Trae's list
+  // types (libharness CloudModelConfigInfo / CloudModelDetailInfo) carry
+  // provider on each model_detail_list item, beside its model_name, and
+  // not on the config, and an enterprise model's detail has no __dev name
+  // for modelName to come from. 0.2.42 read provider off the config and
+  // sent no model_name, so both were missing, and the reporter's seat got
+  // 4023 "We're sorry, something went wrong" on every function (#1258,
+  // AI/deekseek-v4.1-flash and volc/deepseek-v4-1-flash).
+  if (enterpriseModel(entry)) {
+    body.config_source = ENTERPRISE
+    body.is_custom_model = true
+    const detail = enterpriseDetail(entry)
+    if (!body.model_name && detail?.model_name) body.model_name = String(detail.model_name)
+    const provider = entry.provider || detail?.provider
+    if (provider) body.provider = String(provider)
   }
   if (typeof req.temperature === "number") body.temperature = req.temperature
   if (Array.isArray(req.tools) && req.tools.length && req.tool_choice !== "none") {
@@ -1488,7 +1754,13 @@ const eventName = (s) =>
 // went on with no cache field, which magpie can only read as a miss, so
 // since 10-28 every chat showed 0 (yetone/magpie#3979, #3991; plugins#434
 // says Trae stopped sending cache_read_input_tokens then). A count naming
-// the cache, a 0 included, is Trae's own word and goes as before.
+// the cache with nothing read and nothing written is unknown too: Trae
+// answers 0 and 0 while it bills the turn at its cache price (a real
+// Trae CN account on 10-29, deepseek-v4.1-flash, a 146k prompt: 5.84
+// credits cold, 0.12 warm, cache_read 0 on both; dingminhua/dsh-connect-
+// trae's docs/ISSUE69_DIAGNOSIS.md), so a 0 says nothing of the cache
+// (feng2787 on magpie's Discord: every hit 0). A nonzero read or write is
+// Trae's word, as before.
 // DeepSeek's prompt_cache_hit_tokens, a bare cached_tokens and the
 // Responses-style input_tokens_details are read too, the largest of them,
 // should Trae pass a model's own usage on.
@@ -1511,6 +1783,7 @@ function tokensOf(u) {
     const w = n(u.cache_creation_input_tokens, u.cacheCreationInputTokens)
     if (r) out.cache_read_input_tokens = r
     if (w) out.cache_creation_input_tokens = w
+    if (!r && !w) out.magpie_cache_unknown = true
   }
   const thought = n(u.reasoning_tokens, u.completion_tokens_details?.reasoning_tokens)
   if (thought) out.completion_tokens_details = { reasoning_tokens: thought }
@@ -1564,6 +1837,38 @@ class TextTools {
       const sm = this.buf.match(STRAY_AT)
       const s = sm ? sm.index : -1
       const x = this.buf.search(XML_AT)
+      const j = jsonCallAt(this.buf, this.sent + text)
+      if (j >= 0 && [i, d, r, x, s].every((y) => y < 0 || j < y)) {
+        // OpenAI's own wire shape written as text, {"tool_calls":[{…}]} on
+        // a line of its own (plugins#1114): whole and readable, its calls;
+        // cut short, a failure; in code or not readable, text
+        const head = this.buf.slice(0, j)
+        const brace = this.buf.indexOf("{", j)
+        const o = quoted(this.sent + text + head) ? -2 : objectEnd(this.buf, brace)
+        if (o === -1 && !end) {
+          text += head
+          this.buf = this.buf.slice(j)
+          break
+        }
+        if (o === -1) {
+          this.buf = ""
+          text += head
+          this.sent += text
+          return { text, calls, reasoning, error: CUT_SHORT }
+        }
+        const got = o > 0 ? jsonCalls(this.buf.slice(brace, o)) : null
+        if (!got) {
+          text += this.buf.slice(0, brace + 1)
+          this.buf = this.buf.slice(brace + 1)
+          continue
+        }
+        text += head
+        calls.push(...got)
+        this.mark = this.sent.length + text.length
+        this.buf = this.buf.slice(o)
+        this.after = true
+        continue
+      }
       if (s >= 0 && [i, d, r, x].every((y) => y < 0 || s < y)) {
         // a close with no call open, with what GLM left before it
         // (}}</tool_call>, magpie#1945): not the answer, dropped; in code,
@@ -1726,7 +2031,7 @@ class TextTools {
       this.buf = ""
     } else {
       // keep back an opened block, or what may be the start of one
-      const at = [this.buf.search(OPEN_AT), this.buf.search(OPEN_HOLD), this.buf.search(DSML_AT), this.buf.search(REASON_AT), this.buf.search(XML_AT), this.buf.search(XML_HOLD)].filter((x) => x >= 0)
+      const at = [this.buf.search(OPEN_AT), this.buf.search(OPEN_HOLD), this.buf.search(DSML_AT), this.buf.search(REASON_AT), this.buf.search(XML_AT), this.buf.search(XML_HOLD), jsonCallAt(this.buf, this.sent + text), jsonHoldAt(this.buf, this.sent + text)].filter((x) => x >= 0)
       let keep = at.length ? this.buf.length - Math.min(...at) : 0
       if (!keep) for (let k = Math.min(MARK_MAX - 1, this.buf.length); k > 0; k--) if (MARKS.some((m) => m.startsWith(this.buf.slice(-k)))) { keep = k; break }
       // and braces, brackets, quotes or a > a close may still come after
@@ -1880,6 +2185,46 @@ class TextTools {
     if (/^\s*[\w.:-]{1,128}\s*<arg_key>/.test(body)) return { error: close >= 0 ? UNREADABLE : CUT_SHORT }
     return { text: true }
   }
+}
+
+// A {"tool_calls":[{ at a line's start (plugins#1114); before refers to
+// what came before buf, the start of a line only after a line break or
+// blanks.
+const JSON_CALL_AT = /(^|\n)[ \t]*\{\s*"tool_calls"\s*:\s*\[\s*\{/g
+const JSON_CALL_KEY = '{"tool_calls":[{'
+const atLineStart = (before) => !/\S/.test(before.slice(before.lastIndexOf("\n") + 1))
+
+// jsonCallAt is where in buf the line holding such an object starts, or -1
+function jsonCallAt(buf, before) {
+  for (const m of buf.matchAll(JSON_CALL_AT)) {
+    const at = m.index + m[1].length
+    if (at > 0 || atLineStart(before)) return at
+  }
+  return -1
+}
+
+// jsonHoldAt is where buf's last line starts when it may still grow into
+// one (its indent alone too), or -1
+function jsonHoldAt(buf, before) {
+  const k = buf.lastIndexOf("\n") + 1
+  if (k === 0 && !atLineStart(before)) return -1
+  const line = buf.slice(k)
+  return line && JSON_CALL_KEY.startsWith(line.replace(/\s+/g, "")) ? k : -1
+}
+
+// jsonCalls reads such an object's calls: {"name","arguments"} entries or
+// OpenAI's {"type":"function","function":{…}}; null when there are none or
+// one has no name
+function jsonCalls(s) {
+  const list = looseJSON(s)?.tool_calls
+  if (!Array.isArray(list) || !list.length) return null
+  const out = []
+  for (const e of list) {
+    const f = e?.function ?? e
+    if (!f || typeof f.name !== "string" || !f.name) return null
+    out.push({ name: f.name, arguments: callArgs(f) })
+  }
+  return out
 }
 
 const CUT_SHORT = "the model's tool call, written as text, was cut short; it is not sent on as the answer"
@@ -2634,13 +2979,15 @@ async function* chain(held, it) {
 }
 
 // failure is the response for an error Trae answered with
-function failure(site, status, code, message) {
+// ctx, when given, says what was asked: an error that isn't a lapse or a
+// quota names it, so a 502 says which model, where and through what
+function failure(site, status, code, message, ctx = "") {
   message = message || statusLine(status)
   if (status === 401 || lapsedCode(code, site) || (status === 403 && lapsedWords.test(message))) {
     return errorResponse(401, `${site.realm}'s sign-in has expired (${message}); sign in again`, "expired")
   }
   if (status === 429 || quotaCode(code, site) || (status === 403 && quotaWords.test(message))) return errorResponse(429, `${site.realm}: ${message}`)
-  return errorResponse(status >= 400 ? status : 502, `${site.realm}: ${message}${code ? ` (code ${code})` : ""}`)
+  return errorResponse(status >= 400 ? status : 502, `${site.realm}: ${message}${code ? ` (code ${code})` : ""}${ctx ? `; ${ctx}` : ""}`)
 }
 
 // openai is the answer as an OpenAI chat completion: a stream, or one body
@@ -2738,11 +3085,28 @@ const wrongFunction = (code) => ["4001", "4023", "1005"].includes(String(code))
 // The lists also hold the IDE's own helpers (summary, fast_apply, title
 // generation: usage other than chat_completion), configs switched off, and
 // the slots of custom models, which need a provider bound in the IDE.
+//
+// An enterprise's own built-in models are the exception: Trae CN's client
+// (3.4.20, ai-modules-chat ModelConfigSource) marks each entry's
+// config_source Trae 1, Enterprise 2 or Personal 3, and shows the
+// Enterprise ones as "Enterprise-builtin" for every seat of the tenant —
+// served by Trae with the tenant's provider, so a seat picks them like its
+// own. Not being Trae's presets (is_preset false), they come out as custom
+// models (is_custom_model) and were dropped with the personal ones, whose
+// provider key lives in the user's IDE only (plugins#1258, 0.2.41).
+// One the admin switched off (status false) stays out, as in the IDE.
+const ENTERPRISE = 2
+const enterpriseModel = (m) => Number(m?.config_source) === ENTERPRISE
+// enterpriseDetail is the model detail an enterprise model is asked by: its
+// __dev one when it names one, else the first that names a model
+const enterpriseDetail = (m) => devModel(m) ?? (Array.isArray(m?.model_detail_list) ? m.model_detail_list : []).find((d) => d?.model_name)
 function chatModel(m, site) {
   const id = String(m?.config_name ?? "")
-  if (!id || /^custom_model/i.test(id)) return false
+  if (!id) return false
   if (m.usage && m.usage !== "chat_completion") return false
   if (m.config_switch === false) return false
+  if (enterpriseModel(m)) return m.status !== false && !(site?.hidesInvisible && m.is_invisible_to_user === true)
+  if (/^custom_model/i.test(id)) return false
   if (m.is_custom_model === true || m.display_config?.is_custom_model === true) return false
   // the IDE's own picker hides these: Auto-mode routing channels and
   // pay-as-you-go twins of another entry (gemini-3.1-pro vs -paygo/-auto,
@@ -2781,6 +3145,80 @@ const maxModel = (...ms) => {
 // deepseek-v4.1-flash in Max mode
 const MAX = "-max"
 
+  // traeRateOf is a model's consumption multiplier, from the account's list:
+  // display_contact_config is a JSON string naming the rate now and the full
+  // price, and an activity's off-peak windows, which are computed here rather
+  // than trusted from the snapshot the list was read at (a list fetched in
+  // the morning would otherwise say the day price all evening).
+  const traeRateOf = (m, now = Date.now()) => {
+    // A field written badly (an unknown time_zone throws in Intl) must cost
+    // this model its rate alone: this runs inside modelOf, whose caller falls
+    // back to the static list on a throw, losing every model of the list.
+    const read = (raw) => {
+      if (!raw) return {}
+      let cfg
+      try { cfg = typeof raw === "string" ? JSON.parse(raw) : raw } catch { return {} }
+      if (!cfg || typeof cfg !== "object") return {}
+      const num = (x) => (x === null || x === "" || x === undefined ? undefined : Number.isFinite(Number(x)) ? Number(x) : undefined)
+      const activity = cfg.activity_discount
+      const offPeak = activity?.data?.off_peak
+      const windows = Array.isArray(offPeak?.time_windows) ? offPeak.time_windows : []
+      // enable: false says the rate is not in force; the list may keep a
+      // stale data.rate there, so it is not shown.
+      let rate = cfg.consumption_rate?.enable === false ? undefined : num(cfg.consumption_rate?.data?.rate)
+      // A member discount runs alongside consumption_rate, which keeps the
+      // price before it (0.78 while discount.data.consumption_rate is 0.58):
+      // the discounted price is the one to show.
+      const discount = cfg.discount
+      if (discount?.enable) {
+        const after = num(discount?.data?.consumption_rate)
+        if (after !== undefined) rate = after
+      }
+      const was = num(activity?.data?.current?.before_consumption_rate)
+        ?? num(offPeak?.before_consumption_rate)
+        ?? num(discount?.data?.original_consumption_rate)
+      if (activity?.enable && windows.length) {
+        const zone = typeof offPeak?.time_zone === "string" && offPeak.time_zone ? offPeak.time_zone : "Asia/Shanghai"
+        rate = inWindows(windows, zone, now)
+          ? num(offPeak?.after_consumption_rate) ?? rate
+          : num(offPeak?.before_consumption_rate) ?? rate
+      }
+      return {
+        ...(rate !== undefined ? { rate } : {}),
+        ...(rate !== undefined && was !== undefined && was > rate ? { rateWas: was } : {}),
+      }
+    }
+    try {
+      return read(m?.display_contact_config)
+    } catch {
+      // a bad window costs the rate only; give back what the plain field says
+      try {
+        const cfg = typeof m?.display_contact_config === "string" ? JSON.parse(m.display_contact_config) : m?.display_contact_config
+        const plain = cfg?.consumption_rate?.enable === false ? undefined : Number(cfg?.consumption_rate?.data?.rate)
+        return Number.isFinite(plain) ? { rate: plain } : {}
+      } catch { return {} }
+    }
+  }
+
+  // inWindows says whether now falls in one of the windows, as the list
+  // spells them: weekdays 1–7 (Monday first), minutes from midnight, and
+  // the window's own time zone.
+  const inWindows = (windows, timeZone, now) => {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone, weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).formatToParts(new Date(now))
+    const get = (t) => parts.find((p) => p.type === t)?.value
+    const weekday = { Sun: 7, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[get("weekday")]
+    const hour = Number(get("hour"))
+    const minute = Number(get("minute"))
+    if (!Number.isFinite(weekday) || !Number.isFinite(hour) || !Number.isFinite(minute)) return false
+    const mins = hour * 60 + minute
+    return windows.some((w) => Array.isArray(w?.weekdays) && w.weekdays.includes(weekday)
+      && Number.isFinite(w.start_minute) && Number.isFinite(w.end_minute)
+      && mins >= w.start_minute && mins < w.end_minute)
+  }
+
+
 // ---- reasoning levels --------------------------------------------------------------
 //
 // A list entry carries a reasoning_effort_config: the levels its model takes
@@ -2794,6 +3232,15 @@ const MAX = "-max"
 // V4.1 Flash 轻/高/极高 (light/high/extra_high) alone, and its "Max" is the
 // 更大上下文 (Max) 1M-window switch, which is the model id + MAX below, not a
 // level (#434's screenshot).
+//
+// TRAE CN's 极高 (extra_high) is the top of a model that names no max of its
+// own — DeepSeek-V4.1-Flash, GLM-5.3 and Kimi-K3 offer 轻/高/极高 — so it is
+// that model's max too (@avalongarden6 on X, 11-09). Offered as xhigh alone,
+// such a member ranged 低–很高 beside WorkBuddy's and Qoder's …–最高 in a
+// routing group, and the group, which offers the levels its members share,
+// lost max for every member. So such a model is offered max as well, and max
+// is sent as extra_high (topsAtXhigh). An entry that names Trae's own max
+// keeps it: max is max and extra_high is xhigh.
 //
 // An entry without the config takes no level: Trae serves it at its own
 // default and nothing is sent. The plugin used to send none for every model,
@@ -2819,19 +3266,27 @@ const levelsOf = (m) => {
 // spelling here would make the body say "light", which is not one of the
 // levels this plugin offers, and the field would then be dropped. {} when the
 // model takes none.
-const variantsOf = (levels) => Object.fromEntries((levels ?? []).map((level) => [level, { reasoningEffort: level }]))
+const variantsOf = (levels) => Object.fromEntries(offered(levels).map((level) => [level, { reasoningEffort: level }]))
+
+// topsAtXhigh: the entry's top level is extra_high, with no max of its own
+const topsAtXhigh = (levels) => Array.isArray(levels) && levels.includes("xhigh") && !levels.includes("max")
+
+// offered is the levels agents are offered for a model: its own, and max
+// beside an extra_high that is its top (sent as extra_high, effortOf)
+const offered = (levels) => (topsAtXhigh(levels) ? [...levels, "max"] : levels ?? [])
 
 // effortOf is the name to send Trae for an effort the request carries, or
 // undefined when the model doesn't take that one: a level Trae has no entry for
 // is rejected, so nothing is sent instead. The effort arrives in either
 // spelling — this plugin's own (low/high/xhigh) from its variants, or Trae's
 // (light/extra_high) from a client that read them off the list — and both name
-// the same level.
+// the same level. max is sent as extra_high to a model whose top that is.
 const effortOf = (levels, effort) => {
   if (typeof effort !== "string" || !levels) return undefined
   const mine = Object.values(LEVELS).includes(effort) ? effort
     : Object.prototype.hasOwnProperty.call(LEVELS, effort) ? LEVELS[effort]
     : undefined
+  if (mine === "max" && topsAtXhigh(levels)) return "extra_high"
   if (mine === undefined || !levels.includes(mine)) return undefined
   return Object.keys(LEVELS).find((k) => LEVELS[k] === mine)
 }
@@ -2839,12 +3294,16 @@ const effortOf = (levels, effort) => {
 // ---- usage ------------------------------------------------------------------------
 
 // credits adds up the account's entitlement packs as the IDE shows them:
-// each pack with a credit limit (-1 unlimited) and what it used
-function credits(v) {
+// each pack with a credit limit (-1 unlimited) and what it used. until is
+// the soonest end of a pack that still has credits left and has not ended:
+// a spent daily pack or one already past its end changes nothing on the
+// account, so it does not name the date the credits turn over (#718, #1157).
+function credits(v, now = Date.now()) {
   let limit = 0
   let used = 0
   let unlimited = false
   let soonest = 0
+  let lapsing = 0
   for (const p of v?.user_entitlement_pack_list ?? []) {
     const bi = p?.entitlement_base_info ?? {}
     const l = Number(bi?.quota?.credits_limit)
@@ -2854,12 +3313,143 @@ function credits(v) {
     else if (l >= 0) limit += l
     if (u > 0) used += u
     const end = whenOf(bi.end_time ?? bi.expire_time ?? p.end_time)
-    if (end && (!soonest || end < soonest)) soonest = end
+    const left = l === -1 || (l > 0 && u < l)
+    if (!(end && end > now && left)) continue
+    // what a finite pack has left is lost at its end, whether or not a
+    // new pack follows: lapsing is the credits that go at the soonest end
+    // (#718: a TraeCode CN account's sign-in rewards are 31-day packs of
+    // 100, one a day)
+    const rest = l === -1 ? 0 : Math.max(0, l - Math.max(0, u))
+    if (!soonest || end < soonest) (soonest = end), (lapsing = rest)
+    else if (end === soonest) lapsing += rest
   }
-  return { limit, used, unlimited, until: soonest }
+  return { limit, used, unlimited, until: soonest, lapsing }
 }
 
 const round = (n) => Math.round(n * 100) / 100
+
+// yuan is money as Trae CN's console counts it, in yuan. The consumer
+// window's unit is a bare word ("credits"); a currency the card can't name
+// in a unit goes in display, as Cursor's and JoyCode's do.
+const yuan = (n) => "¥" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+// dollars is the same money as the international console counts it. The
+// console's own build picks the symbol by deployment (volcengine ¥,
+// byteplus $), so each realm's console is asked with its own.
+const DOLLARS = (n) => "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+// seatUsageWindow is the seat pool's window, which both realms' consoles
+// name the same way: the pool as the limit and the models' own cost as what
+// was spent, in the realm's money, resetting when the console's period does.
+// The count rides on the window (amount of limit), as the consumer window's
+// does, so magpie says it in the window's row; display carries the currency
+// the card's own row can't name (yetone/magpie#694).
+//
+// A spend the console did not answer (used === null) is not a spend of
+// nothing: the window says no percent and no amount, and its display names
+// the pool with a question mark, so magpie reads the account as unknown
+// rather than as one that has spent none of its allowance.
+function seatUsageWindow(pool, used, until, money, unit) {
+  const w = {
+    name: "Seat Usage",
+    display: used === null ? `? / ${money(pool.limit)}` : `${money(used)} / ${money(pool.limit)}`,
+    limit: round(pool.limit),
+    unit,
+  }
+  if (used === null) w.used = null
+  else {
+    w.used = Math.round(Math.max(0, Math.min(100, (used / pool.limit) * 100)) * 100) / 100
+    w.amount = round(used)
+  }
+  if (until) w.resetsAt = until
+  return w
+}
+
+// PAYGO_UNLIMITED is the console's "no limit": a pay-as-you-go pool is
+// handed this instead of a real one (9999999999), which is not a limit a
+// card should show. The seat pool is the limit that matters.
+const PAYGO_UNLIMITED = 1e9
+
+// seatPoolOf reads an enterprise account's allowance as its console has it:
+// the seat pool, in the realm's money (seat_pool_currency_quota). A pool the
+// console hands PAYGO_UNLIMITED is no limit at all, as the consumer page's
+// -1 is. A pool the console names as null or "" is no pool either: Number()
+// would read both as 0, which would draw an allowance of nothing rather than
+// say the console named none.
+function seatPoolOf(v) {
+  const q = v?.user_model_quota
+  if (!q) return null
+  const raw = q.seat_pool_currency_quota
+  if (raw === null || raw === undefined || raw === "") return null
+  const limit = Number(raw)
+  if (!Number.isFinite(limit)) return null
+  if (limit < 0 || limit >= PAYGO_UNLIMITED) return { limit: 0, unlimited: true }
+  return { limit, unlimited: false }
+}
+
+// seatSpentOf adds up what an enterprise account's models cost, in the
+// realm's money: each model's total_cost_currency in the seat's usage
+// detail. The console gives no total of its own
+// (seat_total_cost_currency is null), so this is the sum, and a model the
+// answer leaves out costs nothing.
+//
+// Only the account's own seat is counted. The console answers an
+// administrator with every seat in the tenant, and adding those up would
+// show one person's card the whole tenant's spend; the account's own seat is
+// the one the quota names (user_model_quota.user_id), which a real console
+// sends. A seat the account's cannot be told apart — several seats and no id
+// to pick by — is not guessed at.
+//
+// null when there is nothing to add up honestly: no usage list at all (the
+// read failed, and a failed read is not a spend of zero), or several seats
+// with no way to say which is the account's.
+function seatSpentOf(v, uid) {
+  const list = v?.user_usage_list
+  if (!Array.isArray(list)) return null
+  const me = uid === undefined || uid === null || uid === "" ? null : String(uid)
+  const ids = new Set(list.map((u) => (u?.user_id === undefined || u?.user_id === null ? "" : String(u.user_id))).filter((s) => s !== ""))
+  let seats = list
+  if (ids.size > 0) {
+    // the seats carry ids: take the account's own. With no id from the quota,
+    // a single seat's answer is that seat; several seats' is not knowable.
+    const want = me ?? (ids.size === 1 ? [...ids][0] : null)
+    if (want === null) return null
+    seats = list.filter((u) => String(u?.user_id ?? "") === want)
+    if (seats.length === 0) return null
+  }
+  let used = 0
+  for (const u of seats) {
+    for (const m of u?.in_seat_detail?.chat_usage_details ?? []) {
+      const c = Number(m?.total_cost_currency)
+      if (Number.isFinite(c) && c > 0) used += c
+    }
+  }
+  return used
+}
+
+// entResetOf is when an enterprise account's seat pool refills, as an ISO
+// string: the console's ResetTime. The usage page reads the same field for
+// its "席位额度将于 <date> 重置" line, so the card and the page name one
+// date. whenOf reads it, which takes the milliseconds the console sends and
+// the seconds a stand-in may. Absent when the console gives none.
+function entResetOf(v) {
+  const t = whenOf(v?.Data?.ResetTime)
+  return t > 0 ? new Date(t).toISOString() : null
+}
+
+// isEnterprise: the sign-in named the realm's enterprise console as the
+// account's host, which is what an enterprise (SaaS) sign-in does — the
+// console serves that account's models and holds its usage. A personal
+// account names the consumer hosts, or none.
+function isEnterprise(a, site) {
+  const named = String(site?.consoleHost ?? "").toLowerCase()
+  if (!named || !a?.host) return false
+  try {
+    return new URL(String(a.host)).hostname.toLowerCase() === named
+  } catch {
+    return false
+  }
+}
 
 // dollarUsageOf reads an account's entitlement pack as the dollar billing
 // has it (the international deployment): the period's allowance in dollars
@@ -2979,6 +3569,39 @@ const makePlugin = (site) => async ({ client }) => {
     return { models: rec.done, expired: rec.expired }
   }
 
+  // the enterprise seats whose console turned a chat away (4245) in this
+  // run, by account: the mark is kept with the sign-in too, and this holds
+  // it when that save fails
+  const consoleRefused = new Set()
+  // hostOf is the account's model host, with that mark applied
+  const hostOf = (a) => {
+    const h = apiOf(a, site)
+    if (site.hosts.console && h === site.hosts.console && consoleRefused.has(a.uid || a.name)) return site.hosts.api
+    return h
+  }
+  // onConsole: the host is the enterprise console, where a 4245 is the
+  // seat's console refusing chats rather than this model or function
+  const onConsole = (host) => !!site.hosts.console && host === site.hosts.console && host !== site.hosts.api
+  const consoleRefuses = (code) => String(code) === "4245"
+
+  // askedOf says what a refused chat asked for: the model, the functions
+  // tried and the host, and whether the account's list has the model at all.
+  // A model typed in by hand that the list doesn't name is the likeliest
+  // cause of a refusal, and the list is read for it (once per REREAD_MS)
+  // only on this failing path.
+  const askedOf = async (a, id, entry, fns, host) => {
+    let listed = !!entry && liveEntry.has(id)
+    if (!listed) {
+      await readList(a).catch(() => {})
+      entry = liveEntry.get(id) ?? null
+      listed = !!entry
+    }
+    const kind = enterpriseModel(entry) ? "enterprise built-in model" : "model"
+    let out = `${kind} ${id} asked through ${fns.join(", ")} on ${host.replace(/^https?:\/\//, "")}`
+    if (!listed && liveEntry.size) out += `; this account's model list doesn't have ${id}, so Trae may not serve it under that id`
+    return out
+  }
+
   const save = async (auth) => {
     try {
       await client?.auth?.set?.({ path: { id: site.id }, body: auth })
@@ -3081,7 +3704,7 @@ const makePlugin = (site) => async ({ client }) => {
     const deviceId = ug && site.id === "trae-cn" ? await clientDevice(a.uid) : undefined
     const own = deviceId ? { deviceId, ...thisMachine() } : undefined
     // every other Trae CN account checks in on its own device, in the
-    // client's shape (ugDevice, #194)
+    // 15-digit shape Trae CN takes (ugDevice, #194, plugins#709)
     if (ug && site.id === "trae-cn" && !own) a = { ...a, deviceId: ugDevice(a) }
     const res = await fetch(url, {
       method,
@@ -3119,34 +3742,57 @@ const makePlugin = (site) => async ({ client }) => {
     const body = first.body
     if (body.checked_in) return { outcome: "done", ...(Number(body.credits) > 0 ? { credit: Number(body.credits) } : {}) }
     if (!body.enable) return { outcome: "inactive" }
-    const claim = await ownRequest(getAuth, a0, site.hosts.auth + site.checkin.claim.path, "POST", "{}")
-    const claimText = await claim.text()
-    let answer
-    try { answer = JSON.parse(claimText) } catch {}
-    const ce = errorOf(answer)
+    const read = async (res) => {
+      const text = await res.text()
+      let v
+      try { v = JSON.parse(text) } catch {}
+      return { claim: res, claimText: text, answer: v, ce: errorOf(v) }
+    }
+    let { claim, claimText, answer, ce } = await read(await ownRequest(getAuth, a0, site.hosts.auth + site.checkin.claim.path, "POST", "{}"))
+    // A 9074 on an account no Trae CN client here is signed in as is
+    // claimed once more, at once, as the tools that check such accounts in
+    // send it (clientShape, plugins#709, #722) — once, never on another
+    // code, and never for an account that rode its own client's device. A
+    // 9074 means Trae took nothing, so the second claim can't take the day
+    // twice; what it answers is the day's answer, read the same way.
+    let again = ""
+    if (String(ce.code) === "9074" && site.id === "trae-cn" && a0.uid && !(await clientDevice(a0.uid))) {
+      let a
+      try {
+        a = await fresh(getAuth)
+      } catch (e) {
+        if (!(e instanceof Expired)) throw e
+      }
+      if (a) {
+        ;({ claim, claimText, answer, ce } = await read(await fetch(site.hosts.auth + site.checkin.claim.path, { method: "POST", headers: clientShapeHeaders(a), body: "{}", signal: AbortSignal.timeout(20_000) })))
+        again = "; claimed again in the request Trae CN's client-less check-in tools send"
+      }
+    }
     if (claim.status === 401 || lapsedCode(ce.code, site)) return { outcome: "failed", message: ce.message || `${a0.name || a0.uid}: Trae's sign-in has expired` }
     // 9095: this device is in for today, whoever took it — the day's answer
-    if (String(ce.code) === "9095") return { outcome: "ineligible", message: `${ce.message || "this device has checked in today"} (${await deviceNote(a0.uid)})` }
+    if (String(ce.code) === "9095") return { outcome: "ineligible", message: `${ce.message || "this device has checked in today"} (${await deviceNote(a0.uid)}${again})` }
     // 9074: Trae did not take this claim for this account's device. Its own
     // words say the pool is busy, which measurements do not bear out: the
     // same account, token and headers were taken on a 16-digit id where a
-    // 19-digit one got 9074 (plugins#194), and on 2026-10-23 the same
+    // 19-digit one got 9074 (plugins#194), on 2026-10-23 the same
     // account and headers were taken on a device id Trae had never seen
-    // while this account's own id answered 9074. So the message says what
+    // while this account's own id answered 9074, and on 2026-11-05 a
+    // 16-digit id got 9074 where 15 digits were taken (plugins#709, so the
+    // claim goes on 15 now: ugDevice). So the message says what
     // Trae said and that the device is what it refused, rather than
     // sending people to check in in Trae CN's app, which is not where the
-    // problem is. No device id is made up or rotated to get round this:
-    // the account keeps its own until a client of its own is here to sign
-    // it in. Nothing is said of signing one in: it is the one thing seen
-    // to change a 9074, but it hasn't been tried on a real account, and
-    // on a claim that already rode a client's device it is what the user
-    // did — the advice would only send them back to do it again. What it
+    // problem is. Its own device is never rotated: an account with no
+    // client here gets one more claim in the client-less tools' request,
+    // on the one id they make from its uid (above), and nothing after
+    // that. Nothing is said of signing a client in: on a claim that
+    // already rode a client's device it is what the user did — the
+    // advice would only send them back to do it again. What it
     // does say, after both 9074 and 9095, is which device the claim went
     // on and why (deviceNote): moxuanchen (plugins#436) had to run
     // clientDevice by hand to learn that the account Trae CN took (A, 100
     // credits) rode the client's device and the one it refused 9074 (B)
     // rode magpie's own, since both of that machine's profiles were A's.
-    if (String(ce.code) === "9074") return { outcome: "ineligible", message: `${ce.message} (9074) — Trae CN did not take this check-in for this account's device (${await deviceNote(a0.uid)})` }
+    if (String(ce.code) === "9074") return { outcome: "ineligible", message: `${ce.message} (9074) — Trae CN did not take this check-in for this account's device (${await deviceNote(a0.uid)}${again})` }
     if (claim.status !== 200 || (ce.code && String(ce.code) !== "0")) return { outcome: "failed", message: ce.message || statusLine(claim.status) }
     if (!answer || typeof answer !== "object" || Array.isArray(answer)) return { outcome: "failed", message: `check-in claim: unreadable reply ${claimText.trim().slice(0, 120) || "(empty)"}` }
     // a claim's own code 0 is not proof the day is in: Trae answers it for
@@ -3186,6 +3832,70 @@ const makePlugin = (site) => async ({ client }) => {
     return { outcome: "claimed", ...(credit > 0 ? { credit } : {}) }
   }
 
+  // enterpriseUsage reads an enterprise (SaaS) account's usage: the seat
+  // pool and what the account's models cost (get_personal_quota and
+  // get_user_model_usage on the realm's console, in the realm's money). On
+  // Trae CN the consumer credits page is read beside them for the card's
+  // second row — that realm's console is what such an account bills on, and
+  // the credits page answers it too with an allowance real calls have been
+  // measured not to touch. The international realm has no such page.
+  const enterpriseUsage = async (a, signIn) => {
+    const ent = site.usage.ent
+    const ask = async (path) => {
+      const r = await post(a, site.hosts.console + path, {})
+      const e = errorOf(r.v)
+      // A console known to take the IDE's own token answers a lapsed sign-in
+      // with 401 or the realm's lapsed code, and that is the sign-in's
+      // trouble. A console that is not known to (the international one, which
+      // no such account could be found to ask) is not allowed to say so: its
+      // refusal is reported as the read's error and the sign-in stands,
+      // because a console that wants its own session would otherwise mark
+      // every one of that realm's enterprise accounts expired, and signing in
+      // again would not clear it.
+      if (r.status === 401 || lapsedCode(e.code, site)) {
+        return site.consoleTakesIdeToken ? { gone: true } : { error: e.message || statusLine(r.status) }
+      }
+      if (r.status !== 200 || (e.code && String(e.code) !== "0")) return { error: e.message || statusLine(r.status) }
+      return { v: r.v }
+    }
+    let quota
+    try {
+      quota = await ask(ent.quota.path)
+    } catch (e) {
+      return { error: `${site.realm} usage: ` + (e?.message ?? e), signIn }
+    }
+    if (quota.gone) return { error: `${a.name || a.uid}: ${site.realm}'s sign-in has expired — sign in again`, signIn: "expired" }
+    if (quota.error) return { error: `${site.realm} usage: ${quota.error}`, signIn, user: a.name }
+    // the spend page is the second half of the count: when it fails, the
+    // allowance is still worth showing but the spend is unknown, and the
+    // window says so (used: null) rather than reading as nothing spent — a
+    // failed read is not a spend of zero
+    let spent = { v: {} }
+    try {
+      const got = await ask(ent.spent.path)
+      if (!got.gone && !got.error) spent = got
+    } catch {}
+    // the console's own period, for the date the pool refills: a failure
+    // there costs the card its reset date and nothing else
+    let core = { v: {} }
+    try {
+      const got = await ask(ent.core.path)
+      if (!got.gone && !got.error) core = got
+    } catch {}
+    // the credits page is the card's second row, never the count: a failure
+    // there leaves the seat pool standing. Trae Global has no such page —
+    // its own usage page is the dollar billing's, read above as the pool.
+    let page = null
+    if (site.usage.kind === "credits") {
+      try {
+        const r = await post(a, site.usage.host(site, a) + site.usage.path, site.usage.body)
+        const e = errorOf(r.v)
+        if (r.status === 200 && (!e.code || String(e.code) === "0")) page = r.v
+      } catch {}
+    }
+    return ent.read({ quota: quota.v, spent: spent.v, core: core.v, credits: page }, a, signIn, { credits, round })
+  }
+
   const usage = async (getAuth) => {
     let a
     try {
@@ -3194,6 +3904,9 @@ const makePlugin = (site) => async ({ client }) => {
       return { error: e.message, signIn: e instanceof Expired ? "expired" : "kept" }
     }
     const signIn = a.renewed ? "renewed" : "kept"
+    // an enterprise (SaaS) account bills on the realm's own console, not on
+    // the page its realm otherwise bills on
+    if (site.usage.ent && isEnterprise(a, site)) return enterpriseUsage(a, signIn)
     let r
     try {
       r = await post(a, site.usage.host(site, a) + site.usage.path, site.usage.body)
@@ -3210,7 +3923,7 @@ const makePlugin = (site) => async ({ client }) => {
   // SOLO CN's ai-agent asks (batch_get_detail_param): {function: entries}.
   // null when Trae answers it with no lists.
   const batchLists = async (a) => {
-    const r = await post(a, apiOf(a, site) + "/api/ide/v1/batch_get_detail_param", {
+    const r = await post(a, hostOf(a) + "/api/ide/v1/batch_get_detail_param", {
       functions: site.functions, agent_type: "", current_config_info: { config_name: "", is_custom_model: false },
       mode_type: 0, access_type: 0, ab_force_vids: "", ab_autotest_advanced_mode: 0, show_custom_model: true,
     })
@@ -3229,7 +3942,7 @@ const makePlugin = (site) => async ({ client }) => {
 
   // listOf is one function's model list, as the IDE asks for it
   const listOf = async (a, fn) => {
-    const r = await post(a, apiOf(a, site) + "/api/ide/v1/get_detail_param", {
+    const r = await post(a, hostOf(a) + "/api/ide/v1/get_detail_param", {
       function: fn, config_names: null, need_prompt: false, current_config_info: null, poly_prompt: true, mode_type: null, agent_type: null,
     })
     if (r.status === 401 || lapsedCode(errorOf(r.v).code, site)) throw new Expired(`${site.realm}'s sign-in has expired; sign in again`)
@@ -3402,6 +4115,7 @@ const makePlugin = (site) => async ({ client }) => {
       // for every model it hands over — so only a non-empty one is kept, or a
       // model in the fallback table would lose the levels its entry names.
       variants: Object.keys(was.variants ?? {}).length ? was.variants : variantsOf(levelsOf(m)),
+      ...traeRateOf(m),
     }
   }
 
@@ -3470,7 +4184,7 @@ const makePlugin = (site) => async ({ client }) => {
         const a0 = fromAuth(await getAuth(), site)
         if (!a0) return {}
         return {
-          baseURL: apiOf(a0, site) + "/v1",
+          baseURL: hostOf(a0) + "/v1",
           apiKey: "trae", // the engine's placeholder; the request carries the JWT
           async fetch(input, init = {}) {
             const r0 = input instanceof Request ? input : null
@@ -3543,47 +4257,79 @@ const makePlugin = (site) => async ({ client }) => {
             // the account answering it, so a failover inside one conversation
             // is not one Trae reads as another's
             const session = conversationID(req, sessionOf(new Headers(init.headers ?? r0?.headers ?? {})), who)
-            for (const fn of [...new Set(fns)]) {
-              const res = await fetch(apiOf(a, site) + "/api/agent/v3/llm_utils_chat", {
-                method: "POST",
-                headers: ideHeaders(a, site, { Accept: "text/event-stream", "X-Request-ID": randomUUID() }),
-                body: JSON.stringify(chatBody(req, fn, named?.fn === fn || max ? named.name : "", named?.fn === fn || max ? named.most : 0, max, session, sees, levels)),
-                signal: ac.signal,
-              })
-              if (!res.ok) {
-                const text = await res.text()
-                const e = errorOf(text)
-                last = failure(site, res.status, e.code, e.message || text.trim().slice(0, 300))
-                if (res.status === 400 && wrongFunction(e.code)) continue
-                break
-              }
-              const ct = res.headers.get("content-type") ?? ""
-              if (!ct.includes("event-stream") && ct.includes("json")) {
-                // an answer that isn't a stream is an error in a 200
-                const e = errorOf(await res.text())
-                last = failure(site, 502, e.code, e.message)
-                if (wrongFunction(e.code)) continue
-                break
-              }
-              const it = parts(sse(res.body), Array.isArray(req.tools) ? req.tools : [])[Symbol.asyncIterator]()
-              const { held, done } = await first(it)
-              const err = held.find((p) => p.error)
-              if (err) {
-                last = failure(site, 502, err.code, err.error)
-                if (wrongFunction(err.code)) {
-                  // another function may take it: this answer's read goes
-                  // with the function it came from, not left hanging
-                  it.return?.()
-                  res.body.cancel?.().catch(() => {})
-                  continue
+            // an enterprise seat chats on its console, which bills the seat
+            // pool. One whose console turns chats away (4245, #1127) is
+            // marked, kept with its sign-in, and the same request is asked
+            // once more on the consumer gateway; its list is read from there
+            // next.
+            // what the last refusal was, and where it was asked: the error
+            // the agent gets names the model, the functions and the host
+            let why = null
+            const tried = []
+            const entry = liveEntryOf(base)
+            for (let round = 0; round < 2; round++) {
+              const host = hostOf(a)
+              let refused = false
+              for (const fn of [...new Set(fns)]) {
+                tried.push(fn)
+                const res = await fetch(host + "/api/agent/v3/llm_utils_chat", {
+                  method: "POST",
+                  headers: ideHeaders(a, site, { Accept: "text/event-stream", "X-Request-ID": randomUUID() }),
+                  body: JSON.stringify(chatBody(req, fn, named?.fn === fn || max ? named.name : "", named?.fn === fn || max ? named.most : 0, max, session, sees, levels, entry)),
+                  signal: ac.signal,
+                })
+                if (!res.ok) {
+                  const text = await res.text()
+                  const e = errorOf(text)
+                  why = { status: res.status, code: e.code, message: e.message || text.trim().slice(0, 300), host }
+                  last = failure(site, why.status, why.code, why.message)
+                  if (onConsole(host) && consoleRefuses(e.code)) { refused = true; break }
+                  if (res.status === 400 && wrongFunction(e.code)) continue
+                  break
                 }
-                break
+                const ct = res.headers.get("content-type") ?? ""
+                if (!ct.includes("event-stream") && ct.includes("json")) {
+                  // an answer that isn't a stream is an error in a 200
+                  const e = errorOf(await res.text())
+                  why = { status: 502, code: e.code, message: e.message, host }
+                  last = failure(site, 502, e.code, e.message)
+                  if (onConsole(host) && consoleRefuses(e.code)) { refused = true; break }
+                  if (wrongFunction(e.code)) continue
+                  break
+                }
+                const it = parts(sse(res.body), Array.isArray(req.tools) ? req.tools : [])[Symbol.asyncIterator]()
+                const { held, done } = await first(it)
+                const err = held.find((p) => p.error)
+                if (err) {
+                  why = { status: 502, code: err.code, message: err.error, host }
+                  last = failure(site, 502, err.code, err.error)
+                  if (onConsole(host) && consoleRefuses(err.code)) {
+                    it.return?.()
+                    res.body.cancel?.().catch(() => {})
+                    refused = true
+                    break
+                  }
+                  if (wrongFunction(err.code)) {
+                    // another function may take it: this answer's read goes
+                    // with the function it came from, not left hanging
+                    it.return?.()
+                    res.body.cancel?.().catch(() => {})
+                    continue
+                  }
+                  break
+                }
+                fnOf.set(who, fn)
+                const out = await openai(req, done ? held : chain(held, it), () => ac.abort(), site)
+                out.headers.set("X-Magpie-Sign-In", signIn)
+                return out
               }
-              fnOf.set(who, fn)
-              const out = await openai(req, done ? held : chain(held, it), () => ac.abort(), site)
-              out.headers.set("X-Magpie-Sign-In", signIn)
-              return out
+              if (!refused) break
+              consoleRefused.add(who)
+              a = { ...a, consoleChat: false }
+              await save(toAuth(a, site))
+              readAt.delete(who)
             }
+            if (why && last.status !== 401 && last.status !== 429) last = failure(site, why.status, why.code, why.message, await askedOf(a, base, entry, [...new Set(tried)], why.host))
             if (!last.headers.has("X-Magpie-Sign-In")) last.headers.set("X-Magpie-Sign-In", signIn)
             return last
           },
@@ -3598,4 +4344,4 @@ const makePlugin = (site) => async ({ client }) => {
 export const TraeCNAuthPlugin = makePlugin(SITES["trae-cn"])
 export const TraeGlobalAuthPlugin = makePlugin(SITES["trae-global"])
 
-export const _internal = { ownClient, clientStoragePaths, clientDevice, clientProfiles, deviceNote, clientDecode, thisMachine, traeHost, accountOf, HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, nameCall, toolNamed, unwrapped, traeMessages, chatBody, nativeTools, moonshotSchema, credits, dollarUsageOf, whenOf, newDevice, ugDevice, proofOf, SITES, SESSION, conversationID, LEVELS, levelsOf, variantsOf, effortOf }
+export const _internal = { chatModel, ownClient, clientStoragePaths, clientDevice, clientProfiles, deviceNote, clientDecode, thisMachine, traeHost, accountOf, HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, nameCall, toolNamed, unwrapped, traeMessages, chatBody, nativeTools, moonshotSchema, credits, dollarUsageOf, seatPoolOf, seatSpentOf, entResetOf, isEnterprise, yuan, whenOf, newDevice, ugDevice, proofOf, SITES, SESSION, conversationID, LEVELS, levelsOf, variantsOf, effortOf, offered, traeRateOf }

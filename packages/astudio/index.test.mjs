@@ -1,21 +1,39 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { AStudioPlugin, _internal } from "./index.mjs"
+import * as astroBrowser from "./browser.mjs"
 
 const {
   createPlugin,
   rowFromCatalogEntry,
   bootstrapRows,
   readDesktopCredential,
+  waitForDesktopCredential,
   readAcodeConfigToken,
   registryDataRoots,
   buildCookieHeader,
   studioJson,
+  exchangeModelToken,
   MODEL_GATEWAY_BASE,
   MODEL_MANAGER_URL,
   STUDIO_API_BASE,
+  STUDIO_VERSION,
+  STUDIO_WEB_URL,
+  OFFICIAL_SITE,
+  DESKTOP_WAIT_MS,
+  BOOTSTRAP,
+  sparkModelIds,
   ID,
 } = _internal
+
+const methodByLabel = (plugin, pattern) => {
+  const method = plugin.auth.methods.find((m) => pattern.test(m.label))
+  assert.ok(method, `没有找到匹配 ${pattern} 的登录方式`)
+  return method
+}
+const desktopMethod = (plugin) => methodByLabel(plugin, /桌面端/)
+const pasteMethod = (plugin) => methodByLabel(plugin, /粘贴/)
+const webMethod = (plugin) => methodByLabel(plugin, /浏览器登录/)
 
 const CATALOG_ENTRY = {
   slug: "spark-x2.6-4b",
@@ -71,12 +89,14 @@ test("rowFromCatalogEntry degrades safely on sparse entries", () => {
 
 test("bootstrap table covers the observed catalog", () => {
   const rows = bootstrapRows()
-  assert.equal(Object.keys(rows).length, 7)
+  assert.equal(Object.keys(rows).length, 8)
   for (const id of ["astronclaw-auto", "spark-x2.6", "spark-x2.6-4b", "xopglm52", "xopdeepseekv4pro0813"]) {
     assert.ok(rows[id], `missing ${id}`)
   }
   assert.equal(rows["spark-x2.6-4b"].free, true)
   assert.equal(rows["xopglm52"].limit.context, 1048576)
+  // 目录接口尚未上、网关已接受的模型：目录读不到时也要能选到。
+  assert.equal(rows["xdeepseek-flash-in"].name, "DeepSeek-V4.1-Flash")
 })
 
 test("readAcodeConfigToken parses the astron-spark section", () => {
@@ -207,8 +227,12 @@ test("models hook maps the live catalog and keeps the old list on network failur
     },
   })
   const rows = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: "k" } })
-  assert.deepEqual(Object.keys(rows), ["spark-x2.6-4b", "xopglm52"])
+  assert.deepEqual(Object.keys(rows), ["spark-x2.6-4b", "xopglm52", "xdeepseek-flash-in"])
   assert.equal(rows["spark-x2.6-4b"].free, true)
+  // 目录没上的模型由 EXTRA_CATALOG 补位，形状与目录行一致（context/推理档位都在）。
+  assert.equal(rows["xdeepseek-flash-in"].name, "DeepSeek-V4.1-Flash")
+  assert.equal(rows["xdeepseek-flash-in"].limit.context, 1048576)
+  assert.equal(rows["xdeepseek-flash-in"].reasoning, true)
 
   const keep = createPlugin({ fetchImpl: async () => { throw new Error("down") } })
   const previousProvider = { models: { kept: true } }
@@ -227,6 +251,54 @@ test("models hook maps the live catalog and keeps the old list on network failur
   await assert.rejects(malformed.provider.models({ models: {} }, { auth: { type: "api", key: "k" } }))
 })
 
+test("catalog rows win over EXTRA_CATALOG for the same slug", async () => {
+  const plugin = createPlugin({
+    fetchImpl: async () => okRes({
+      code: 0,
+      data: { models: [{ slug: "xdeepseek-flash-in", display_name: "DeepSeek-V4.1-Flash（目录）", context_window: 4096, max_output_tokens: 512, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "none" }] }] },
+    }),
+  })
+  const rows = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: "k" } })
+  assert.equal(rows["xdeepseek-flash-in"].name, "DeepSeek-V4.1-Flash（目录）")
+  assert.equal(rows["xdeepseek-flash-in"].limit.context, 4096)
+})
+
+test("EXTRA_CATALOG does not revive a slug the catalog delisted", async () => {
+  // 目录给了这个名字但标成 hidden：那是上游下架的表态，补位表不能把它复活。
+  const plugin = createPlugin({
+    fetchImpl: async () => okRes({
+      code: 0,
+      data: { models: [
+        { slug: "xopglm52", display_name: "GLM-5.2", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "none" }] },
+        { slug: "xdeepseek-flash-in", display_name: "DeepSeek-V4.1-Flash", visibility: "hidden", supported_in_api: true, supported_reasoning_levels: [{ effort: "none" }] },
+      ] },
+    }),
+  })
+  const rows = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: "k" } })
+  assert.deepEqual(Object.keys(rows), ["xopglm52"])
+})
+
+test("an empty catalog is still an error, EXTRA_CATALOG does not mask it", async () => {
+  const plugin = createPlugin({ fetchImpl: async () => okRes({ code: 0, data: { models: [] } }) })
+  await assert.rejects(
+    plugin.provider.models({ models: {} }, { auth: { type: "api", key: "k" } }),
+    /AStudio 模型目录为空/,
+  )
+})
+
+test("catalog reads refuse redirects and carry a timeout", async () => {
+  let init
+  const plugin = createPlugin({
+    fetchImpl: async (_url, options) => {
+      init = options
+      return okRes({ code: 0, data: { models: [CATALOG_ENTRY] } })
+    },
+  })
+  await plugin.provider.models({ models: {} }, { auth: { type: "api", key: "k" } })
+  assert.equal(init.redirect, "error")
+  assert.ok(init.signal, "目录请求要带 AbortSignal 超时")
+})
+
 test("usage hook checks the credential without burning quota", async () => {
   const ok = createPlugin({ fetchImpl: async () => okRes({ code: 0, data: { models: [] } }) })
   assert.deepEqual(await ok.auth.usage(async () => ({ type: "api", key: "k" })), { plan: "AStudio", windows: [] })
@@ -242,27 +314,178 @@ test("usage hook checks the credential without burning quota", async () => {
   assert.deepEqual(await ok.auth.usage(async () => undefined), {})
 })
 
+test("desktop login method is oauth, so magpie shows no key input box", () => {
+  const plugin = createPlugin({ env: {}, registryQuery: () => null, readFileImpl: fakeFs({}) })
+  const method = desktopMethod(plugin)
+  // type:"api" 在 magpie 里就是一个 key 输入框 —— 本方法自己读磁盘，不该要用户输入。
+  assert.equal(method.type, "oauth")
+  assert.match(method.label, /桌面端/)
+  assert.equal(method.prompts, undefined)
+})
+
 test("desktop login method reads real files through authorize", async () => {
   const plugin = createPlugin({
     env: { ASTUDIO_HOME: "D:\\astudio" },
+    registryQuery: () => null,
     readFileImpl: fakeFs({
       "D:\\astudio/userdata/astron-session.json": JSON.stringify({ uid: "u9", modelBearerToken: "tok-9" }),
     }),
   })
-  const method = plugin.auth.methods[0]
-  assert.match(method.label, /桌面端/)
-  const out = await method.authorize({})
-  assert.deepEqual(out, {
+  const out = await desktopMethod(plugin).authorize({})
+  assert.equal(out.url, "")
+  assert.match(out.instructions, /已读取本机 AStudio 登录态（u9）/)
+  assert.equal(out.method, "auto")
+  assert.deepEqual(await out.callback(), {
     type: "success",
     key: "tok-9",
     accountId: "u9",
     metadata: { uid: "u9", source: "D:\\astudio/userdata/astron-session.json", method: "desktop", session: undefined },
   })
+})
 
-  const failing = createPlugin({ env: {}, readFileImpl: fakeFs({}) })
-  const failed = await failing.auth.methods[0].authorize({})
+test("desktop login method points at the official site and waits when nothing is on disk", async () => {
+  let clock = 0
+  const slept = []
+  const plugin = createPlugin({
+    env: {},
+    registryQuery: () => null,
+    readFileImpl: fakeFs({}),
+    sleepImpl: async (ms) => {
+      slept.push(ms)
+      // 变异把 deadline 判断删掉时这里立刻报红，而不是让假 sleep 把事件循环占死。
+      if (slept.length > 400) throw new Error("轮询没有封顶")
+      clock += ms
+    },
+    nowMsImpl: () => clock,
+  })
+  const out = await desktopMethod(plugin).authorize({})
+  assert.equal(out.url, OFFICIAL_SITE)
+  assert.equal(out.method, "auto")
+  assert.match(out.instructions, /没有找到 AStudio 桌面端登录态/)
+  // 用户去装桌面端：等不到就是 failed，并告诉他装好后重试
+  const failed = await out.callback()
   assert.equal(failed.type, "failed")
-  assert.match(failed.error, /未找到/)
+  assert.match(failed.error, /重新点一次/)
+  // 轮询被 DESKTOP_WAIT_MS 封顶，不会无限等下去
+  assert.equal(slept.length, DESKTOP_WAIT_MS / 2000)
+})
+
+test("desktop login method completes on its own once the desktop signs in", async () => {
+  const session = JSON.stringify({ uid: "u7", modelBearerToken: "tok-7" })
+  let reads = 0
+  const plugin = createPlugin({
+    env: { ASTUDIO_HOME: "D:\\astudio" },
+    registryQuery: () => null,
+    sleepImpl: async () => {},
+    readFileImpl: (path) => {
+      if (path !== "D:\\astudio/userdata/astron-session.json") throw Object.assign(new Error("ENOENT"), { code: "ENOENT" })
+      reads += 1
+      if (reads < 3) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" })
+      return session
+    },
+  })
+  const out = await desktopMethod(plugin).authorize({})
+  assert.equal(out.url, OFFICIAL_SITE)
+  assert.equal(reads, 1) // authorize 读一次
+  assert.equal((await out.callback()).key, "tok-7")
+  assert.equal(reads, 3)
+})
+
+test("waitForDesktopCredential stops at the deadline", async () => {
+  let clock = 0
+  const slept = []
+  const result = await waitForDesktopCredential({
+    read: () => ({ error: new Error("没找到") }),
+    sleep: async (ms) => {
+      slept.push(ms)
+      clock += ms
+    },
+    now: () => clock,
+    waitMs: 5000,
+    stepMs: 2000,
+  })
+  assert.equal(result.status, "timeout")
+  assert.equal(result.error.message, "没找到") // 超时要把最后一次的原因带出来
+  assert.deepEqual(slept, [2000, 2000, 2000])
+})
+
+test("desktop login method refuses banned accounts instead of offering the site", async () => {
+  const plugin = createPlugin({
+    env: { ASTUDIO_HOME: "D:\\astudio" },
+    registryQuery: () => null,
+    readFileImpl: fakeFs({
+      "D:\\astudio/userdata/astron-session.json": JSON.stringify({ banned: true, modelBearerToken: "tok" }),
+    }),
+  })
+  // 宿主 host.js 不看 oauth authorize 结果里的 type，只看它抛出的 message 或 callback；
+  // 抛错在任何宿主版本上都把原因原样交给用户。
+  await assert.rejects(() => desktopMethod(plugin).authorize({}, {}), /封禁/)
+})
+
+test("desktop login method explains an unreadable session instead of pointing at install", async () => {
+  const plugin = createPlugin({
+    env: { ASTUDIO_HOME: "D:\\astudio" },
+    registryQuery: () => null,
+    readFileImpl: fakeFs({ "D:\\astudio/userdata/astron-session.json": "{ 不是 JSON" }),
+  })
+  const out = await desktopMethod(plugin).authorize({}, {})
+  assert.equal(out.url, OFFICIAL_SITE)
+  assert.match(out.instructions, /不是有效 JSON/)
+  assert.doesNotMatch(out.instructions, /本机没有找到/)
+})
+
+test("desktop login method keeps a read error instead of calling the machine empty", async () => {
+  const plugin = createPlugin({
+    env: { ASTUDIO_HOME: "D:\\astudio" },
+    registryQuery: () => null,
+    readFileImpl: () => {
+      throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
+    },
+  })
+  const out = await desktopMethod(plugin).authorize({}, {})
+  assert.match(out.instructions, /读取失败.*EACCES/s) // 读不了 ≠ 没装
+})
+
+test("desktop login method reports the last reason when it times out", async () => {
+  let clock = 0
+  const slept = []
+  const plugin = createPlugin({
+    env: { ASTUDIO_HOME: "D:\\astudio" },
+    registryQuery: () => null,
+    readFileImpl: fakeFs({ "D:\\astudio/userdata/astron-session.json": "{}" }),
+    sleepImpl: async (ms) => {
+      slept.push(ms)
+      if (slept.length > 400) throw new Error("轮询没有封顶")
+      clock += ms
+    },
+    nowMsImpl: () => clock,
+  })
+  const out = await desktopMethod(plugin).authorize({}, {})
+  const failed = await out.callback(undefined, {})
+  assert.equal(failed.type, "failed")
+  assert.match(failed.error, /没有 modelBearerToken.token/)
+})
+
+test("desktop login method stops polling when the sign-in is cancelled", async () => {
+  let clock = 0
+  const slept = []
+  const controller = new AbortController()
+  const plugin = createPlugin({
+    env: {},
+    registryQuery: () => null,
+    readFileImpl: fakeFs({}),
+    sleepImpl: async (ms) => {
+      slept.push(ms)
+      clock += ms
+      controller.abort()
+    },
+    nowMsImpl: () => clock,
+  })
+  const out = await desktopMethod(plugin).authorize({}, { signal: controller.signal })
+  const failed = await out.callback(undefined, { signal: controller.signal })
+  assert.equal(failed.type, "failed")
+  assert.match(failed.error, /取消/)
+  assert.equal(slept.length, 1) // 取消后不再空转
 })
 
 test("desktop credential carries the cookie session for points and check-in", () => {
@@ -318,6 +541,8 @@ test("studioJson unwraps the envelope and flags dead sessions", async () => {
 test("studioJson via usage: balance and membership map to quota windows", async () => {
   const session = { token: "T", ssoSessionId: "S", accountId: "A" }
   const plugin = createPlugin({
+    // 时钟钉在 2026-11-06：否则 11-22 之后这条断言会随真实时间过期。
+    nowMsImpl: () => Date.parse("2026-11-06T00:00:00+08:00"),
     fetchImpl: async (input) => {
       const url = String(input)
       if (url.includes("points/balance")) {
@@ -326,6 +551,9 @@ test("studioJson via usage: balance and membership map to quota windows", async 
       if (url.includes("membership/me")) {
         return jsonRes({ flag: true, code: 0, data: { uid: 18800000000, active: true, planCode: "TRIAL", planName: "体验版" } })
       }
+      if (url.includes("points/details")) {
+        return jsonRes({ flag: true, code: 0, data: { total: 1, items: [sparkGrantRow(35000, "2026-11-22T21:34:30")] } })
+      }
       throw new Error(`unexpected ${url}`)
     },
   })
@@ -333,13 +561,38 @@ test("studioJson via usage: balance and membership map to quota windows", async 
   assert.equal(out.plan, "体验版")
   assert.equal(out.user, "18800000000")
   assert.deepEqual(out.windows[0], { name: "通用积分", balance: 7900, aside: false, runsOutAt: "2026-11-03T06:11:12", runsOut: 7900 })
-  assert.deepEqual(out.windows[1], { name: "星火积分", balance: 35000, aside: false })
+  // 星火到期从入账流水推（balance 接口不给星火到期时间）。
+  assert.deepEqual(out.windows[1], { name: "星火积分", balance: 35000, aside: false, models: ["spark-x2.5", "spark-x2.6"], runsOutAt: "2026-11-22T13:34:30.000Z", runsOut: 35000 })
 })
 
-const checkinFetch = (balanceSequence) => {
+test("usage spark window omits expiry when the ledger query fails", async () => {
+  const session = { token: "T", ssoSessionId: "S", accountId: "A" }
+  const plugin = createPlugin({
+    fetchImpl: async (input) => {
+      const url = String(input)
+      if (url.includes("points/balance")) {
+        return jsonRes({ flag: true, code: 0, data: { totalBalance: 7900, activityBalance: 7900, sparkTotalBalance: 35000, sparkActivityBalance: 35000 } })
+      }
+      if (url.includes("membership/me")) {
+        return jsonRes({ flag: true, code: 0, data: { uid: 18800000000, active: true, planCode: "TRIAL", planName: "体验版" } })
+      }
+      if (url.includes("points/details")) {
+        return jsonRes({ flag: false, code: 11001001, desc: "参数无效" })
+      }
+      throw new Error(`unexpected ${url}`)
+    },
+  })
+  const out = await plugin.auth.usage(async () => ({ type: "api", key: "k", metadata: { session } }))
+  // 到期推算失败不塌方：星火窗口退回无 runsOut 形态。
+  assert.deepEqual(out.windows[1], { name: "星火积分", balance: 35000, aside: false, models: ["spark-x2.5", "spark-x2.6"] })
+})
+
+const checkinFetch = (balanceSequence, { popups = [], identityAssert, popupFails = false, onComplete, completeFails = false, ledger, ledgerSequence, ledgerFails = false, sparkLedger, sparkPages } = {}) => {
   let balanceCalls = 0
-  return async (input) => {
+  let ledgerCalls = 0
+  return async (input, init) => {
     const url = String(input)
+    if (identityAssert) identityAssert(init.headers, init)
     if (url.includes("membership/plan-config")) {
       return jsonRes({ flag: true, code: 0, data: { dailyLoginEnabled: true, dailyLoginValidDays: 31, plans: [{ planCode: "TRIAL", dailyLoginPoints: 100 }] } })
     }
@@ -348,6 +601,37 @@ const checkinFetch = (balanceSequence) => {
       const total = balanceSequence[Math.min(balanceCalls - 1, balanceSequence.length - 1)]
       return jsonRes({ flag: true, code: 0, data: { totalBalance: total, activityBalance: total } })
     }
+    if (url.includes("points/details")) {
+      if (ledgerFails) return jsonRes({ flag: false, code: 11001001, desc: "参数无效" })
+      // 当日窗口（起止同日）=「每日登录赠送」查询；跨 60 天窗口 = 星火到期查询。
+      const params = new URL(url).searchParams
+      const isDailyQuery = params.get("startTime")?.slice(0, 10) === params.get("endTime")?.slice(0, 10)
+      if (!isDailyQuery && sparkPages) {
+        const page = Number(params.get("pageNum") ?? 1)
+        const items = sparkPages[page - 1] ?? []
+        return jsonRes({ flag: true, code: 0, data: { total: 0, pageNum: page, pageSize: 50, items } })
+      }
+      // ledgerSequence 区分「签到前读」与「签到后读」：前者没有行，后者有。
+      let items
+      if (isDailyQuery) {
+        ledgerCalls += 1
+        items = ledgerSequence
+          ? ledgerSequence[Math.min(ledgerCalls - 1, ledgerSequence.length - 1)]
+          : ledger
+      } else {
+        items = sparkLedger
+      }
+      return jsonRes({ flag: true, code: 0, data: { total: items?.length ?? 0, pageNum: 1, pageSize: 50, items: items ?? [] } })
+    }
+    if (url.includes("client-popups/pending")) {
+      if (popupFails) return jsonRes({ flag: false, code: 11001001, desc: "客户端平台、版本或构建号无效", data: null })
+      return jsonRes({ flag: true, code: 0, data: popups })
+    }
+    if (url.includes("client-popups/complete")) {
+      if (completeFails) return jsonRes({ flag: false, code: 11003002, desc: "每日奖励已领取" }, 409)
+      if (onComplete) onComplete(JSON.parse(init.body))
+      return jsonRes({ flag: true, code: 0, data: null })
+    }
     if (url.includes("membership/me") || url.includes("points/summary")) {
       return jsonRes({ flag: true, code: 0, data: {} })
     }
@@ -355,18 +639,155 @@ const checkinFetch = (balanceSequence) => {
   }
 }
 
+const dailyGrantRow = (createTime = "2026-11-06T00:00:30", amount = 100) => ({
+  assetCode: "GENERAL_POINTS", deductions: [], direction: "CREDIT", operation: "GRANT",
+  amount, balanceAfter: 8000, sourceType: "ACTIVITY", reason: "每日登录赠送", createTime,
+  expireTime: "2026-12-07T00:00:30",
+})
+
+const sparkGrantRow = (amount, expireTime) => ({
+  assetCode: "SPARK_POINTS", deductions: [], direction: "CREDIT", operation: "GRANT",
+  amount, balanceAfter: 35000, sourceType: "ACTIVITY", reason: "1024讯飞开发者节狂欢", createTime: "2026-10-22T21:34:30",
+  expireTime,
+})
+
+const dailyRewardPopup = [{
+  popupId: 42, popupCode: "DAILY_LOGIN_REWARD_V1", popupType: "BANNER", componentType: "DAILY_REWARD_DIALOG",
+  priority: 100, instanceKey: "20261109", payload: { confirmText: "知道了", title: "今日登录积分已到账" },
+}]
+
+const otherRewardPopup = {
+  popupId: 7, popupCode: "CLIENT_DOWNLOAD_REWARD", popupType: "MODAL", componentType: "CLIENT_DOWNLOAD_REWARD_DIALOG",
+  priority: 300, instanceKey: "download", payload: {},
+}
+
 const checkinAuth = { type: "api", key: "k", metadata: { session: { token: "T", ssoSessionId: "S", accountId: "A" } } }
 
-test("check-in observes the balance delta around the session touch", async () => {
-  const claimed = createPlugin({ fetchImpl: checkinFetch([7900, 8000]), sleepImpl: async () => {} })
-  const out = await claimed.auth.checkin(async () => checkinAuth)
-  assert.deepEqual(out, { outcome: "claimed", credit: 100, message: "每日登录积分 +100" })
+test("check-in completes the pending daily reward popup and claims from the ledger", async () => {
+  // 主路径：当日还没有 GRANT 行 ⇒ complete 这一条每日奖励弹窗 ⇒ 再读流水。
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 8000], {
+      popups: dailyRewardPopup,
+      ledgerSequence: [[], [dailyGrantRow()]],
+      onComplete: (body) => completed.push(body),
+    }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "claimed")
+  assert.equal(out.credit, 100)
+  assert.match(out.message, /本次领取/)
+  assert.deepEqual(completed, [{ popupId: 42, instanceKey: "20261109" }])
+})
 
-  const unobserved = createPlugin({ fetchImpl: checkinFetch([7900, 7900]), sleepImpl: async () => {} })
-  const out2 = await unobserved.auth.checkin(async () => checkinAuth)
-  // 余额没涨不谎称 done（宿主渲染成「今日已签到」）：inactive + 实情 message。
-  assert.equal(out2.outcome, "inactive")
-  assert.match(out2.message, /未观测到新发放/)
+test("check-in trusts the daily grant ledger and writes nothing when already granted", async () => {
+  // 当日已有 GRANT 行：done，一个弹窗不读、一个写请求不发。
+  let popupReads = 0
+  let completeCalls = 0
+  const plugin = createPlugin({
+    fetchImpl: async (input, init) => {
+      const url = String(input)
+      if (url.includes("client-popups/pending")) popupReads += 1
+      if (url.includes("client-popups/complete")) completeCalls += 1
+      return checkinFetch([8000, 8000], { ledger: [dailyGrantRow()] })(input, init)
+    },
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "done")
+  assert.equal(out.credit, 100)
+  assert.match(out.message, /已发放/)
+  assert.equal(popupReads, 0)
+  assert.equal(completeCalls, 0)
+})
+
+test("check-in never reports done without a daily grant ledger row", async () => {
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 7900], { popups: [], ledger: [], onComplete: (body) => completed.push(body) }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "inactive")
+  assert.notEqual(out.outcome, "done")
+  assert.equal(completed.length, 0)
+})
+
+test("check-in claims when the grant lands after the complete call", async () => {
+  // complete 之后才有 GRANT 行 ⇒ 本次领取。
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 8000], {
+      popups: dailyRewardPopup,
+      ledgerSequence: [[], [dailyGrantRow()]],
+      onComplete: (body) => completed.push(body),
+    }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "claimed")
+  assert.equal(completed.length, 1)
+})
+
+test("check-in completes only the daily reward popup among mixed popups", async () => {
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 8000], {
+      popups: [otherRewardPopup, ...dailyRewardPopup],
+      ledgerSequence: [[], [dailyGrantRow()]],
+      onComplete: (body) => completed.push(body),
+    }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "claimed")
+  assert.deepEqual(completed, [{ popupId: 42, instanceKey: "20261109" }])
+})
+
+test("check-in message warns about spark points expiring within 7 days", async () => {
+  // 星火大额批次 5 天后到期：签到消息要带上提醒。
+  const soon = new Date(Date.now() + 5 * 86400000)
+  const p2 = (n) => String(n).padStart(2, "0")
+  const stamp = `${soon.getFullYear()}-${p2(soon.getMonth() + 1)}-${p2(soon.getDate())}T21:34:30`
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([8000, 8000], {
+      ledger: [dailyGrantRow()],
+      sparkLedger: [sparkGrantRow(35000, stamp)],
+    }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "done")
+  assert.match(out.message, /35000 星火积分 \d 天内到期|35000 星火积分 今天到期/)
+})
+
+test("check-in message stays quiet when spark expiry is far away", async () => {
+  const far = new Date(Date.now() + 40 * 86400000)
+  const p2 = (n) => String(n).padStart(2, "0")
+  const stamp = `${far.getFullYear()}-${p2(far.getMonth() + 1)}-${p2(far.getDate())}T21:34:30`
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([8000, 8000], {
+      ledger: [dailyGrantRow()],
+      sparkLedger: [sparkGrantRow(35000, stamp)],
+    }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.doesNotMatch(out.message, /到期/)
+})
+
+test("check-in fails without writes when the ledger query fails", async () => {
+  // 流水是唯一判据：读不到就不能猜，也不发 complete。
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 7900], { ledgerFails: true, popups: dailyRewardPopup, onComplete: (body) => completed.push(body) }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "failed")
+  assert.match(out.message, /获得明细|参数无效/)
+  assert.equal(completed.length, 0)
 })
 
 test("check-in reports ineligible without a session and inactive without the campaign", async () => {
@@ -382,6 +803,159 @@ test("check-in reports ineligible without a session and inactive without the cam
   assert.equal(out2.outcome, "inactive")
 })
 
+test("check-in sends the desktop client identity on account requests", async () => {
+  const seen = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 7900], {
+      identityAssert: (headers, init) => seen.push({ headers, method: init.method ?? "GET" }),
+    }),
+    sleepImpl: async () => {},
+  })
+  await plugin.auth.checkin(async () => checkinAuth)
+  // 没有待领取弹窗的 inactive 路径只发只读 GET：plan-config、当日流水、pending。
+  const gets = seen.filter((item) => item.method !== "POST")
+  assert.equal(gets.length, 3)
+  assert.ok(seen.every((item) => item.method !== "POST"))
+  for (const { headers } of seen) {
+    assert.equal(headers.clientType, process.platform === "darwin" ? "22" : "21")
+    assert.equal(headers.studioVersion, STUDIO_VERSION)
+  }
+})
+
+test("check-in reports inactive without completing when no daily popup is pending", async () => {
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 7900], { popups: [], ledger: [], onComplete: (body) => completed.push(body) }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "inactive")
+  assert.match(out.message, /没有待领取/)
+  assert.equal(completed.length, 0)
+})
+
+test("check-in only completes popups that match the daily reward contract", async () => {
+  // popupId 非正整数、instanceKey 为空：契约不成立，绝不 complete，也不判 done。
+  for (const broken of [
+    { ...dailyRewardPopup[0], popupId: 0 },
+    { ...dailyRewardPopup[0], popupId: -1 },
+    { ...dailyRewardPopup[0], instanceKey: "  " },
+    { ...dailyRewardPopup[0], instanceKey: undefined },
+  ]) {
+    const completed = []
+    const plugin = createPlugin({
+      fetchImpl: checkinFetch([7900, 7900], { popups: [broken], ledger: [], onComplete: (body) => completed.push(body) }),
+      sleepImpl: async () => {},
+    })
+    const out = await plugin.auth.checkin(async () => checkinAuth)
+    assert.equal(out.outcome, "inactive")
+    assert.equal(completed.length, 0)
+  }
+})
+
+test("check-in ignores other popup types and never completes them", async () => {
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 7900], {
+      popups: [otherRewardPopup, { ...dailyRewardPopup[0], componentType: "NEW_USER_DIALOG" }],
+      ledger: [],
+      onComplete: (body) => completed.push(body),
+    }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "inactive")
+  assert.equal(completed.length, 0)
+})
+
+test("check-in fails without writes when the popup query fails", async () => {
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 7900], { popupFails: true, ledger: [], onComplete: (body) => completed.push(body) }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "failed")
+  assert.match(out.message, /11001001|平台|版本/)
+  assert.equal(completed.length, 0)
+})
+
+test("check-in does not report done when complete succeeds but no grant row appears", async () => {
+  // complete 成功 ≠ 到账：流水没有再复读一次，仍未出现就 failed。
+  let sleeps = 0
+  let ledgerReads = 0
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: async (input, init) => {
+      const url = String(input)
+      if (url.includes("points/details")) ledgerReads += 1
+      return checkinFetch([7900, 7900], {
+        popups: dailyRewardPopup,
+        ledger: [],
+        onComplete: (body) => completed.push(body),
+      })(input, init)
+    },
+    sleepImpl: async () => { sleeps += 1 },
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "failed")
+  assert.match(out.message, /流水未出现/)
+  assert.equal(completed.length, 1)
+  // complete 前 1 次 + complete 后立即 1 次 + 短延迟后 1 次；不无限重试。
+  assert.equal(ledgerReads, 3)
+  assert.equal(sleeps, 1)
+})
+
+test("check-in reads the ledger once more after a short delay and claims", async () => {
+  const completed = []
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 8000], {
+      popups: dailyRewardPopup,
+      ledgerSequence: [[], [], [dailyGrantRow()]],
+      onComplete: (body) => completed.push(body),
+    }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "claimed")
+  assert.equal(out.credit, 100)
+  assert.equal(completed.length, 1)
+})
+
+test("check-in surfaces complete failures and does not claim", async () => {
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([7900, 7900], { popups: dailyRewardPopup, ledger: [], completeFails: true }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "failed")
+  assert.match(out.message, /每日奖励领取/)
+  assert.match(out.message, /已领取/)
+})
+
+test("check-in never calls init-app or auth/bearer-token", async () => {
+  const paths = []
+  const plugin = createPlugin({
+    fetchImpl: async (input) => {
+      const url = String(input)
+      paths.push(url)
+      if (url.includes("membership/plan-config")) {
+        return jsonRes({ flag: true, code: 0, data: { dailyLoginEnabled: true } })
+      }
+      if (url.includes("points/balance")) {
+        return jsonRes({ flag: true, code: 0, data: { totalBalance: 7900, activityBalance: 7900 } })
+      }
+      if (url.includes("client-popups/pending")) return jsonRes({ flag: true, code: 0, data: [] })
+      if (url.includes("points/details")) return jsonRes({ flag: true, code: 0, data: { total: 0, items: [] } })
+      return jsonRes({ flag: true, code: 0, data: {} })
+    },
+    sleepImpl: async () => {},
+  })
+  await plugin.auth.checkin(async () => checkinAuth)
+  assert.ok(!paths.some((p) => p.includes("tenant-app/v2/init-app")))
+  assert.ok(!paths.some((p) => p.includes("auth/bearer-token")))
+})
+
 test("check-in propagates dead sessions as signIn expired", async () => {
   const dead = createPlugin({
     fetchImpl: async () => jsonRes({ flag: false, code: 80000, desc: "登录异常，请重新登录" }, 200),
@@ -395,7 +969,7 @@ test("check-in propagates dead sessions as signIn expired", async () => {
 
 test("paste login method stores key plus cookie session inputs", async () => {
   const plugin = createPlugin()
-  const method = plugin.auth.methods[1]
+  const method = pasteMethod(plugin)
   assert.match(method.label, /粘贴/)
   const out = await method.authorize({ modelBearerToken: "tok-p", uid: "u7", sessionToken: "tok-36", accountId: "A7", ssoSessionId: "sso-7" })
   assert.deepEqual(out, {
@@ -443,5 +1017,585 @@ test("module export is a plugin factory", async () => {
   const plugin = await AStudioPlugin()
   assert.equal(typeof plugin.config, "function")
   assert.equal(typeof plugin.auth.loader, "function")
-  assert.equal(plugin.auth.methods.length, 2)
+  assert.equal(plugin.auth.methods.length, 3)
+})
+
+// ---------------------------------------------------------------- 网页登录（多账号）
+
+// 假浏览器模块：startBrowserHarvest 立刻给出一个收割结果，removeProfile 记账。
+function fakeBrowser({ session = { token: "tok-web", accountId: "A-web", ssoSessionId: "sso-web" }, profilePath = "C:/tmp/astudio-profile" } = {}) {
+  const calls = { started: 0, closed: 0, released: 0, removed: [] }
+  return {
+    calls,
+    startBrowserHarvest() {
+      calls.started++
+      return {
+        promise: Promise.resolve({
+          session,
+          profilePath,
+          release: async () => { calls.released++ },
+          close: async () => { calls.closed++ },
+        }),
+        abort: async () => {},
+      }
+    },
+    async removeProfile(path) { calls.removed.push(path) },
+  }
+}
+
+const webFetch = ({ uid = "u-web", token = "tok-model-web", exchangeStatus = 200 } = {}) => async (input) => {
+  const url = String(input)
+  if (url.includes("membership/me")) return jsonRes({ flag: true, code: 0, data: uid ? { uid } : {} })
+  if (url.includes("auth/bearer-token")) {
+    if (exchangeStatus !== 200) return jsonRes({}, exchangeStatus)
+    return jsonRes({ flag: true, code: 0, data: { modelBearerToken: token } })
+  }
+  throw new Error(`unexpected ${url}`)
+}
+
+test("web login is the recommended oauth method, listed first", () => {
+  const plugin = createPlugin()
+  const method = webMethod(plugin)
+  assert.equal(method.type, "oauth")
+  assert.match(method.label, /推荐/)
+  assert.match(method.label, /多账号/)
+  assert.equal(method.prompts, undefined)
+  assert.equal(plugin.auth.methods[0], method)
+})
+
+test("web login harvests cookies, exchanges the model token, and drops the browser profile", async () => {
+  const browser = fakeBrowser()
+  const plugin = createPlugin({ fetchImpl: webFetch(), browserModule: browser })
+  const out = await webMethod(plugin).authorize({}, {})
+  // 浏览器由插件自己弹出，宿主不要再开 url（mclaw 同款 opened:true）。
+  assert.equal(out.url, "")
+  assert.equal(out.opened, true)
+  assert.match(out.instructions, /登录/)
+  assert.equal(out.method, "auto")
+  const result = await out.callback()
+  assert.deepEqual(result, {
+    type: "success",
+    key: "tok-model-web",
+    accountId: "u-web",
+    metadata: {
+      uid: "u-web",
+      method: "web",
+      source: STUDIO_WEB_URL,
+      session: { token: "tok-web", accountId: "A-web", ssoSessionId: "sso-web" },
+    },
+  })
+  assert.equal(browser.calls.started, 1)
+  assert.equal(browser.calls.closed, 1)
+  assert.equal(browser.calls.released, 1)
+  // 会话已进 metadata.session，浏览器目录不留第二份凭据。
+  assert.deepEqual(browser.calls.removed, ["C:/tmp/astudio-profile"])
+})
+
+test("web login retries a transient membership read before failing", async () => {
+  let reads = 0
+  const sleeps = []
+  const flaky = async (input) => {
+    if (String(input).includes("membership/me") && reads++ === 0) throw new Error("network down")
+    return webFetch()(input)
+  }
+  const plugin = createPlugin({ fetchImpl: flaky, sleepImpl: async (ms) => { sleeps.push(ms) }, browserModule: fakeBrowser() })
+  const out = await webMethod(plugin).authorize({}, {})
+  const result = await out.callback()
+  assert.equal(result.type, "success")
+  assert.equal(result.accountId, "u-web")
+  assert.equal(reads, 2)
+  // 真实等 2s 会让这条测试变成最慢的一条；注入 sleep 只验「等过」。
+  assert.deepEqual(sleeps, [2000])
+})
+
+test("web login retries a membership read that answered 5xx", async () => {
+  let reads = 0
+  const flaky = async (input) => {
+    if (String(input).includes("membership/me") && reads++ === 0) return jsonRes({}, 502)
+    return webFetch()(input)
+  }
+  const plugin = createPlugin({ fetchImpl: flaky, sleepImpl: async () => {}, browserModule: fakeBrowser() })
+  const result = await (await webMethod(plugin).authorize({}, {})).callback()
+  assert.equal(result.type, "success")
+  assert.equal(reads, 2)
+})
+
+test("web login refuses to promise a window when no browser is installed", async () => {
+  const browser = {
+    ...fakeBrowser(),
+    browserExecutable: async () => { throw new Error("找不到 Chrome/Edge；请安装其中一个") },
+  }
+  const plugin = createPlugin({ fetchImpl: webFetch(), browserModule: browser })
+  await assert.rejects(() => webMethod(plugin).authorize({}, {}), /找不到 Chrome/)
+  assert.equal(browser.calls.started, 0)
+})
+
+test("check-in reads the ledger for a web session without a token cookie", async () => {
+  const urls = []
+  const plugin = createPlugin({
+    nowMsImpl: () => Date.parse("2026-11-06T02:00:00Z"),
+    fetchImpl: async (input) => {
+      const url = String(input)
+      urls.push(url)
+      if (url.includes("membership/plan-config")) {
+        return jsonRes({ flag: true, code: 0, data: { dailyLoginEnabled: true } })
+      }
+      if (url.includes("points/details")) {
+        return jsonRes({
+          flag: true,
+          code: 0,
+          data: { items: [{ direction: "CREDIT", operation: "GRANT", reason: "每日登录赠送", amount: 100, createTime: "2026-11-06 00:00:30" }] },
+        })
+      }
+      throw new Error(`unexpected ${url}`)
+    },
+  })
+  // 网页登录收割的会话可以没有 token Cookie（只需 ssoSessionId + account_id）。
+  const out = await plugin.auth.checkin(async () => ({
+    type: "api",
+    key: "k",
+    metadata: { session: { accountId: "A-web", ssoSessionId: "S-web" } },
+  }))
+  assert.equal(out.outcome, "done")
+  assert.ok(urls.some((url) => url.includes("points/details")))
+})
+
+test("web login drops the profile when the session cannot become an account", async () => {
+  const browser = fakeBrowser()
+  const plugin = createPlugin({ fetchImpl: webFetch({ uid: "" }), browserModule: browser })
+  const out = await webMethod(plugin).authorize({}, {})
+  const result = await out.callback()
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /没有 uid/)
+  assert.deepEqual(browser.calls.removed, ["C:/tmp/astudio-profile"])
+  assert.equal(browser.calls.closed, 1)
+})
+
+test("web login drops the profile when the exchange is refused", async () => {
+  const browser = fakeBrowser()
+  const plugin = createPlugin({ fetchImpl: webFetch({ exchangeStatus: 401 }), browserModule: browser })
+  const out = await webMethod(plugin).authorize({}, {})
+  const result = await out.callback()
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /会话已失效/)
+  assert.deepEqual(browser.calls.removed, ["C:/tmp/astudio-profile"])
+})
+
+test("two web logins with different accounts return different accountIds", async () => {
+  const signIn = async (uid) => {
+    const plugin = createPlugin({ fetchImpl: webFetch({ uid }), browserModule: fakeBrowser() })
+    const out = await webMethod(plugin).authorize({}, {})
+    return (await out.callback()).accountId
+  }
+  // 宿主按 accountId 给账号池分格：uid 不同 = 两个账号，uid 相同 = 同一账号。
+  assert.equal(await signIn("u-a"), "u-a")
+  assert.equal(await signIn("u-b"), "u-b")
+})
+
+test("exchangeModelToken reads modelBearerToken and reports the envelope error", async () => {
+  const session = { token: "T", accountId: "A" }
+  assert.equal(await exchangeModelToken(session, webFetch({ token: "tok-x" })), "tok-x")
+  await assert.rejects(() => exchangeModelToken(session, async () => jsonRes({ flag: false, code: 7, desc: "拒绝" })), /拒绝/)
+  await assert.rejects(() => exchangeModelToken(session, async () => ({ ok: true, status: 200, json: async () => { throw new Error("x") } })), /不是 JSON/)
+})
+
+test("desktop sign-in falls back to account_id when the session has no uid", async () => {
+  const plugin = createPlugin({
+    env: { ASTUDIO_HOME: "D:\astudio" },
+    readFileImpl: fakeFs({
+      "D:\astudio/userdata/astron-session.json": JSON.stringify({
+        accountId: "A-only", token: "tok-36", ssoSessionId: "sso-36", modelBearerToken: "tok-65",
+      }),
+    }),
+  })
+  const out = await desktopMethod(plugin).authorize({}, {})
+  const result = await out.callback()
+  assert.equal(result.accountId, "A-only")
+})
+
+test("the same account signed in both ways lands on one accountId", async () => {
+  const plugin = createPlugin({
+    env: { ASTUDIO_HOME: "D:\astudio" },
+    readFileImpl: fakeFs({
+      "D:\astudio/userdata/astron-session.json": JSON.stringify({
+        uid: "u-same", accountId: "u-same", token: "tok-36", ssoSessionId: "sso-36", modelBearerToken: "tok-65",
+      }),
+    }),
+    fetchImpl: webFetch({ uid: "u-same" }),
+    browserModule: fakeBrowser(),
+  })
+  const desktop = await (await desktopMethod(plugin).authorize({}, {})).callback()
+  const web = await (await webMethod(plugin).authorize({}, {})).callback()
+  assert.equal(desktop.accountId, "u-same")
+  assert.equal(web.accountId, desktop.accountId)
+})
+
+// ---------------------------------------------------------------- browser.mjs
+
+const fakeChrome = (cookies = []) => ({
+  connection: { send: async () => ({ cookies }), closed: false },
+  close: async () => {},
+})
+
+test("harvestAstronSession prefers the most specific domain and needs ssoSessionId plus account_id", async () => {
+  const cookies = [
+    { name: "token", value: "t-other", domain: ".example.com" },
+    { name: "token", value: "t-generic", domain: ".xfyun.cn" },
+    { name: "token", value: "t-passport", domain: "passport.xfyun.cn" },
+    { name: "token", value: "t-host", domain: "agent.xfyun.cn" },
+    { name: "account_id", value: "A1", domain: ".xfyun.cn" },
+    { name: "ssoSessionId", value: "S1", domain: ".xfyun.cn" },
+  ]
+  assert.deepEqual((await astroBrowser.harvestAstronSession(fakeChrome(cookies))).session, {
+    token: "t-host", accountId: "A1", ssoSessionId: "S1",
+  })
+  // 网页登录可能没有 token Cookie：账号面与换发只需 ssoSessionId + account_id。
+  const noToken = cookies.filter((c) => c.name !== "token")
+  assert.deepEqual((await astroBrowser.harvestAstronSession(fakeChrome(noToken))).session, {
+    accountId: "A1", ssoSessionId: "S1",
+  })
+  assert.equal(await astroBrowser.harvestAstronSession(fakeChrome([{ name: "token", value: "t", domain: ".xfyun.cn" }])), undefined)
+  assert.equal(await astroBrowser.harvestAstronSession(fakeChrome([
+    { name: "account_id", value: "A1", domain: ".xfyun.cn" },
+  ])), undefined)
+})
+
+test("startBrowserHarvest rejects, closes the window, and removes the profile on abort", async () => {
+  let closed = 0
+  const removed = []
+  const open = async ({ profilePath }) => ({
+    browser: { ...fakeChrome(), close: async () => { closed++ } },
+    profilePath,
+    release: async () => {},
+  })
+  const harvest = astroBrowser.startBrowserHarvest({
+    startUrl: "https://example.com",
+    profilePath: "C:/tmp/astudio-abort-profile",
+    open,
+    removeProfileImpl: async (path) => { removed.push(path) },
+  })
+  // 先挂 rejection 断言再 abort：abort 会立刻让 promise 拒绝。
+  const rejected = assert.rejects(() => harvest.promise, /登录已取消/)
+  await harvest.abort()
+  await rejected
+  assert.equal(closed, 1)
+  // 宿主取消后 callback 不会再被调，profile 没人认领，必须删掉（abort 与 catch
+  // 都会删，rm 幂等，所以只断言「删过这个路径」）。
+  assert.ok(removed.includes("C:/tmp/astudio-abort-profile"))
+})
+
+test("startBrowserHarvest times out when no sign-in appears", async () => {
+  const removed = []
+  const open = async ({ profilePath }) => ({ browser: fakeChrome(), profilePath, release: async () => {} })
+  const harvest = astroBrowser.startBrowserHarvest({
+    startUrl: "https://example.com",
+    deadlineMs: 0,
+    open,
+    removeProfileImpl: async (path) => { removed.push(path) },
+  })
+  await assert.rejects(() => harvest.promise, (error) => {
+    assert.match(error.message, /登录超时/)
+    // 不足 1 分钟要说秒，不能渲染成「0 分钟」。
+    assert.doesNotMatch(error.message, /0 分钟/)
+    return true
+  })
+  assert.equal(removed.length, 1)
+})
+
+test("startBrowserHarvest removes the profile when the browser cannot start", async () => {
+  const removed = []
+  const harvest = astroBrowser.startBrowserHarvest({
+    startUrl: "https://example.com",
+    profilePath: "C:/tmp/never-opened",
+    open: async () => { throw new Error("找不到浏览器") },
+    removeProfileImpl: async (path) => { removed.push(path) },
+  })
+  await assert.rejects(() => harvest.promise, /找不到浏览器/)
+  assert.deepEqual(removed, ["C:/tmp/never-opened"])
+})
+
+test("web login does not retry a deterministic 4xx", async () => {
+  let calls = 0
+  const plugin = createPlugin({
+    fetchImpl: async (input) => {
+      if (String(input).includes("membership/me")) {
+        calls++
+        return jsonRes({ flag: false, code: 7, desc: "参数无效" }, 400)
+      }
+      return webFetch()(input)
+    },
+    browserModule: fakeBrowser(),
+  })
+  const out = await webMethod(plugin).authorize({}, {})
+  const result = await out.callback()
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /参数无效/)
+  assert.equal(calls, 1)
+})
+
+test("usage reads the account API from a token-less web session", async () => {
+  const seen = []
+  const plugin = createPlugin({
+    fetchImpl: async (input) => {
+      seen.push(String(input))
+      if (String(input).includes("points/balance")) {
+        return jsonRes({ flag: true, code: 0, data: { totalBalance: 42 } })
+      }
+      if (String(input).includes("membership/me")) return jsonRes({ flag: true, code: 0, data: { uid: "u" } })
+      return jsonRes({ flag: true, code: 0, data: {} })
+    },
+  })
+  const out = await plugin.auth.usage(async () => ({
+    type: "api",
+    key: "k",
+    metadata: { session: { accountId: "A", ssoSessionId: "S" } },
+  }))
+  assert.ok(seen.some((u) => u.includes("points/balance")))
+  assert.equal(out.windows[0].balance, 42)
+})
+
+// ---------------------------------------------------------------- 北京时间窗口
+
+test("check-in builds the daily ledger window in Beijing time", async () => {
+  // 北京 2026-11-06 00:00:30（UTC 还是 11-05）：窗口必须是北京的当日，
+  // 否则午夜批量发放会被算到窗口外，签到误报 inactive。
+  const seen = []
+  const plugin = createPlugin({
+    nowMsImpl: () => Date.parse("2026-11-05T16:00:30Z"),
+    fetchImpl: async (input) => {
+      const url = String(input)
+      seen.push(url)
+      if (url.includes("points/details")) return jsonRes({ flag: true, code: 0, data: { items: [] } })
+      if (url.includes("membership/plan-config")) return jsonRes({ flag: true, code: 0, data: { dailyLoginEnabled: true } })
+      if (url.includes("points/balance")) return jsonRes({ flag: true, code: 0, data: { totalBalance: 8000, activityBalance: 8000 } })
+      return jsonRes({ flag: true, code: 0, data: {} })
+    },
+    sleepImpl: async () => {},
+  })
+  await plugin.auth.checkin(async () => checkinAuth)
+  const daily = seen.find((url) => url.includes("points/details"))
+  const params = new URL(daily).searchParams
+  assert.equal(params.get("startTime"), "2026-11-06 00:00:00")
+  assert.equal(params.get("endTime"), "2026-11-06 00:00:30")
+})
+
+test("spark expiry window also uses Beijing bounds", async () => {
+  const seen = []
+  const plugin = createPlugin({
+    nowMsImpl: () => Date.parse("2026-11-06T00:00:00+08:00"),
+    fetchImpl: async (input) => {
+      const url = String(input)
+      seen.push(url)
+      if (url.includes("points/balance")) {
+        return jsonRes({ flag: true, code: 0, data: { totalBalance: 0, activityBalance: 0, sparkTotalBalance: 35000 } })
+      }
+      if (url.includes("membership/me")) return jsonRes({ flag: true, code: 0, data: {} })
+      if (url.includes("points/details")) return jsonRes({ flag: true, code: 0, data: { items: [] } })
+      throw new Error(`unexpected ${url}`)
+    },
+  })
+  await plugin.auth.usage(async () => ({ type: "api", key: "k", metadata: { session: { token: "T", accountId: "A" } } }))
+  const spark = seen.find((url) => url.includes("points/details"))
+  const params = new URL(spark).searchParams
+  assert.equal(params.get("startTime"), "2026-09-07 00:00:00")
+  assert.equal(params.get("endTime"), "2026-11-06 00:00:00")
+})
+
+test("check-in ignores a GRANT row that is not the daily login grant", async () => {
+  // reason 过滤：别的活动赠送不能冒充每日登录积分。
+  const plugin = createPlugin({
+    fetchImpl: checkinFetch([8000, 8000], { ledger: [{ ...dailyGrantRow(), reason: "活动奖励" }] }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.equal(out.outcome, "inactive")
+})
+
+test("spark expiry sums one batch, skips expired rows, and caps at the balance", async () => {
+  const plugin = createPlugin({
+    nowMsImpl: () => Date.parse("2026-11-06T00:00:00+08:00"),
+    fetchImpl: async (input) => {
+      const url = String(input)
+      if (url.includes("points/balance")) {
+        return jsonRes({ flag: true, code: 0, data: { totalBalance: 0, activityBalance: 0, sparkTotalBalance: 20000 } })
+      }
+      if (url.includes("membership/me")) return jsonRes({ flag: true, code: 0, data: {} })
+      if (url.includes("points/details")) {
+        return jsonRes({ flag: true, code: 0, data: { items: [
+          sparkGrantRow(10000, "2026-11-22T21:34:30"),
+          sparkGrantRow(25000, "2026-11-22T21:34:30"),
+          sparkGrantRow(9999, "2026-10-01T00:00:00"), // 已过期，跳过
+        ] } })
+      }
+      throw new Error(`unexpected ${url}`)
+    },
+  })
+  const out = await plugin.auth.usage(async () => ({ type: "api", key: "k", metadata: { session: { token: "T", accountId: "A" } } }))
+  // 同批 10000+25000=35000，但余额只剩 20000 ⇒ 提示按余额封顶。
+  const spark = out.windows.find((w) => w.name === "星火积分")
+  assert.equal(spark.runsOut, 20000)
+  assert.equal(spark.runsOutAt, "2026-11-22T13:34:30.000Z")
+})
+
+test("spark expiry reads past the first page of ledger rows", async () => {
+  const filler = Array.from({ length: 50 }, (_, i) => ({ ...dailyGrantRow(), createTime: `2026-10-${String((i % 28) + 1).padStart(2, "0")}T00:00:00` }))
+  const plugin = createPlugin({
+    nowMsImpl: () => Date.parse("2026-11-06T00:00:00+08:00"),
+    fetchImpl: async (input) => {
+      const url = String(input)
+      if (url.includes("points/balance")) {
+        return jsonRes({ flag: true, code: 0, data: { totalBalance: 0, activityBalance: 0, sparkTotalBalance: 35000 } })
+      }
+      if (url.includes("membership/me")) return jsonRes({ flag: true, code: 0, data: {} })
+      if (url.includes("points/details")) {
+        const page = Number(new URL(url).searchParams.get("pageNum") ?? 1)
+        const items = page === 1 ? filler : [sparkGrantRow(35000, "2026-11-22T21:34:30")]
+        return jsonRes({ flag: true, code: 0, data: { items } })
+      }
+      throw new Error(`unexpected ${url}`)
+    },
+  })
+  const out = await plugin.auth.usage(async () => ({
+    type: "api",
+    key: "k",
+    metadata: { session: { token: "T", accountId: "A" } },
+  }))
+  const spark = out.windows.find((w) => w.name === "星火积分")
+  assert.equal(spark.runsOut, 35000)
+  assert.equal(spark.runsOutAt, "2026-11-22T13:34:30.000Z")
+})
+
+test("check-in counts days to expiry by Beijing calendar days", async () => {
+  // 北京 11-06 23:00，到期 11-07 00:30：不到 24 小时，但日历上是「1 天内」。
+  const plugin = createPlugin({
+    nowMsImpl: () => Date.parse("2026-11-06T23:00:00+08:00"),
+    fetchImpl: checkinFetch([8000, 8000], {
+      ledger: [dailyGrantRow()],
+      sparkLedger: [sparkGrantRow(35000, "2026-11-07T00:30:00")],
+    }),
+    sleepImpl: async () => {},
+  })
+  const out = await plugin.auth.checkin(async () => checkinAuth)
+  assert.match(out.message, /35000 星火积分 1 天内到期/)
+})
+
+test("web login does not retry a session the server turns away", async () => {
+  // code 80000 = 登录异常：studioJson 映射成 signIn expired，retryTransient 不重试。
+  let calls = 0
+  const plugin = createPlugin({
+    fetchImpl: async (input) => {
+      if (String(input).includes("membership/me")) {
+        calls++
+        return jsonRes({ flag: false, code: 80000, desc: "登录异常，请重新登录" })
+      }
+      return webFetch()(input)
+    },
+    browserModule: fakeBrowser(),
+  })
+  const out = await webMethod(plugin).authorize({}, {})
+  const result = await out.callback()
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /会话已失效/)
+  assert.equal(calls, 1)
+})
+
+test("web login's account requests refuse redirects and carry a timeout", async () => {
+  let exchangeInit
+  const plugin = createPlugin({
+    fetchImpl: async (input, init) => {
+      if (String(input).includes("auth/bearer-token")) {
+        exchangeInit = init
+        return jsonRes({ flag: true, code: 0, data: { modelBearerToken: "tok" } })
+      }
+      return webFetch()(input)
+    },
+    browserModule: fakeBrowser(),
+  })
+  const out = await webMethod(plugin).authorize({}, {})
+  const result = await out.callback()
+  assert.equal(result.type, "success")
+  assert.equal(exchangeInit.redirect, "error")
+  assert.ok(exchangeInit.signal, "请求要带超时 signal")
+})
+
+test("web login maps a code 80000 from the exchange to sign-in expired", async () => {
+  let exchangeCalls = 0
+  const plugin = createPlugin({
+    fetchImpl: async (input) => {
+      if (String(input).includes("auth/bearer-token")) {
+        exchangeCalls++
+        return jsonRes({ flag: false, code: 80000, desc: "登录异常，请重新登录" })
+      }
+      return webFetch()(input)
+    },
+    browserModule: fakeBrowser(),
+  })
+  const out = await webMethod(plugin).authorize({}, {})
+  const result = await out.callback()
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /会话已失效/)
+  assert.equal(exchangeCalls, 1)
+})
+
+// magpie 怎么读窗口（internal/provider/routing.go allowanceOf / Limit.applies）：
+// aside 的窗口不挡账号；列了 models 的窗口只算这些模型；balance ≤ 0 即用光。
+const gating = (windows, model) =>
+  windows.filter((w) => !w.aside && (!w.models || w.models.map((m) => m.toLowerCase()).includes(model.toLowerCase())))
+const exhaustedFor = (windows, model) => gating(windows, model).some((w) => typeof w.balance === "number" && w.balance <= 0)
+
+const poolsFetch = (totalBalance, sparkTotalBalance) => async (input) => {
+  const url = String(input)
+  if (url.includes("points/balance")) return jsonRes({ flag: true, code: 0, data: { totalBalance, activityBalance: 0, sparkTotalBalance } })
+  if (url.includes("membership/me")) return jsonRes({ flag: true, code: 0, data: { uid: 1, planName: "体验版" } })
+  if (url.includes("points/details")) return jsonRes({ flag: true, code: 0, data: { items: [] } })
+  throw new Error(`unexpected ${url}`)
+}
+
+test("Spark points at 0 leave the general-points models routable (plugins#990)", async () => {
+  // 报告者的账号：通用积分 1500，星火积分 0。
+  const plugin = createPlugin({ fetchImpl: poolsFetch(1500, 0) })
+  const out = await plugin.auth.usage(async () => ({ type: "api", key: "k", metadata: { session: { token: "T", accountId: "A" } } }), { models: bootstrapRows() })
+  const spark = out.windows.find((w) => w.name === "星火积分")
+  assert.equal(spark.balance, 0)
+  assert.deepEqual(spark.models, ["spark-x2.5", "spark-x2.6"])
+  for (const model of ["xopdsv4flash0731in", "xopdeepseekv4pro0813", "xopglm52", "astronclaw-auto"]) {
+    assert.equal(exhaustedFor(out.windows, model), false, `${model} 扣通用积分，不该被星火积分挡住`)
+  }
+  // 星火模型仍按星火积分判：0 就是用光。限免的 Lite 不扣积分，不挡。
+  assert.equal(exhaustedFor(out.windows, "spark-x2.6"), true)
+  assert.equal(exhaustedFor(out.windows, "spark-x2.5"), true)
+  assert.equal(exhaustedFor(out.windows, "spark-x2.6-4b"), false)
+})
+
+test("general points at 0 still stop the account", async () => {
+  const plugin = createPlugin({ fetchImpl: poolsFetch(0, 35000) })
+  const out = await plugin.auth.usage(async () => ({ type: "api", key: "k", metadata: { session: { token: "T", accountId: "A" } } }), { models: bootstrapRows() })
+  assert.equal(exhaustedFor(out.windows, "xopdsv4flash0731in"), true)
+  assert.equal(out.windows.find((w) => w.name === "通用积分").models, undefined)
+})
+
+test("the Spark window follows the account's live catalog", () => {
+  // 目录新增星火模型就圈进去；目录说限免的不圈；目录把 Lite 的限免撤了就圈。
+  assert.deepEqual(
+    sparkModelIds({
+      "spark-x3": { id: "spark-x3" },
+      "spark-x2.6-4b": { id: "spark-x2.6-4b" },
+      "spark-x2.6": { id: "spark-x2.6", free: true },
+      xopglm52: { id: "xopglm52" },
+    }),
+    ["spark-x2.5", "spark-x2.6-4b", "spark-x3"],
+  )
+  // 没有目录（usage 没拿到 provider）时退回启动表。
+  const fromBootstrap = BOOTSTRAP.filter((m) => /^spark-/.test(m.id) && !m.free).map((m) => m.id).sort()
+  assert.deepEqual(sparkModelIds(undefined), fromBootstrap)
+})
+
+test("a Spark window with no model to count is shown only", async () => {
+  const all = Object.fromEntries(BOOTSTRAP.filter((m) => /^spark-/.test(m.id)).map((m) => [m.id, { id: m.id, free: true }]))
+  const plugin = createPlugin({ fetchImpl: poolsFetch(1500, 0) })
+  const out = await plugin.auth.usage(async () => ({ type: "api", key: "k", metadata: { session: { token: "T", accountId: "A" } } }), { models: all })
+  const spark = out.windows.find((w) => w.name === "星火积分")
+  assert.equal(spark.aside, true)
+  assert.equal(spark.models, undefined)
+  assert.equal(exhaustedFor(out.windows, "xopdsv4flash0731in"), false)
 })

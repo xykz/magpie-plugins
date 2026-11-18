@@ -43,11 +43,20 @@ function routeToFake() {
     return real(`http://127.0.0.1:${server.port}/${new URL(host).host}${url.slice(host.length)}`, init)
   }
 }
+const ADDRESS_SLOTS = 6 // startGate.address
 afterEach(() => {
   globalThis.fetch = real
   got.length = 0
   answer = null
   _internal.edge.until = 0
+  _internal.busyHold.until = 0
+  _internal.busyHold.hits.length = 0
+  _internal.busyHold.now = () => Date.now()
+  // a reply a test leaves unread keeps its Start Plan slot (startGate)
+  _internal.startGate.lanes.clear()
+  _internal.startGate.narrow.clear()
+  _internal.startGate.now = () => Date.now()
+  _internal.startGate.address = ADDRESS_SLOTS
 })
 
 const sha = (s) => createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16)
@@ -89,36 +98,39 @@ const day = (() => {
   const p = (n) => String(n).padStart(2, "0")
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 })()
+// the untrusted-downloads note, ZCode 3.17.2's env-info.ts bullet
+const UNTRUSTED =
+  "Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, keep scripts you write in a different directory, and pass paths as arguments instead of running an interpreter or build tool from inside it. Interpreters load code from the script's directory and the current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. This does not apply to code the user asked you to build or run."
 // the environment section: the agent's folder and git repository only as
-// magpie told them (where), never the plugin's own process.cwd() (#86)
-const environment = (powered, where = []) =>
+// magpie told them (where), never the plugin's own process.cwd() (#86);
+// bullets one space in, as 3.17.2 renders them
+const environment = (where = []) =>
   [
     "# Environment",
-    "You have been invoked in the following environment:",
+    "You have been invoked in the following environment: ",
     ...where,
-    "- Platform: " + process.platform,
-    "- OS Version: " + osVersion,
-    ...(powered ? [`- You are powered by the model named ${powered}.`] : []),
+    " - Platform: " + process.platform,
+    " - OS Version: " + osVersion,
+    " - " + UNTRUSTED,
   ].join("\n")
+const poweredBy = (powered) => PROMPT.poweredBy.replace("{provider}", powered.split("/")[0]).replace("{model}", powered.split("/").slice(1).join("/"))
 const eph = { type: "ephemeral" }
 // zcodeSystem is ZCode's three blocks, the agent's own system texts (own)
 // joined to the end of the third
 const zcodeSystem = (powered, where, own = []) => [
   { type: "text", text: PROMPT.cliPrefix, cache_control: eph },
   { type: "text", text: PROMPT.stableSections.join("\n\n"), cache_control: eph },
-  { type: "text", text: "\n\n" + [PROMPT.beforeEnvironment, environment(powered, where), PROMPT.afterEnvironment, ...own].join("\n\n"), cache_control: eph },
+  {
+    type: "text",
+    text:
+      "\n\n" +
+      [PROMPT.dynamicBehavior, environment(where), ...(powered ? [poweredBy(powered)] : []), PROMPT.contextManagement, ...own].join("\n\n"),
+    cache_control: eph,
+  },
 ]
 const reminder = {
   role: "user",
-  content: [
-    {
-      type: "text",
-      text:
-        "<system-reminder>As you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is " +
-        day +
-        ".\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.</system-reminder>",
-    },
-  ],
+  content: [{ type: "text", text: "<system-reminder>Today's date is " + day + ".</system-reminder>" }],
 }
 // the device, and the conversation as x-session-id names it; the agent named none
 const userID = () => JSON.stringify({ device_id: DEVICE, account_uuid: "", session_id: _internal.sessionOf("", DEVICE) })
@@ -164,9 +176,9 @@ test("a Start Plan request's system is ZCode's three blocks, the agent's text at
     expect(b.system.length).toBe(3)
     expect(b.system).toEqual(zcodeSystem("zai-api/GLM-5.3", undefined, own))
     // the first two are ZCode's byte for byte; the third ends with the agent's
-    expect(sha(b.system[0].text)).toBe("46dd360a22c87a92")
-    expect(sha(b.system[1].text)).toBe("49bda31511fc9670")
-    expect(b.system[2].text.endsWith(PROMPT.afterEnvironment + "\n\n" + own.join("\n\n"))).toBe(true)
+    expect(sha(b.system[0].text)).toBe("7779642ea44a4696")
+    expect(sha(b.system[1].text)).toBe("8eaf38ce3f1f2f15")
+    expect(b.system[2].text.endsWith(PROMPT.contextManagement + "\n\n" + own.join("\n\n"))).toBe(true)
   }
   // with no system of the agent's, the third block ends where ZCode's does
   got.length = 0
@@ -174,20 +186,57 @@ test("a Start Plan request's system is ZCode's three blocks, the agent's text at
   expect(JSON.parse(r.body).system).toEqual(zcodeSystem("zai-api/GLM-5.3"))
 })
 
+// plugins#348 (XinOrigin, 11-04): zcode.z.ai lets a Start Plan request
+// through only when its system is an array of two or three text blocks,
+// ZCode's first byte for byte and its second as ZCode's begins; a string,
+// no system, the first alone, the first with a block of the caller's, or a
+// fourth block answers 405/3012. Claude Code's billing-header block and
+// Codex's string instructions, the two shapes a magpie agent sends, each
+// go out as the passing row: ZCode's three, the agent's text after
+// ZCode's own sections in the third. On 11-06 both, and Claude Code's
+// thinking, context_management and output_config, got past the check
+// live (1005 for an account with no gift) where ZCode's first block alone
+// got 3012.
+test("an agent's system goes out as the shape zcode.z.ai lets through (plugins#348)", async () => {
+  const claude = [
+    { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.310; cc_entrypoint=cli;" },
+    { type: "text", text: "You are an interactive agent that helps users with software engineering tasks.", cache_control: eph },
+    { type: "text", text: "# CLAUDE.md\nproject rules", cache_control: eph },
+  ]
+  const codex = "You are Codex, a coding agent. You and the user share the same workspace."
+  const extra = { thinking: { type: "adaptive" }, context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] }, output_config: { effort: "high" } }
+  for (const system of [claude, codex, undefined, [{ type: "text", text: PROMPT.cliPrefix }]]) {
+    got.length = 0
+    const r = await send(start("zai"), JSON.stringify({ model: "GLM-5.3-Flash", max_tokens: 8, system, ...extra, messages: [{ role: "user", content: "hi" }] }))
+    const b = JSON.parse(r.body)
+    expect(Array.isArray(b.system)).toBe(true)
+    expect(b.system.length).toBe(3)
+    expect(b.system.every((x) => x.type === "text")).toBe(true)
+    expect(b.system[0].text).toBe(PROMPT.cliPrefix)
+    expect(b.system[1].text).toBe(PROMPT.stableSections.join("\n\n"))
+    expect(b.system[2].text.startsWith("\n\n" + PROMPT.dynamicBehavior)).toBe(true)
+    const own = system === undefined ? [] : typeof system === "string" ? [system] : system.map((x) => x.text)
+    expect(b.system[2].text.endsWith(PROMPT.contextManagement + (own.length ? "\n\n" + own.join("\n\n") : ""))).toBe(true)
+    for (const k of Object.keys(extra)) expect(b[k]).toEqual(extra[k])
+  }
+})
+
 test("the prompt texts are the plugin's, byte for byte", () => {
-  expect(sha(PROMPT.cliPrefix)).toBe("46dd360a22c87a92")
-  expect(PROMPT.cliPrefix).toBe("You are ZCode, an interactive coding agent")
+  expect(sha(PROMPT.cliPrefix)).toBe("7779642ea44a4696")
+  expect(PROMPT.cliPrefix).toBe("You are ZCode, an interactive agent")
   expect(PROMPT.stableSections.length).toBe(2)
-  expect(sha(PROMPT.stableSections[0])).toBe("3f21ff9a88a03a76")
-  expect(PROMPT.stableSections[0].length).toBe(1211)
-  expect(sha(PROMPT.stableSections[1])).toBe("39a1e86c93452c01")
-  expect(PROMPT.stableSections[1].length).toBe(1100)
-  expect(sha(PROMPT.stableSections.join("\n\n"))).toBe("49bda31511fc9670")
-  expect(PROMPT.stableSections.join("\n\n").length).toBe(2313)
-  expect(sha(PROMPT.beforeEnvironment)).toBe("bbdc66b399d297ff")
-  expect(PROMPT.beforeEnvironment.length).toBe(3065)
-  expect(sha(PROMPT.afterEnvironment)).toBe("1732b7f098a925d7")
-  expect(PROMPT.afterEnvironment.length).toBe(1915)
+  expect(sha(PROMPT.stableSections[0])).toBe("aac4ba4cc7b555b3")
+  expect(PROMPT.stableSections[0].length).toBe(1229)
+  expect(sha(PROMPT.stableSections[1])).toBe("86e0396775d5ed0e")
+  expect(PROMPT.stableSections[1].length).toBe(1377)
+  expect(sha(PROMPT.stableSections.join("\n\n"))).toBe("8eaf38ce3f1f2f15")
+  expect(PROMPT.stableSections.join("\n\n").length).toBe(2608)
+  expect(sha(PROMPT.dynamicBehavior)).toBe("7d843753f3adae93")
+  expect(PROMPT.dynamicBehavior.length).toBe(975)
+  expect(sha(PROMPT.sessionGuidance)).toBe("6596a0131800c779")
+  expect(PROMPT.sessionGuidance.length).toBe(163)
+  expect(sha(PROMPT.contextManagement)).toBe("406a0480d88086cd")
+  expect(PROMPT.contextManagement.length).toBe(559)
 })
 
 test("a Start Plan request carries ZCode's headers, and only those", async () => {
@@ -203,9 +252,9 @@ test("a Start Plan request carries ZCode's headers, and only those", async () =>
     "anthropic-version": "2023-06-01",
     "content-type": "application/json",
     "http-referer": "https://zcode.z.ai",
-    "user-agent": "ZCode/3.16.3 ai-sdk/anthropic/3.0.81",
-    "x-zcode-app-version": "3.16.3",
-    "x-title": "Z Code@cli",
+    "user-agent": "ZCode/3.17.2 ai-sdk/anthropic/3.0.81",
+    "x-zcode-app-version": "3.17.2",
+    "x-title": "Z Code@electron",
     "x-release-channel": "production",
     "x-client-language": o.locale,
     "x-client-timezone": o.timeZone,
@@ -217,9 +266,12 @@ test("a Start Plan request carries ZCode's headers, and only those", async () =>
     "x-zcode-session-type": "main",
     "x-zcode-trace-id": h["x-zcode-trace-id"],
     "x-zcode-query-source": "main_turn",
+    // the user's query this turn answers, as 3.17.2 names it
+    "x-query-id": _internal.queryOf(JSON.stringify(agentBody), _internal.sessionOf("", DEVICE)),
     // the conversation, as ZCode names it; the agent told none (#387)
     "x-session-id": _internal.sessionOf("", DEVICE),
   })
+  expect(h["x-query-id"]).toMatch(UUID)
   expect(h["x-api-key"]).toBeUndefined()
   expect(h["x-device-mid"]).toBeUndefined()
 })
@@ -254,7 +306,7 @@ test("a Start Plan request from Claude Code goes with ZCode's headers alone, wit
     const h = own(r.headers)
     for (const k of Object.keys(CLAUDE_CODE)) if (!TRANSPORT.has(k)) expect(h[k]).toBeUndefined()
     expect(Object.keys(h).sort()).toEqual(
-      ["authorization", "anthropic-version", "content-type", "http-referer", "user-agent", "x-zcode-app-version", "x-title", "x-release-channel", "x-client-language", "x-client-timezone", "x-zcode-agent", "x-platform", "x-os-category", "x-os-version", "x-request-id", "x-zcode-session-type", "x-zcode-trace-id", "x-zcode-query-source", "x-session-id"].sort(),
+      ["authorization", "anthropic-version", "content-type", "http-referer", "user-agent", "x-zcode-app-version", "x-title", "x-release-channel", "x-client-language", "x-client-timezone", "x-zcode-agent", "x-platform", "x-os-category", "x-os-version", "x-request-id", "x-zcode-session-type", "x-zcode-trace-id", "x-zcode-query-source", "x-query-id", "x-session-id"].sort(),
     )
     expect(r.headers.accept).not.toBe(CLAUDE_CODE.accept)
   }
@@ -285,15 +337,27 @@ test("a Start Plan request's body is dressed as ZCode's", async () => {
     stream: true,
   })
   // the blocks' texts, by the plugin's hashes
-  expect(sha(b.system[0].text)).toBe("46dd360a22c87a92")
-  expect(sha(b.system[1].text)).toBe("49bda31511fc9670")
+  expect(sha(b.system[0].text)).toBe("7779642ea44a4696")
+  expect(sha(b.system[1].text)).toBe("8eaf38ce3f1f2f15")
   const dyn = b.system[2].text
-  expect(dyn.startsWith("\n\n" + PROMPT.beforeEnvironment + "\n\n# Environment\n")).toBe(true)
-  expect(dyn.endsWith("\n\n" + PROMPT.afterEnvironment + "\n\nYou are opencode, an agent.\n\nProject instructions.")).toBe(true)
-  expect(sha(dyn.slice(2, 2 + 3065))).toBe("bbdc66b399d297ff")
+  expect(dyn.startsWith("\n\n" + PROMPT.dynamicBehavior + "\n\n# Environment\n")).toBe(true)
+  expect(dyn.includes("\n\n" + poweredBy("zai-api/GLM-5.3-Flash") + "\n\n" + PROMPT.contextManagement)).toBe(true)
+  expect(dyn.endsWith("\n\n" + PROMPT.contextManagement + "\n\nYou are opencode, an agent.\n\nProject instructions.")).toBe(true)
+  expect(sha(dyn.slice(2, 2 + PROMPT.dynamicBehavior.length))).toBe("7d843753f3adae93")
+  // no slash-skill guidance without a Skill tool in the request
+  expect(dyn.includes(PROMPT.sessionGuidance)).toBe(false)
   expect(b.metadata.user_id).toBe(userID())
   // exactly one cache mark in the turns, and none on the tools
   expect((r.body.match(/cache_control/g) ?? []).length).toBe(4)
+})
+
+test("a Skill tool brings the slash-skill guidance into the third block", async () => {
+  const body = { ...agentBody, tools: [{ name: "Skill", description: "Invoke a skill", input_schema: { type: "object" } }] }
+  const r = await send(start("zai"), JSON.stringify(body))
+  const b = JSON.parse(r.body)
+  const dyn = b.system[2].text
+  expect(dyn.startsWith("\n\n" + PROMPT.dynamicBehavior + "\n\n" + PROMPT.sessionGuidance + "\n\n# Environment\n")).toBe(true)
+  expect(b.system).toEqual(zcodeSystem("zai-api/GLM-5.3-Flash", undefined, ["You are opencode, an agent.", "Project instructions."]).map((x, i) => (i === 2 ? { ...x, text: dyn } : x)))
 })
 
 test("a BigModel sign-in's Start Plan names bigmodel-api; a string turn takes the cache mark", async () => {
@@ -320,7 +384,7 @@ test("a Start Plan body with no model has no powered-by line; a blank system add
 
 test("a Start Plan request made as a Request, its body a stream, is dressed too", async () => {
   const r = await send(start("zai"), JSON.stringify(agentBody), { asRequest: true })
-  expect(r.headers["x-title"]).toBe("Z Code@cli")
+  expect(r.headers["x-title"]).toBe("Z Code@electron")
   expect(JSON.parse(r.body).system).toEqual(zcodeSystem("zai-api/GLM-5.3-Flash", undefined, AGENT_OWN))
   expect(Number(r.headers["content-length"])).toBe(Buffer.byteLength(r.body))
 })
@@ -335,17 +399,17 @@ test("a Start Plan request says the agent's folder as magpie tells it, and no fo
   const dir = "C:\\Users\\me\\My Proj 中文 & <x>"
   let r = await send(start("zai"), JSON.stringify(agentBody), { place: { dir: encodeURIComponent(dir), git: "yes" } })
   expect(JSON.parse(r.body).system).toEqual(
-    zcodeSystem("zai-api/GLM-5.3-Flash", ["- Primary working directory: " + dir, "- Is a git repository: yes"], AGENT_OWN),
+    zcodeSystem("zai-api/GLM-5.3-Flash", [" - Primary working directory: " + dir, " - Is a git repository: true"], AGENT_OWN),
   )
   expect(r.headers["x-magpie-work-dir"]).toBeUndefined()
   expect(r.headers["x-magpie-work-git"]).toBeUndefined()
   got.length = 0
   r = await send(start("zai"), JSON.stringify(agentBody), { place: { dir: encodeURIComponent("/Users/me/notes"), git: "no" } })
-  expect(JSON.parse(r.body).system[2].text).toContain("- Primary working directory: /Users/me/notes\n- Is a git repository: no\n- Platform: ")
+  expect(JSON.parse(r.body).system[2].text).toContain(" - Primary working directory: /Users/me/notes\n - Is a git repository: false\n - Platform: ")
   got.length = 0
   // a folder whose repository magpie doesn't know: no git line
   r = await send(start("zai"), JSON.stringify(agentBody), { place: { dir: encodeURIComponent("/srv/x") } })
-  expect(JSON.parse(r.body).system[2].text).toContain("- Primary working directory: /srv/x\n- Platform: ")
+  expect(JSON.parse(r.body).system[2].text).toContain(" - Primary working directory: /srv/x\n - Platform: ")
   got.length = 0
   // nothing told (an older magpie, an agent that says no folder): neither
   // line, and never the plugin's own folder or shell
@@ -354,7 +418,7 @@ test("a Start Plan request says the agent's folder as magpie tells it, and no fo
   expect(JSON.parse(r.body).system).toEqual(zcodeSystem("zai-api/GLM-5.3-Flash", undefined, AGENT_OWN))
   expect(text).not.toContain("Primary working directory")
   expect(text).not.toContain("Is a git repository")
-  expect(text).not.toContain("- Shell:")
+  expect(text).not.toContain(" - Shell:")
   expect(r.body).not.toContain(JSON.stringify(process.cwd()).slice(1, -1))
   expect(r.headers["x-magpie-work-git"]).toBeUndefined()
 })
@@ -460,6 +524,15 @@ test("a block page holds the Start Plan off zcode.z.ai for every account a while
   r = await ask(start("zai"))
   expect(r.status).toBe(200)
   expect(messages()).toBe(3)
+  // both holds on: the edge's 405 wins — an IP the firewall already refused
+  // keeps that behavior, busy hold or not
+  _internal.edge.until = Date.now() + _internal.EDGE_HOLD
+  _internal.busyHold.until = Date.now() + _internal.BUSY_HOLD
+  answer = () => Response.json({ type: "message", content: [] })
+  r = await ask(start("zai"))
+  expect(r.status).toBe(405)
+  expect(JSON.parse(r.text).error.message).toStartWith("405 Method Not Allowed — " + START_EDGE)
+  _internal.busyHold.until = 0
 })
 
 test("the Start Plan's 3012 says ZCode blocked the account, and a block page the network (plugins#348, #425)", async () => {
@@ -505,4 +578,220 @@ test("the Start Plan's 3012 says ZCode blocked the account, and a block page the
   r = await ask({ type: "api", key: "one.secret", metadata: { site: "zai" } })
   expect(r.status).toBe(405)
   expect(r.text).toBe("request has been blocked")
+})
+
+// 11-06: two days' logs show a burst of 3008 concurrency caps is the edge
+// firewall's countdown — 3–7 minutes of ~18 requests/min later the whole IP
+// is refused 405 for 1–2 hours. askBusy's per-request waits absorb ~90% of
+// the caps, so neither magpie nor the agent ever sees that the address is
+// saturated. A run of caps in one minute now holds the Start Plan off for
+// three minutes, process-wide, and answers with a 429 + Retry-After so
+// magpie still rests the account and asks the group's next provider. The
+// coding plan, on another host, is never held.
+test("a run of busy caps holds the Start Plan off before the IP is blocked, and nothing else", async () => {
+  const waits = _internal.BUSY_WAITS.splice(0)
+  _internal.BUSY_WAITS.push(1)
+  try {
+  const ask = async (auth) => {
+    routeToFake()
+    const hooks = await ZCodeAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const opts = await hooks.auth.loader(async () => auth, { id: "zcode" })
+    const res = await opts.fetch("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-api-key": "zcode" }, body: agentText })
+    return { status: res.status, text: await res.text(), retryAfter: res.headers.get("retry-after"), signIn: res.headers.get("x-magpie-sign-in") }
+  }
+  const messages = () => got.filter((r) => r.path.endsWith("/messages")).length
+  const busy = () => Response.json({ code: "3008", msg: "user concurrency limit exceeded" }, { status: 429 })
+  // one cap alone is a turn not come: no hold, and the request still went
+  // upstream (it came back a 429 after the waits, not a local one)
+  answer = busy
+  expect((await ask(start("zai"))).status).toBe(429)
+  expect(messages()).toBeGreaterThanOrEqual(1)
+  expect(_internal.busyHold.until).toBe(0)
+  // a run of them holds the gift, with a 429 magpie reads as a rate limit
+  const before = Date.now()
+  for (let i = 0; i < 4; i++) await ask(start("zai"))
+  expect(_internal.busyHold.until).toBeGreaterThanOrEqual(before + _internal.BUSY_HOLD)
+  expect(_internal.busyHold.until).toBeLessThanOrEqual(Date.now() + _internal.BUSY_HOLD)
+  got.length = 0
+  answer = () => Response.json({ type: "message", content: [] })
+  const other = { type: "oauth", access: jwt, refresh: JSON.stringify({ site: "zai", device: "9999***4333-8444***5555", jwt, plan: "Start Plan" }), expires: 0 }
+  for (const auth of [start("zai"), other]) {
+    const r = await ask(auth)
+    expect(r.status).toBe(429)
+    expect(r.signIn).toBe("kept")
+    expect(r.retryAfter).toMatch(/^\d+$/)
+    expect(Number(r.retryAfter)).toBeGreaterThan(0)
+    expect(Number(r.retryAfter)).toBeLessThanOrEqual(Math.ceil(_internal.BUSY_HOLD / 1000))
+    const e = JSON.parse(r.text).error
+    expect(e.type).toBe("rate_limit_error")
+    expect(e.message).toContain("ZCode turned away 5 requests in the last minute")
+  }
+  expect(messages()).toBe(0)
+  // the coding plan goes on, held or not
+  const plan = await ask({ type: "api", key: "one.secret", metadata: { site: "zai" } })
+  expect(plan.status).toBe(200)
+  expect(messages()).toBe(1)
+  // the hold is over: the Start Plan is asked again, one cap does not re-arm
+  // it — with hits left as the arming left them (empty), not cleared by hand
+  _internal.busyHold.until = Date.now() - 1
+  answer = busy
+  expect((await ask(start("zai"))).status).toBe(429)
+  expect(_internal.busyHold.until).toBeLessThanOrEqual(Date.now())
+  _internal.busyHold.until = 0
+  } finally {
+    _internal.BUSY_WAITS.length = 0
+    _internal.BUSY_WAITS.push(...waits)
+    _internal.busyHold.now = () => Date.now()
+  }
+})
+
+// The clock is the hold's own, moved by the test: caps spread over more than
+// a window never arm a hold, caps landing while the hold is on count toward
+// nothing, and the hold ends by the clock without the hits being cleared by
+// hand.
+test("the busy hold reads its clock: a spread run holds nothing, caps during the hold count toward nothing", async () => {
+  const waits = _internal.BUSY_WAITS.splice(0)
+  _internal.BUSY_WAITS.push(1)
+  const ask = async (auth) => {
+    routeToFake()
+    const hooks = await ZCodeAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const opts = await hooks.auth.loader(async () => auth, { id: "zcode" })
+    return opts.fetch("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-api-key": "zcode" }, body: agentText })
+  }
+  let clock = 1_000_000_000_000
+  _internal.busyHold.now = () => clock
+  try {
+    answer = () => Response.json({ code: "3008", msg: "user concurrency limit exceeded" }, { status: 429 })
+    // five caps, each a minute and a second apart: no window ever holds five
+    for (let i = 0; i < 5; i++) {
+      clock += 61_000
+      await ask(start("zai"))
+    }
+    expect(_internal.busyHold.until).toBe(0)
+    // a fast run arms it; caps landing while the hold is on are not counted
+    clock += 1_000
+    for (let i = 0; i < 5; i++) await ask(start("zai"))
+    const armedAt = clock
+    expect(_internal.busyHold.until).toBe(armedAt + _internal.BUSY_HOLD)
+    for (let i = 0; i < 9; i++) {
+      clock += 1_000
+      await ask(start("zai"))
+    }
+    expect(_internal.busyHold.until).toBe(armedAt + _internal.BUSY_HOLD)
+    // the hold expires by the clock with hits empty: one cap does not re-arm
+    clock = armedAt + _internal.BUSY_HOLD + 1_000
+    expect((await ask(start("zai"))).status).toBe(429)
+    expect(_internal.busyHold.until).toBeLessThanOrEqual(clock)
+    _internal.busyHold.until = 0
+  } finally {
+    _internal.BUSY_WAITS.length = 0
+    _internal.BUSY_WAITS.push(...waits)
+    _internal.busyHold.now = () => Date.now()
+    _internal.busyHold.hits.length = 0
+  }
+})
+
+// The hold's guard is the one the serial tests cannot see: requests already
+// in flight when the hold arms get their counted cap after it. Hold the
+// clock still, put 12 Start Plan requests in flight at once — twelve
+// accounts, one each, so each cap is a lone request's, the kind that counts
+// (two or more of one account's narrow its gate instead, plugins#438) — and
+// answer them all 3008 after they
+// have all reached the fake. No first cap counts; the 1s re-asks are
+// refused again and the fifth of those arms the hold. With the guard gone,
+// the seven after it count toward a second hold.
+test("caps that land after the hold armed change neither hits nor until (requests in flight)", async () => {
+  const waits = _internal.BUSY_WAITS.splice(0)
+  _internal.BUSY_WAITS.push(1)
+  try {
+    routeToFake()
+    // twelve in flight at once, more than the address's gate lets go
+    // (startGate.address): what the hold does with such a run is under test
+    _internal.startGate.address = 12
+    let clock = 1_000_000_000_000
+    _internal.busyHold.now = () => clock
+    const hooks = await ZCodeAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const accounts = Array.from({ length: 12 }, (_, i) => i + 1).map((n) => {
+      const own = ["{}", JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600, n })].map((s) => Buffer.from(s).toString("base64url")).join(".") + ".sig"
+      const s = { site: "zai", device: DEVICE, jwt: own, plan: "Start Plan" }
+      return { type: "oauth", access: own, refresh: JSON.stringify(s), expires: 0 }
+    })
+    const loaders = await Promise.all(accounts.map((a) => hooks.auth.loader(async () => a, { id: "zcode" })))
+    // the fake parks every /messages request on one gate until the test opens it
+    let open = () => {}
+    const gate = new Promise((r) => (open = r))
+    answer = async () => {
+      await gate
+      return Response.json({ code: "3008", msg: "user concurrency limit exceeded" }, { status: 429 })
+    }
+    const all = loaders.flatMap((opts) =>
+      Array.from({ length: 1 }, () =>
+        opts.fetch("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-api-key": "zcode" }, body: agentText })))
+    // every request is in flight (reached the fake) before any answer comes
+    while (got.filter((r) => r.path.endsWith("/messages")).length < 12) await Bun.sleep(5)
+    expect(got.filter((r) => r.path.endsWith("/messages")).length).toBe(12)
+    clock += 1_000
+    open()
+    const rs = await Promise.all(all)
+    // every request was refused twice; the fifth second refusal armed the
+    // hold, and the ones after it changed neither hits nor until. Each
+    // answer is the hold's own 429 with its Retry-After or, for the four
+    // that armed it, busyAnswer's
+    expect(rs.every((r) => r.status === 429)).toBe(true)
+    expect(got.filter((r) => r.path.endsWith("/messages")).length).toBe(24)
+    expect(rs.filter((r) => r.headers.get("retry-after") === String(_internal.BUSY_HOLD / 1000)).length).toBeGreaterThanOrEqual(8)
+    expect(_internal.busyHold.hits.length).toBe(0)
+    expect(_internal.busyHold.until).toBe(clock + _internal.BUSY_HOLD)
+  } finally {
+    _internal.BUSY_WAITS.length = 0
+    _internal.BUSY_WAITS.push(...waits)
+    _internal.busyHold.now = () => Date.now()
+    _internal.busyHold.hits.length = 0
+    _internal.busyHold.until = 0
+  }
+})
+
+// A slow handful of caps is a plan at its limit, not a firewall countdown:
+// the old per-request waits keep serving it. (Only caps on the Start Plan
+// count; a coding plan's caps must never hold the gift.)
+test("a few caps do not hold the Start Plan, and coding plan caps hold nothing", async () => {
+  const waits = _internal.BUSY_WAITS.splice(0)
+  _internal.BUSY_WAITS.push(1)
+  try {
+  const ask = async (auth) => {
+    routeToFake()
+    const hooks = await ZCodeAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const opts = await hooks.auth.loader(async () => auth, { id: "zcode" })
+    return opts.fetch("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-api-key": "zcode" }, body: agentText })
+  }
+  answer = () => Response.json({ code: "3008", msg: "user concurrency limit exceeded" }, { status: 429 })
+  for (let i = 0; i < 4; i++) expect((await ask(start("zai"))).status).toBe(429)
+  expect(_internal.busyHold.until).toBe(0)
+  // the same run on the coding plan leaves the gift alone
+  for (let i = 0; i < 8; i++) await ask({ type: "api", key: "one.secret", metadata: { site: "zai" } })
+  expect(_internal.busyHold.until).toBe(0)
+  _internal.busyHold.hits.length = 0
+  } finally {
+    _internal.BUSY_WAITS.length = 0
+    _internal.BUSY_WAITS.push(...waits)
+    _internal.busyHold.now = () => Date.now()
+  }
+})
+
+// 3.17.2's x-query-id (createModelRequestAttributionHeaders) names the
+// user's query: every request of one turn, the tool calls on the way
+// among them, carries the same, and what the user says next a new one.
+test("x-query-id is the turn's: the same through tool results, new for the next user message", () => {
+  const q = (messages, sid = "s1") => _internal.queryOf(JSON.stringify({ messages }), sid)
+  const ask = { role: "user", content: [{ type: "text", text: "fix it" }] }
+  const call = { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } }] }
+  const result = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "a.go" }] }
+  const first = q([ask])
+  expect(first).toMatch(UUID)
+  expect(q([ask, call, result])).toBe(first)
+  expect(q([ask, call, result, { role: "assistant", content: "done" }, { role: "user", content: "thanks" }])).not.toBe(first)
+  expect(q([ask], "s2")).not.toBe(first)
+  // nothing the user said, or a body that doesn't read: none
+  expect(q([result])).toBe("")
+  expect(_internal.queryOf("{", "s1")).toBe("")
 })

@@ -10,51 +10,34 @@
 // those of its current desktop app (see SITES' app, cli and appName).
 
 import { createHash, randomBytes } from "node:crypto"
-import { FORMAT_KEY, FORMAT_MAGPIE, FORMAT_2108, FORMATS, headersOn, bodyOn, streamed, whole, gzipOn } from "./codebuddy.mjs"
-import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs"
-import { homedir } from "node:os"
-import { isAbsolute, join } from "node:path"
-import { gzipSync } from "node:zlib"
+import { closeSync, createReadStream, openSync, readFileSync, readdirSync, readSync, statSync } from "node:fs"
+import { arch, cpus, homedir, hostname, release, totalmem, userInfo } from "node:os"
+import { dirname, isAbsolute, join } from "node:path"
+import { createGunzip, gzipSync } from "node:zlib"
 
-const APP_VERSION = "2.0.0" // the version WorkBuddy's sign-in page is opened with
+import { FORMAT_KEY, FORMAT_MAGPIE, FORMAT_2108, FORMATS, headersOn, bodyOn, streamed, whole, gzipOn } from "./codebuddy.mjs"
+
 const POLL_MS = 1000
 const SIGN_IN_MS = 5 * 60 * 1000
 const EARLY_MS = 60 * 1000 // a token this close to its end is refreshed before a request
 const LEAD_MS = 5 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
 const KEEP_RENEWED_MS = 60 * 1000 // how long a refresh's result answers for the old refresh token
 
-// The request format a chat goes out in. "magpie" is this plugin's own — the
-// shape of WorkBuddy's current desktop client, read from WorkBuddy 5.9.3. The
-// other is that of @tencent-ai/codebuddy-code 2.108.1, the official CodeBuddy
-// CLI, as live captures of its releases describe it rather than a reading of
-// its bundle (which assembles headers over three layers and so under-reports
-// them). It is a switch a person turns on, never a default: with none on, and
-// with a value naming no format, chats go out as "magpie", which is what every
-// request did before the option existed.
+// [id, name, context, efforts, output]
 //
-// Two ways in, one per host. magpie has switches (auth.options): booleans, one
-// per format, drawn in the provider's editor and read through
-// input.magpie.option. OpenCode has none, so there the format comes from the
-// plugin tuple's second entry, { "requestFormat": "codebuddy-2108" }.
-// FORMAT_KEY, FORMAT_MAGPIE and FORMAT_2108 are codebuddy.mjs's, where the
-// shape itself lives.
-const FORMAT_SWITCH = "request_format_2108"
-// FORMAT_SWITCHES are the switches a chat's format is read from, newest first.
-// magpie hands a plugin nothing when a switch changes (host.js's
-// setProviderOptions only takes the values over), so no switch can know
-// whether another was turned on after it: the first one on is the one that
-// sends, whatever order they were set in. A third format is one entry here
-// and one switch beside it, and the newest wins from then on.
-const FORMAT_SWITCHES = [{ key: FORMAT_SWITCH, fmt: FORMAT_2108 }]
-// [id, name, context, efforts]
+// output is the config's maxOutputTokens, where a config read from the site
+// gave it (testdata/config-561.json, config-efforts.json); without it magpie
+// fills in models.dev's, which for deepseek-v4.1-flash is 384000 where
+// WorkBuddy's own config says 128000 (sayagoodbyeplz on Discord). A model
+// with none here is left to models.dev, as before.
 const CN_MODELS = [
   ["auto", "Auto", 168000],
   ["hy4-preview-f", "Hy4 preview", 1000000, ["high"]],
   ["hy3", "Hy3", 192000, ["low", "high"]],
   ["hy3-x", "Hy3-X", 192000, ["low", "high"]],
-  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000, ["none", "low", "high", "max"]],
+  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000, ["none", "low", "high", "max"], 128000],
   ["glm-5.3", "GLM-5.3", 1000000, ["low", "high", "max"]],
-  ["glm-5.3-flash", "GLM-5.3-Flash", 1000000, ["low", "high", "max"]],
+  ["glm-5.3-flash", "GLM-5.3-Flash", 1000000, ["low", "high", "max"], 131072],
   ["glm-5.2", "GLM-5.2", 1000000, ["high", "xhigh"]],
   ["glm-5.1", "GLM-5.1", 200000],
   ["glm-5v-turbo", "GLM-5v-Turbo", 200000],
@@ -62,24 +45,24 @@ const CN_MODELS = [
   ["kimi-k3-1", "Kimi-K3", 1000000, ["low", "high", "xhigh"]],
   ["kimi-k2.7", "Kimi-K2.7-Code", 256000],
   ["kimi-k2.6", "Kimi-K2.6", 256000],
-  ["deepseek-v4-pro", "Deepseek-V4-Pro", 1000000, ["none", "high", "xhigh"]],
+  ["deepseek-v4-pro", "Deepseek-V4-Pro", 1000000, ["none", "high", "xhigh"], 128000],
 ]
 
 const AI_MODELS = [
-  ["default-model", "Default", 176000],
-  ["fast-model", "Fast", 200000],
+  ["default-model", "Default", 176000, undefined, 24000],
+  ["fast-model", "Fast", 200000, undefined, 32000],
   ["balanced-model", "Balanced", 256000],
-  ["primary-model", "Primary", 272000],
+  ["primary-model", "Primary", 272000, undefined, 72000],
   ["deep-model", "Deep", 176000],
   ["gpt-5.5", "GPT-5.5", 1000000],
   ["gpt-5.4", "GPT-5.4", 272000],
   ["gpt-5.3-codex", "GPT-5.3-Codex", 272000],
   ["gemini-3.1-pro", "Gemini-3.1-Pro", 400000],
-  ["gemini-3.5-flash", "Gemini-3.5-Flash", 1000000],
+  ["gemini-3.5-flash", "Gemini-3.5-Flash", 1000000, undefined, 65536],
   ["glm-5.3", "GLM-5.3", 1000000, ["low", "high", "max"]],
-  ["glm-5.2", "GLM-5.2", 1000000, ["high", "xhigh"]],
-  ["hy3", "Hy3", 192000, ["low", "high"]],
-  ["kimi-k3", "Kimi-K3", 1000000],
+  ["glm-5.2", "GLM-5.2", 1000000, ["high", "xhigh"], 48000],
+  ["hy3", "Hy3", 192000, ["low", "high"], 64000],
+  ["kimi-k3", "Kimi-K3", 1000000, undefined, 32000],
   ["kimi-k2.6", "Kimi-K2.6", 256000],
   ["minimax-m3", "MiniMax-M3", 512000],
 ]
@@ -246,6 +229,48 @@ function domainOf(site, a) {
   return a.domain || new URL(api(site)).host
 }
 
+// CLOUD_HOSTED are the hosts of WorkBuddy's cloud-hosted enterprises, as
+// WorkBuddy's own product.json lists them (cloudHostedDomain, read from
+// WorkBuddy 5.5.6 and WorkBuddy AI): <enterprise>.sso.copilot.tencent.com,
+// <enterprise>.copilot.qq.com, <enterprise>.sso.codebuddy.cn. Such an
+// account's sign-in names that host as its domain, and WorkBuddy's client
+// serves it there: the cloud-hosted product has no endpoint of its own, and
+// the client sets the enterprise's endpoint in its place
+// (applyEnterpriseEndpoint). Tencent's own iOA host
+// (tencent.sso.copilot.tencent.com) matches the pattern but is served at
+// copilot.tencent.com (product.ioa.json), as the client checks iOA first.
+const CLOUD_HOSTED = [/^[a-z0-9-]+\.sso\.copilot\.tencent\.com$/, /^[a-z0-9-]+\.copilot\.qq\.com$/, /^[a-z0-9-]+\.sso\.codebuddy\.cn$/]
+const IOA = new Set(["tencent.sso.copilot.tencent.com", "tencent.sso.codebuddy.cn"])
+
+// endpointOf is where a's requests go: its enterprise's own host for a
+// cloud-hosted enterprise's account, else the site's endpoint. Before
+// 0.2.32 every account was sent to the site's endpoint, which a
+// cloud-hosted enterprise's token isn't valid at.
+function endpointOf(site, a) {
+  const d = typeof a?.domain === "string" ? a.domain.trim().toLowerCase() : ""
+  if (!d || IOA.has(d) || a?.source === "key") return site.endpoint
+  return CLOUD_HOSTED.some((r) => r.test(d)) ? "https://" + d : site.endpoint
+}
+
+// at is site with a's endpoint (endpointOf): the same site when that is
+// the site's own.
+const atHosts = new Map()
+function at(site, a) {
+  const end = endpointOf(site, a)
+  if (end === site.endpoint) return site
+  const key = site.id + "\n" + end
+  let s = atHosts.get(key)
+  if (!s) atHosts.set(key, (s = { ...site, endpoint: end }))
+  return s
+}
+
+// moved is url sent to a's endpoint instead of the site's, when they differ.
+function moved(site, a, url) {
+  const end = endpointOf(site, a)
+  if (end === site.endpoint || !url.startsWith(site.endpoint + "/")) return url
+  return end + url.slice(site.endpoint.length)
+}
+
 // merge takes a token WorkBuddy gave (sign-in or refresh) into the
 // stored sign-in, times given as at-ms or in-seconds.
 function merge(a, got) {
@@ -285,7 +310,7 @@ function renew(site, a, save) {
   let r = renewing.get(key)
   if (!r) {
     r = (async () => {
-      const got = await call(site, "POST", "/v2/plugin/auth/token/refresh", {
+      const got = await call(at(site, a), "POST", "/v2/plugin/auth/token/refresh", {
         "X-Refresh-Token": a.refresh,
         "X-Auth-Refresh-Source": "plugin",
         "X-Domain": domainOf(site, a),
@@ -360,6 +385,9 @@ async function refreshed(site, auth) {
 // them and can't see the tuple; with no switch on, the value stands, and one
 // naming no format this plugin knows is "magpie", so a typo sends what every
 // request sent before the option existed rather than failing a chat.
+const FORMAT_SWITCH = "request_format_2108"
+const FORMAT_SWITCHES = [{ key: FORMAT_SWITCH, fmt: FORMAT_2108 }]
+
 function formatOf(site, options, magpie) {
   if (site.ai) return FORMAT_MAGPIE
   for (const f of FORMAT_SWITCHES) if (magpie?.option?.(site.id, f.key) === true) return f.fmt
@@ -497,7 +525,7 @@ async function enterpriseOf(site, a, who) {
   if (own && name(who)) return { id: own, name: name(who) }
   let list
   try {
-    list = await call(site, "GET", "/v2/plugin/accounts", {
+    list = await call(at(site, a), "GET", "/v2/plugin/accounts", {
       Authorization: "Bearer " + a.access,
       "X-Domain": domainOf(site, a),
     })
@@ -1234,6 +1262,10 @@ function fitSchema(s, depth = 0) {
       changed = true
     }
   }
+  if (s.pattern === "^[^\\uD800-\\uDFFF]*$") {
+    delete s.pattern
+    changed = true
+  }
   if (Array.isArray(s.items)) {
     const list = s.items.filter((v) => v && typeof v === "object")
     s.items = list.length === 0 ? {} : list.length === 1 ? list[0] : { anyOf: list }
@@ -1537,6 +1569,298 @@ function fitted(body) {
   }
 }
 
+// GROWTH_SEND is the growth event WorkBuddy's client puts in a chat's own
+// body for the user's send (Events.ChatRequestSend).
+const GROWTH_SEND = "chat_request_send"
+
+// withGrowth gives a WorkBuddy AI chat the extra_vars its own client sends
+// (magpie-community/plugins#691): `growthEvent`, a JSON string holding an
+// array of growth events, and `initiator: "user"`. WorkBuddy AI 5.6.2's CLI
+// (codebuddy-lite-wb.mjs, reportChatRequestSendTelemetry) builds the
+// chat_request_send event as {eventCode, id: the conversation's id, extra:
+// {inputLength, requestModelId, requestModelName, mode, command, expertId}}
+// and, when its growth flag is on, sends it in the chat body
+// (appendGrowthEvent into providerData.extra_vars) instead of reporting it
+// on /v2/report; a 5.9.4 capture (#691) carries it there, with initiator
+// "user". Nothing proves WorkBuddy reads it for the daily credit; it is the
+// only per-chat activity mark the client sends with the chat itself.
+//
+// Built from the chat alone: inputLength is the length of the user's last
+// own message (its text, as the CLI's getInputLength counts it), the model
+// is the chat's, its name the site's table's (else the id), mode "craft"
+// (the X-Agent-Intent it is sent with) and no command. conv is the chat's
+// X-Conversation-ID; with none, nothing is added. An event the caller put
+// there is kept; was is the conversation id an earlier call gave the event
+// for, whose event this one replaces (the chat sent as another account).
+// true when the chat changed.
+function withGrowth(site, chat, conv, was = "") {
+  if (!site.ai || !conv || !chat || typeof chat !== "object" || !Array.isArray(chat.messages)) return false
+  const vars = chat.extra_vars !== null && typeof chat.extra_vars === "object" && !Array.isArray(chat.extra_vars) ? chat.extra_vars : {}
+  let events = []
+  if (typeof vars.growthEvent === "string" && vars.growthEvent.trim()) {
+    try {
+      const v = JSON.parse(vars.growthEvent)
+      events = Array.isArray(v) ? v : [v]
+    } catch {}
+  }
+  if (was) events = events.filter((e) => !(e?.eventCode === GROWTH_SEND && e?.id === was))
+  const model = typeof chat.model === "string" ? chat.model : ""
+  const event = {
+    eventCode: GROWTH_SEND,
+    id: conv,
+    extra: {
+      inputLength: inputLengthOf(chat.messages),
+      requestModelId: model,
+      requestModelName: site.models.find((m) => m[0] === model)?.[1] ?? model,
+      mode: "craft",
+      command: "",
+    },
+  }
+  if (!events.some((e) => e?.eventCode === GROWTH_SEND && e?.id === conv)) events.push(event)
+  chat.extra_vars = { ...vars, growthEvent: JSON.stringify(events), initiator: vars.initiator ?? "user" }
+  return true
+}
+
+// ---- activity reports (magpie-community/plugins#691) ----
+//
+// WorkBuddy AI's desktop client reports each chat on POST /v2/report, an
+// array of events, and xxhhlk's capture of WorkBuddy AI 5.9.4 shows three
+// such calls around one user send: chat_message_send; then
+// chat_request_send, chat_message_response, chat_message_status and
+// chat_request_response; then agent_task_completed and
+// chat_response_complete. Each answered 200 {"code":0,"msg":"OK"}. On the
+// same day the client's account was granted its daily credit and three
+// accounts chatting through the plugin, which sent the growth event in the
+// chat body alone (withGrowth), were not. Whether the credit reads these
+// reports isn't known; they are what the official client sends for the
+// user's own chat, so the plugin sends them for the user's own chats too,
+// and never a chat of its own.
+//
+// Sent once the reply has been read to its end (reporting), with the token
+// counts and the finish reason the reply gave. A step that ends in tool
+// calls reports its message only; the request's events (chat_request_*,
+// agent_task_completed, chat_response_complete) go with the step that
+// ends the turn. chat_request_send goes with the step the user's own
+// message opened. Best effort: a report that fails is dropped, and the
+// chat's answer never waits on it.
+
+// reportSession is this process's session id, as the client's is its own
+// run's.
+const reportSession = randomBytes(16).toString("hex")
+
+// machineOf is a stable id for this computer, as the client sends one: a
+// hash, so neither the host's name nor the user's is sent.
+let machine
+function machineOf() {
+  if (machine) return machine
+  let user = ""
+  try {
+    user = userInfo().username
+  } catch {}
+  return (machine = createHash("sha256").update(`magpie-workbuddy|${hostname()}|${user}`).digest("hex"))
+}
+
+// reportBase is the fields every event carries (the capture's common set).
+function reportBase(site, a, code) {
+  const cpu = cpus()
+  return {
+    eventCode: code,
+    buddyId: "",
+    buddyName: "",
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? "",
+    userId: a.uid ?? "",
+    username: a.name ?? "",
+    userNickname: a.name ?? "",
+    product: "SaaS",
+    commit: "",
+    ideName: "WorkBuddy",
+    ideType: "WorkBuddy",
+    ideVersion: site.app,
+    machineId: machineOf(),
+    sessionId: reportSession,
+    extName: site.appName,
+    extVersion: site.cli,
+    os: process.platform,
+    arch: arch(),
+    osVersion: release(),
+    cpuModel: cpu[0]?.model ?? "",
+    timestamp: Date.now(),
+    reportDelay: 0,
+    releaseDate: 0,
+    cpuCores: cpu.length,
+    memorySize: totalmem(),
+  }
+}
+
+// replyFacts reads the token counts and the finish reason off the end of a
+// reply, streamed or whole: the last usage object and the last
+// finish_reason it names.
+function replyFacts(tail) {
+  const out = { finish: "", input: 0, output: 0, total: 0, cached: 0 }
+  const reasons = [...tail.matchAll(/"finish_reason"\s*:\s*"([^"]+)"/g)]
+  if (reasons.length) out.finish = reasons.at(-1)[1]
+  const num = (k) => {
+    const m = [...tail.matchAll(new RegExp(`"${k}"\\s*:\\s*(\\d+)`, "g"))]
+    return m.length ? Number(m.at(-1)[1]) : 0
+  }
+  out.input = num("prompt_tokens")
+  out.output = num("completion_tokens")
+  out.total = num("total_tokens") || out.input + out.output
+  out.cached = num("cached_tokens")
+  return out
+}
+
+// reportEvents is the three /v2/report bodies for one step of a chat.
+// t holds the step's ids, model, input length and whether the user's own
+// message opened it; f is replyFacts of its reply; at its start and end
+// times.
+function reportEvents(site, a, t, f, start, end) {
+  const base = (code) => reportBase(site, a, code)
+  const name = site.models.find((m) => m[0] === t.model)?.[1] ?? t.model
+  const ids = {
+    conversationId: t.conv,
+    requestId: t.turn,
+    traceId: t.message,
+    rootRequestId: t.turn,
+    parentConversationId: "",
+    agentName: "",
+    agentType: "main",
+    "codebuddy.session_id": t.conv,
+    "codebuddy.conversation_request_id": t.turn,
+  }
+  const model = { requestModelId: t.model, requestModelName: name }
+  const tokens = { inputToken: f.input, outputToken: f.output, totalToken: f.total, cachedTokens: f.cached, cachedWriteTokens: 0, cachedMissTokens: Math.max(0, f.input - f.cached) }
+  const last = f.finish !== "tool_calls"
+  const ok = { isSuccessful: true, messageErrorCode: "", finishReason: f.finish || "stop" }
+  const first = [{ ...base("chat_message_send"), ...ids, messageId: t.message, ...model, historyCount: t.history, currentStepCount: t.step, totalStepCount: t.step, compactionCount: 0, presentAt: start, isContextTruncated: false }]
+  const second = []
+  if (t.userSend) {
+    second.push({
+      ...base("chat_request_send"), mode: "craft", source: "work", command: "", ...ids, ...model,
+      inputLength: t.input, mentionContextCount: 0, presentAt: start,
+      isPlan: false, isAutoExecuteTerminal: false, isAutoModify: false, codebaseEnable: false, isMaxMode: true,
+      mentionContexts: [], knowledgeId: [], knowledgeName: [],
+      codebaseId: "", inputAttemptId: "", recommendId: "", skillId: "",
+      vcsType: "", vcsRepo: "", vcsBranchName: "", vcsRevId: "",
+    })
+  }
+  second.push({ ...base("chat_message_response"), ...ids, messageId: t.message, ...model, responseModelId: t.model, totalStepCount: t.step, ...tokens, firstTokenAt: start, presentAt: end, ...ok })
+  second.push({ ...base("chat_message_status"), ...ids, messageId: t.message, ...model, messageErrorCode: "0" })
+  const third = []
+  if (last) {
+    const { traceId, ...noTrace } = ids
+    second.push({ ...base("chat_request_response"), mode: "craft", ...noTrace, ...model, toolCallCount: t.toolCalls, ...tokens, presentAt: end, ...ok })
+    third.push({ ...base("agent_task_completed"), mode: "LOCAL", task_id: t.turn, duration_ms: Math.max(0, end - start), total_steps: t.step })
+    third.push({ ...base("chat_response_complete"), conversationId: t.conv, requestId: t.turn, artifactType: "", source: "work" })
+  }
+  return [first, second, third].filter((e) => e.length)
+}
+
+// sendReports posts each body to /v2/report in turn, with the headers the
+// client sends there; failures are dropped.
+async function sendReports(site, a, bodies) {
+  for (const body of bodies) {
+    try {
+      const res = await fetch(endpointOf(site, a) + "/v2/report", {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/plain, */*", "Content-Type": "application/json", "User-Agent": cliAgent(site),
+          "X-Request-ID": hex(), "X-Product": "SaaS", Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "",
+          "X-Domain": domainOf(site, a), "X-Requested-With": "XMLHttpRequest", ...enterpriseHeaders(a),
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      })
+      await res.body?.cancel().catch(() => {})
+    } catch {}
+  }
+}
+
+// TAIL is how much of a reply's end replyFacts reads: the usage chunk and
+// the last finish_reason are in its last few events.
+const TAIL = 16384
+
+// reporting is res with the step's reports sent once its body has been
+// read to the end. A reply cut off before its end, or not read, sends
+// none: the client reports a send it saw answered.
+function reporting(site, a, t, res) {
+  if (!res.body || !res.ok || a.source === "key") return res
+  const start = Date.now()
+  const dec = new TextDecoder()
+  let tail = ""
+  const body = res.body.pipeThrough(
+    new TransformStream({
+      transform(chunk, ctl) {
+        tail = (tail + dec.decode(chunk, { stream: true })).slice(-TAIL)
+        ctl.enqueue(chunk)
+      },
+      flush() {
+        tail = (tail + dec.decode()).slice(-TAIL)
+        sendReports(site, a, reportEvents(site, a, t, replyFacts(tail), start, Date.now()))
+      },
+    }),
+  )
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers })
+}
+
+// stepOf is what reportEvents needs of a chat, read before it is sent:
+// the model, the user's input length, whether the user's own message
+// opened this step, the turn's step count and tool calls so far, and the
+// history's length.
+function stepOf(chat) {
+  const msgs = chat.messages
+  let step = 1
+  let toolCalls = 0
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m?.role === "user") break
+    if (m?.role === "assistant") {
+      step++
+      toolCalls += Array.isArray(m.tool_calls) ? m.tool_calls.length : 0
+    }
+  }
+  return {
+    model: typeof chat.model === "string" ? chat.model : "",
+    input: inputLengthOf(msgs),
+    userSend: msgs.at(-1)?.role === "user",
+    step,
+    toolCalls,
+    history: msgs.filter((m) => m?.role === "user" || m?.role === "assistant").length,
+  }
+}
+
+// regrown is a chat body given for conversation was given its growth event
+// for conv instead (withGrowth); null when it can't be read or isn't one.
+function regrown(site, b, was, conv) {
+  const chat = chatOf(typeof b === "string" ? b : bodyString(b))
+  return chat && withGrowth(site, chat, conv, was) ? JSON.stringify(chat) : null
+}
+
+// withVars is a chat body, as text, with extra_vars set as its last field
+// and every byte it had kept: the vars go in before the object's closing
+// brace. For a chat that names no extra_vars of its own (withGrowth).
+function withVars(body, vars) {
+  if (typeof body !== "string") return body
+  const i = body.lastIndexOf("}")
+  if (i < 0) return body
+  const open = /\{\s*$/.test(body.slice(0, i))
+  return body.slice(0, i) + (open ? "" : ",") + '"extra_vars":' + JSON.stringify(vars) + "}" + body.slice(i + 1)
+}
+
+// inputLengthOf is the length of the chat's last user message that is the
+// user's own (not a tool's result): its text, as WorkBuddy's CLI counts a
+// user input (TelemetryUtils.getInputLength); 0 when there is none.
+function inputLengthOf(msgs) {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role !== "user" || answeredBefore(msgs, i)) continue
+    const c = msgs[i].content
+    if (typeof c === "string") return c.length
+    if (!Array.isArray(c)) return 0
+    return c.reduce((n, p) => n + ((p?.type ?? "text") === "text" && typeof p?.text === "string" ? p.text.length : 0), 0)
+  }
+  return 0
+}
+
 // gzipped is a chat's body compressed, as WorkBuddy's own client sends its
 // model requests: its CLI's GzipRequestProcessor (WorkBuddy 5.9.3, CLI
 // 2.165.0, on both builds) gzips each POST's body and sets
@@ -1793,7 +2117,12 @@ async function browserSignIn(site) {
   if (!state?.state || !state?.authUrl) throw new Error(`${site.name} gave no sign-in page`)
   const url = new URL(state.authUrl)
   if (url.protocol !== "https:") throw new Error(`${site.name}'s sign-in page isn't https`)
-  url.searchParams.set("version", APP_VERSION)
+  // the desktop app's own version, as WorkBuddy desktop opens it
+  // (openAuthUrl: version = CLIENT_INFO_PLUGIN_VERSION, the app's version).
+  // The China build's page hides 企业微信 (WeCom) for a version under 5.8.0
+  // (its signin-callback chunk: platform workbuddy and version >= "5.8.0"),
+  // so the 2.0.0 sent before offered no WeCom sign-in (shenyebuwu on Discord)
+  url.searchParams.set("version", site.app)
   url.searchParams.set("loginSessionId", hex())
   return {
     url: url.toString(),
@@ -1905,6 +2234,144 @@ function desktopSignIn(site) {
   }
 }
 
+// ---- accounts from a file (magpie's auth.import) ------------------------------
+
+// IMPORT_FROM says which files magpie's "Import accounts from a file…"
+// takes for site (marchen_cc on X: there was no way to bring a WorkBuddy
+// sign-in in from its JSON). Importing renews the sign-in, as signing in
+// does, so the app the file came from is signed out of that account.
+function importFrom(site) {
+  const file = site.authID + ".info"
+  return {
+    en: `Choose ${site.name} desktop's sign-in file (${file}, in CodeBuddyExtension/Data/Public/auth), or a copy of a sign-in (JSON with its access and refresh tokens). Each account's sign-in is renewed with ${site.name} before it is added, so the app or tool the file came from is signed out of it and has to sign in again.`,
+    froms: {
+      zh: `选择 ${site.name} 桌面版的登录文件（${file}，在 CodeBuddyExtension/Data/Public/auth 下），或一份登录凭证（含 access 和 refresh token 的 JSON）。每个账号都会先向 ${site.name} 续期登录再添加，所以文件来源的应用或工具会退出该账号，需要重新登录。`,
+      "zh-TW": `選擇 ${site.name} 桌面版的登入檔（${file}，在 CodeBuddyExtension/Data/Public/auth 下），或一份登入憑證（含 access 和 refresh token 的 JSON）。每個帳號都會先向 ${site.name} 續期登入再加入，所以檔案來源的應用或工具會登出該帳號，需要重新登入。`,
+      ja: `${site.name} デスクトップのサインインファイル（${file}、CodeBuddyExtension/Data/Public/auth 内）か、サインイン情報のコピー（access と refresh トークンを含む JSON）を選んでください。各アカウントは追加の前に ${site.name} でサインインを更新するため、ファイルの元のアプリやツールはそのアカウントからサインアウトされ、再サインインが必要になります。`,
+      de: `Wähle die Anmeldedatei von ${site.name} Desktop (${file}, in CodeBuddyExtension/Data/Public/auth) oder eine Kopie einer Anmeldung (JSON mit Access- und Refresh-Token). Die Anmeldung jedes Kontos wird vor dem Hinzufügen bei ${site.name} erneuert, daher wird die App oder das Tool, aus dem die Datei stammt, von diesem Konto abgemeldet und muss sich neu anmelden.`,
+    },
+  }
+}
+
+const str = (v) => (typeof v === "string" ? v.trim() : "")
+const sealed = (v) => !!(v && typeof v === "object" && v.$wbEncrypted)
+// plain is an account a file names with only its plain words: WorkBuddy 5.6
+// and later seal the nickname too ({ $wbEncrypted }), which isn't a name
+const plain = (who) => who && { ...who, nickname: str(who.nickname), phoneNumber: str(who.phoneNumber), uid: str(who.uid) }
+const atMs = (at, inSec, now) => (Number(at) > 0 ? Number(at) : Number(inSec) > 0 ? now + Number(inSec) * 1000 : 0)
+
+// signInsIn are the sign-ins a file's text holds, as found: WorkBuddy
+// desktop's .info ({ auth, account }), a plugin's or OpenCode's auth.json
+// entry ({ access, refresh, expires, uid, domain, enterpriseId, … }, by
+// itself, in a map or a list), or tokens named as OAuth names them
+// (accessToken/refreshToken, access_token/refresh_token). Each is
+// { a, who, sealed? }: a the sign-in, who the account the file names (or
+// null). Nothing is asked of WorkBuddy here.
+function signInsIn(text) {
+  let v
+  try {
+    v = JSON.parse(text)
+  } catch {
+    return [{ error: "not JSON" }]
+  }
+  const out = []
+  const now = Date.now()
+  const seen = new Set()
+  const walk = (o, depth) => {
+    if (!o || typeof o !== "object" || depth > 4 || seen.has(o)) return
+    seen.add(o)
+    if (Array.isArray(o)) return o.forEach((x) => walk(x, depth + 1))
+    // the desktop app's file: its tokens under auth, the account beside
+    if (o.auth && typeof o.auth === "object" && ("accessToken" in o.auth || "refreshToken" in o.auth)) {
+      const t = o.auth
+      if (sealed(t.accessToken) || sealed(t.refreshToken)) return out.push({ sealed: true })
+      const acct = o.account && typeof o.account === "object" ? o.account : null
+      return out.push({
+        a: {
+          access: str(t.accessToken), refresh: str(t.refreshToken),
+          expires: atMs(t.expiresAt, t.expiresIn, now), refreshExpiresAt: atMs(t.refreshExpiresAt, t.refreshExpiresIn, now),
+          domain: str(t.domain), tokenType: str(t.tokenType),
+          ...(str(acct?.enterpriseId) ? { enterpriseId: str(acct.enterpriseId) } : {}),
+        },
+        who: str(acct?.uid) ? plain(acct) : null,
+      })
+    }
+    const access = o.access ?? o.accessToken ?? o.access_token
+    const refresh = o.refresh ?? o.refreshToken ?? o.refresh_token
+    if (sealed(access) || sealed(refresh)) return out.push({ sealed: true })
+    if (str(access) || str(refresh)) {
+      const uid = str(o.uid)
+      return out.push({
+        a: {
+          access: str(access), refresh: str(refresh),
+          expires: atMs(o.expires ?? o.expiresAt, o.expiresIn ?? o.expires_in, now),
+          refreshExpiresAt: atMs(o.refreshExpiresAt, o.refreshExpiresIn ?? o.refresh_expires_in, now),
+          domain: str(o.domain), tokenType: str(o.tokenType ?? o.token_type),
+          ...(str(o.enterpriseId) ? { enterpriseId: str(o.enterpriseId) } : {}),
+        },
+        who: uid ? { uid, nickname: str(o.nickname) || str(o.accountId) } : null,
+      })
+    }
+    for (const x of Object.values(o)) walk(x, depth + 1)
+  }
+  walk(v, 0)
+  return out.length ? out : [{ error: "no WorkBuddy sign-in in it" }]
+}
+
+// otherSite says the site a sign-in's domain belongs to when it isn't
+// site: a China build's sign-in brought into WorkBuddy AI, or the other way.
+function otherSite(site, a) {
+  const d = str(a.domain).toLowerCase()
+  if (!d) return ""
+  const cn = /(^|\.)(codebuddy\.cn|tencent\.com|qq\.com)$/.test(d)
+  const ai = /(^|\.)workbuddy\.ai$/.test(d)
+  if (site.ai && cn) return SITES.workbuddy.name
+  if (!site.ai && ai) return SITES["workbuddy-ai"].name
+  return ""
+}
+
+// importSignIns checks each sign-in texts hold with WorkBuddy, as signing
+// in does, and gives each as a sign-in result: renewed with its refresh
+// token (an access token alone is kept while it lasts), and the account
+// looked up — the one the file names, else the one WorkBuddy's account
+// list has it signed in to.
+async function importSignIns(site, texts) {
+  const results = []
+  for (const text of texts) {
+    for (const got of signInsIn(text)) {
+      if (got.error) { results.push({ type: "failed", error: got.error }); continue }
+      if (got.sealed) {
+        results.push({ type: "failed", error: `${site.name} desktop keeps this sign-in encrypted (WorkBuddy 5.6 and later), which magpie can't read; sign in with "${site.name} account (browser)" instead` })
+        continue
+      }
+      let a = got.a
+      const name0 = got.who ? accountName(got.who, null) : ""
+      try {
+        const other = otherSite(site, a)
+        if (other) throw new Error(`this is a ${other} sign-in; import it under ${other}`)
+        if (refreshable(a)) a = await renew(site, a)
+        else if (!a.access || stale(a)) throw new Error(`the sign-in has ended; sign in to ${site.name} again where it came from`)
+        let who = got.who
+        if (!who?.uid) {
+          const list = await call(at(site, a), "GET", "/v2/plugin/accounts", { Authorization: "Bearer " + a.access, "X-Domain": domainOf(site, a), ...enterpriseHeaders(a) })
+          const all = (list?.accounts ?? []).filter((x) => x?.uid)
+          const ent = a.enterpriseId
+          const pick = ent ? all.filter((x) => str(x.enterpriseId) === ent) : all.filter((x) => x.lastLogin)
+          who = plain(pick.length === 1 ? pick[0] : all.length === 1 ? all[0] : null)
+          if (!who) throw new Error(`${site.name} didn't say whose sign-in this is`)
+        }
+        a.uid = who.uid
+        const ent = await enterpriseOf(site, a, who)
+        if (ent.id) a.enterpriseId = ent.id
+        results.push(success(site, a, accountName(who, ent)))
+      } catch (e) {
+        results.push({ type: "failed", error: e?.message ?? String(e), ...(name0 ? { accountId: name0 } : {}) })
+      }
+    }
+  }
+  return results
+}
+
 // desktopHeld is what a desktop sign-in was renewed to here, by site and
 // account: kept in memory only, never written where the app keeps it.
 const desktopHeld = new Map()
@@ -1948,7 +2415,7 @@ const statusText = (n) => STATUS_TEXT[n] || `HTTP ${n}`
 
 // meterAsked is the billing API's reply to path, asked with a's sign-in.
 function meterAsked(site, a, path, body = {}, signal = AbortSignal.timeout(20000)) {
-  return fetch(site.endpoint + path, {
+  return fetch(endpointOf(site, a) + path, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + site.app,
       Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "", "X-Domain": domainOf(site, a), "X-Product": "SaaS",
@@ -2250,7 +2717,7 @@ const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/
 
 // The window WorkBuddy rate limits deepseek-v4.1-flash by, which its credit
 // meter does not show: WorkBuddy AI measured at about 1e8 over ten days, the
-// China build at about 2e8 on 2026-11-02 (see FREE_WINDOW_CN).
+// China build at about 2e8 on 2026-11-02 (see CN_ESTIMATED_WINDOWS).
 //
 // A free account's usage() reports only the credits window, so a plan with
 // 160 credits untouched reads 0% while chats to deepseek-v4.1-flash are
@@ -2331,18 +2798,48 @@ const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/
 // ~/.config/magpie otherwise. No endpoint reports the window; a ledger that
 // cannot be read yields no window rather than a made-up one.
 
-// A window: the build's ledger rows it counts (provider), the cap it reports
-// against, and how deep its display rounds. Two builds, two windows, two
-// caps: the same phone number can be signed in to both, and their ledgers
+// A window: the build's ledger rows it counts (provider and model), the cap
+// it reports against, and how its card reads. Two builds, two sets of
+// windows: the same phone number can be signed in to both, and their ledgers
 // stay apart — one build's spending must not fill the other's window.
 //
-// The China cap is the measured one, 2e8 (two accounts refused at 200.39M
-// and 200.49M). It was a soft 1.9e8 in 0.2.12 and 0.2.13, so that routing
-// rested the model before the vendor refused it; since the sum is set aside
-// (freeWindowOf's card), the cap only scales what the card says, and the
-// headroom bought nothing but a model stopped 10M tokens early (plugins#641).
-const FREE_WINDOW_CN = { provider: "workbuddy", cap: 2e8, short: "200M" }
-const FREE_WINDOW_AI = { provider: "workbuddy-ai", cap: 1e8, short: "100M" }
+// The China caps are measured on this machine from the vendor's own
+// refusals, never the vendor's word, and each is an estimate: 2e8 for
+// deepseek-v4.1-flash (two accounts refused at 200.39M and 200.49M on
+// 2026-11-02), with the card saying so (`~` and "(est.)"). The card is
+// shown only — set aside, plugins#641 — so a cap that goes stale costs a
+// wrong percentage, never a wrongly rested model; the first refusal of a
+// window pins the card full at the reset the vendor names.
+//
+// One entry per model, and only models that have been measured: a guessed
+// cap would read wrong every day. Add an entry when another model's window
+// is measured; remove one when the vendor stops applying it.
+const CN_ESTIMATED_WINDOWS = [
+  {
+    provider: "workbuddy",
+    model: "deepseek-v4.1-flash",
+    aliases: ["deepseek-v4.1-flash-sg"],
+    cap: 2e8,
+    name: "deepseek-v4.1-flash tokens (est.)",
+    // the card WorkBuddy's refusal makes: nothing in it is estimated
+    refusedName: "deepseek-v4.1-flash tokens",
+    short: "~200M",
+    // no unit: the name already says tokens, and magpie's narrow account
+    // cards cut a unit short ("tok…") beside the nine-digit numbers
+    unit: "",
+  },
+]
+// WorkBuddy AI's window keeps the name it shipped with: there the model is
+// served at x0.00, so "Free model tokens" is what it is.
+const FREE_WINDOW_AI = {
+  provider: "workbuddy-ai",
+  model: "deepseek-v4.1-flash",
+  aliases: ["deepseek-v4.1-flash-sg"],
+  cap: 1e8,
+  name: "Free model tokens",
+  short: "100M",
+  unit: "tokens",
+}
 const FREE_WINDOW_SPAN = 24 * 3600 * 1000
 // The lead: how far back of an edge the read goes on. A chain read from a row
 // that opens a window needs the window the span makes of the rows above it,
@@ -2355,10 +2852,9 @@ const FREE_WINDOW_LEAD = 86400 * 1000
 // earlier row began at most 24h before it, and so ended 24h after it at the
 // latest. This is one of the two edges the ledger itself spells out.
 const FREE_WINDOW_GAP = FREE_WINDOW_SPAN
-// the model the window is counted for; -sg shares it
-const FREE_WINDOW_MODEL = "deepseek-v4.1-flash"
-// both ids, so magpie's exact match finds the -sg one too
-const FREE_WINDOW_MODELS = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-sg"]
+// the model a window is counted for is its spec's `model`; `aliases` are the
+// ids that share the window (-sg is the same model under its paid id), and
+// both are named in the card's models so magpie's exact match finds them
 
 // windowOffset is the UTC offset a refusal spells out, in minutes, from
 // "UTC+8", "UTC+08:00", "UTC-5" or "GMT+8". null when it spells out none,
@@ -2389,6 +2885,19 @@ function windowReset(text) {
   return Date.UTC(+at[1], +at[2] - 1, +at[3], +at[4], +at[5], +at[6]) - off * 60000
 }
 
+// resetOf is the vendor reset a row names, whether its words spell it out or
+// a routing trace handed it as the instant itself.
+function resetOf(row) {
+  const said = windowReset(row?.err)
+  if (Number.isFinite(said)) return said
+  const until = Number(row?.restUntil)
+  return Number.isFinite(until) ? until : NaN
+}
+
+function windowModel(model, win) {
+  return typeof model === "string" && (model.startsWith(win.model) || win.aliases.some((alias) => model.startsWith(alias)))
+}
+
 // freeWindowOf is the window account is in now, from rows (magpie's usage
 // records), or null when it has lapsed — the next request opens a new one.
 // now is passed in so the reading is testable; win is the build's window
@@ -2405,7 +2914,7 @@ function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
       r?.provider === win.provider &&
       r.providerAccount === account &&
       typeof r.model === "string" &&
-      r.model.startsWith(FREE_WINDOW_MODEL) &&
+      windowModel(r.model, win) &&
       r.t,
   )
   if (!mine.length) return null
@@ -2424,7 +2933,7 @@ function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
   const edges = []
   for (const r of mine) {
     if (Number(r.status) !== 429) continue
-    const t = windowReset(r.err)
+    const t = resetOf(r)
     if (Number.isFinite(t)) edges.push(t)
   }
   edges.sort((a, b) => a - b)
@@ -2478,15 +2987,26 @@ function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
   if (now >= end) return null // lapsed: nothing is exhausted, a new window opens on the next request
 
   const card = (amount, resetsAt, refused) => ({
-    name: "Free model tokens",
-    used: Math.min(100, (100 * amount) / win.cap),
-    amount,
-    limit: win.cap,
-    unit: "tokens",
-    display: `${tokensShort(amount)} / ${win.short}`,
+    name: (refused && win.refusedName) || win.name,
+    // A refusal is the vendor's word that the window is spent, and says
+    // nothing of a count: the card says 100% used and when WorkBuddy said it
+    // resets, with no tokens. It used to say the cap as its count,
+    // "200,000,000 / 200,000,000" under "(est.)", a number nothing measured,
+    // which read as magpie's estimate gone wrong (wsyfree on X).
+    ...(refused
+      ? { used: 100, display: "" }
+      : {
+          used: Math.min(100, (100 * amount) / win.cap),
+          amount,
+          limit: win.cap,
+          unit: win.unit,
+          display: `${tokensShort(amount)} / ${win.short}`,
+        }),
     resetsAt: new Date(resetsAt).toISOString(),
     span: FREE_WINDOW_SPAN / 1000,
-    models: FREE_WINDOW_MODELS.slice(),
+    // the window's own model and the ids that share it, so magpie's exact
+    // match finds every id it limits
+    models: [win.model, ...win.aliases],
     // the ledger's sum is an estimate, shown and set aside; the vendor's
     // refusal is the one that stops the model (see the window above)
     ...(refused ? { refused: true } : { aside: true }),
@@ -2499,11 +3019,11 @@ function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
   let live = null
   for (const r of mine) {
     if (Number(r.status) !== 429) continue
-    const t = windowReset(r.err)
+    const t = resetOf(r)
     if (!Number.isFinite(t) || t <= now || t <= start) continue
     if (live === null || t > live) live = t
   }
-  if (live !== null) return card(win.cap, live, true)
+  if (live !== null) return card(0, live, true)
 
   return card(used, end, false)
 }
@@ -2535,6 +3055,13 @@ function tokensShort(n) {
 // own now.
 let ledgerParsed = null
 
+// routingParsed is the WorkBuddy refusals read from a routing file, keyed by
+// that file, provider and model. The
+// usage ledger beside it changes on every request; the routing files need not
+// be read — least of all the gzip days — merely because usage did.
+const routingParsed = new Map()
+const routingReads = { count: 0 }
+
 // ledgerBad is the number of whole lines the ledger last had that could
 // not be decoded, and the file it was read from, so that a ledger read
 // once and read again is complained about once, not on every panel open.
@@ -2557,6 +3084,220 @@ function freeWindowLedger(cwd = process.cwd(), env = process.env, home = homedir
   return dirs.map((d) => join(d, "usage.jsonl"))
 }
 
+// freeWindowRouting is the trace files a window can need, from the same root
+// as the ledger. Magpie writes one plain file a day and gzips the days before,
+// so only the local dates a 24h window and its lead can reach are named:
+// three, from the day two days back through today. A busy day goes on past
+// 256 MB in numbered files (2026-11-13.1.jsonl, magpie 5d93f6b3), each
+// gzipped in turn, and every one of them is that day's too (#1077).
+function freeWindowRouting(base, now = Date.now()) {
+  const days = new Set()
+  for (let at = new Date(now); days.size < 3; at.setDate(at.getDate() - 1)) {
+    days.add(`${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, "0")}-${String(at.getDate()).padStart(2, "0")}`)
+  }
+  let names
+  try {
+    names = readdirSync(join(base, "routing"))
+  } catch {
+    return []
+  }
+  const found = []
+  for (const day of days) {
+    const of = []
+    for (const name of names) {
+      const m = /^(?:\.(\d+))?\.jsonl(\.gz)?$/.exec(name.startsWith(day) ? name.slice(day.length) : "")
+      if (m) of.push({ name, n: Number(m[1] ?? 0), gz: m[2] ? 1 : 0 })
+    }
+    of.sort((a, b) => a.n - b.n || a.gz - b.gz)
+    for (const { name } of of) found.push(join(base, "routing", name))
+  }
+  return found
+}
+
+// restIdentity reads the gateway rest key's exact shape,
+// workbuddy@<account>/<model>: the provider must be this build's whole name,
+// the model starts at the last slash, and the account is everything before it,
+// so an account may itself contain @ or /.
+function restIdentity(rest, win) {
+  if (typeof rest?.key !== "string") return null
+  if (!rest.key.startsWith(win.provider + "@")) return null
+  const tail = rest.key.slice(win.provider.length + 1)
+  const modelAt = tail.lastIndexOf("/")
+  if (modelAt <= 0 || modelAt === tail.length - 1) return null
+  const model = tail.slice(modelAt + 1)
+  return windowModel(model, win) ? { account: tail.slice(0, modelAt), model } : null
+}
+
+// routingRefusals turns a routing trace's failed WorkBuddy attempts into the
+// same shape as a usage row, so freeWindowOf can read the vendor reset an
+// ordinary usage read never saw. An attempt is named either by order[]'s who
+// or, when the gateway rest carries a reset, by rest.key's account and model;
+// keyed accounts are compared case-insensitively, and an order's spelling is
+// kept. Where both name different accounts the attempt is left out rather
+// than guessed onto one of them.
+function routingRefusals(win, text) {
+  const rows = []
+  for (const line of text.split("\n")) routingRefusal(win, line, rows)
+  return rows
+}
+
+// routingRefusal adds one trace line's refusals to rows. Only a line that
+// names a 429 and this build is decoded.
+function routingRefusal(win, line, rows) {
+  if (!/"status"\s*:\s*429/.test(line)) return
+  if (!line.includes(win.provider)) return
+  let event
+  try {
+    event = JSON.parse(line)
+  } catch {
+    return
+  }
+  const orders = Array.isArray(event?.order) ? event.order : []
+  const named = new Map()
+  const ambiguous = new Set()
+  for (const order of orders) {
+    if (order?.provider !== undefined && order.provider !== win.provider) continue
+    if (typeof order.id !== "string" || typeof order.who !== "string") continue
+    if (ambiguous.has(order.id)) continue
+    const was = named.get(order.id)
+    if (was === undefined) named.set(order.id, order.who)
+    else if (was.toLowerCase() !== order.who.toLowerCase()) {
+      named.delete(order.id)
+      ambiguous.add(order.id)
+    }
+  }
+  for (const attempt of Array.isArray(event?.tries) ? event.tries : []) {
+    if (Number(attempt?.status) !== 429) continue
+    if (attempt.provider !== undefined && attempt.provider !== win.provider) continue
+    if (!windowModel(attempt.model, win)) continue
+    const error = typeof attempt.error === "string" ? attempt.error : typeof attempt.error?.message === "string" ? attempt.error.message : ""
+    const keyed = restIdentity(attempt.rest, win)
+    let reset = windowReset(error)
+    let restUntil = NaN
+    if (!Number.isFinite(reset)) {
+      restUntil = keyed && attempt.rest.by === "resets" ? Date.parse(typeof attempt.rest.until === "string" ? attempt.rest.until : "") : NaN
+      if (Number.isFinite(restUntil)) reset = restUntil
+    }
+    if (!Number.isFinite(reset)) continue
+    const ordered = named.get(String(attempt.id ?? ""))
+    if (ordered !== undefined && keyed && ordered.toLowerCase() !== keyed.account.toLowerCase()) continue
+    const account = ordered ?? keyed?.account
+    if (typeof account !== "string" || !account) continue
+    const keyedOnly = ordered === undefined
+    rows.push({
+      provider: win.provider,
+      providerAccount: account,
+      model: attempt.model,
+      t: attempt.start ?? event?.time,
+      status: 429,
+      err: error,
+      ...(keyedOnly ? { keyedOnly: true } : {}),
+      ...(Number.isFinite(windowReset(error)) ? {} : { restUntil }),
+    })
+  }
+}
+
+// ROUTING_LINE_MAX is the longest trace line read; a longer one is passed
+// over. A refusal's line is a few KiB, and the longest line of a 520 MB day
+// was 88 KiB (#1077).
+const ROUTING_LINE_MAX = 4 << 20
+
+// routingLines calls each with every whole line of a routing trace, from
+// byte `from` of a plain file on, unzipped as it is read when compressed.
+// Only a chunk and one line are ever held, never the file: a busy day's .gz
+// unzipped to 520 MB, and reading it whole took the plugin host past 1 GB
+// on a 2 GB machine, where the kernel killed it and every request in flight
+// with it (#1077). It resolves to the offset just past a plain file's last
+// newline, where a later read goes on: a last line with none yet may be
+// half written. A .gz's last line is passed whole, as magpie's own reader
+// takes it. A read that fails part way resolves to how far it got, the
+// lines before kept.
+async function routingLines(path, compressed, from, each) {
+  let offset = from
+  let line = [] // the pieces of the line being read, while it fits
+  let lineBytes = 0
+  const add = (piece) => {
+    if (lineBytes + piece.length <= ROUTING_LINE_MAX) line.push(piece)
+    else line = null
+    lineBytes += piece.length
+  }
+  const done = () => {
+    if (line && lineBytes) each(Buffer.concat(line, lineBytes).toString("utf8"))
+    offset += lineBytes
+    line = []
+    lineBytes = 0
+  }
+  const file = createReadStream(path, compressed ? undefined : { start: from })
+  const stream = compressed ? file.pipe(createGunzip()) : file
+  if (compressed) file.on("error", (e) => stream.destroy(e))
+  try {
+    for await (const chunk of stream) {
+      let start = 0
+      for (let nl = chunk.indexOf(10); nl !== -1; nl = chunk.indexOf(10, start)) {
+        add(chunk.subarray(start, nl))
+        done()
+        offset++
+        start = nl + 1
+      }
+      if (start < chunk.length) add(chunk.subarray(start))
+    }
+    if (compressed) done()
+  } catch {
+    file.destroy()
+    stream.destroy()
+  }
+  return offset
+}
+
+// routingReading is the reads under way, so that two usage reads at once
+// read a trace once.
+const routingReading = new Map()
+
+async function readRoutingRefusals(path, compressed, win) {
+  let st
+  try {
+    st = statSync(path)
+  } catch {
+    return []
+  }
+  const key = `${path}|${win.provider}|${win.model}`
+  const held = routingParsed.get(key)
+  const fingerprint = `${st.mtimeMs}:${st.size}`
+  if (held?.fingerprint === fingerprint) return held.rows
+  const going = routingReading.get(key)
+  if (going) return going
+  const read = (async () => {
+    routingReads.count++
+    // magpie only appends to a day's plain file, so one that has grown is
+    // read on from where the last read stopped; one that shrank or kept its
+    // size was written anew, and is read whole
+    const grown = !compressed && held && held.ino === st.ino && st.size > held.size
+    const rows = grown ? [...held.rows] : []
+    const offset = await routingLines(path, compressed, grown ? held.offset : 0, (line) => routingRefusal(win, line, rows))
+    routingParsed.set(key, { key, path, fingerprint, size: st.size, ino: st.ino, offset, rows })
+    return rows
+  })()
+  routingReading.set(key, read)
+  try {
+    return await read
+  } finally {
+    routingReading.delete(key)
+  }
+}
+
+async function routingRefusalRows(path, compressed, now, account, win = FREE_WINDOW_AI, text) {
+  const parsed = text === undefined ? await readRoutingRefusals(path, compressed, win) : routingRefusals(win, text)
+  const rows = []
+  const oldest = now - 2 * FREE_WINDOW_SPAN
+  for (const attempt of parsed) {
+    const t = Date.parse(attempt.t)
+    if (!Number.isFinite(t) || t < oldest || t > now) continue
+    if (attempt.providerAccount.toLowerCase() !== account.toLowerCase()) continue
+    rows.push({ ...attempt, providerAccount: attempt.keyedOnly ? account : attempt.providerAccount })
+  }
+  return rows
+}
+
 // freeWindowRows reads magpie's usage ledger for account, oldest row first.
 // null when no ledger can be read: the window is then left unknown rather
 // than guessed.
@@ -2571,7 +3312,7 @@ function freeWindowLedger(cwd = process.cwd(), env = process.env, home = homedir
 // ledger mid-write, the one row holding the free window's start was
 // dropped without a word, and the panel showed no window at all until the
 // next read happened to succeed.
-function freeWindowRows(account, now = Date.now(), cwd = process.cwd(), env = process.env, home = homedir(), win = FREE_WINDOW_AI) {
+async function freeWindowRows(account, now = Date.now(), cwd = process.cwd(), env = process.env, home = homedir(), win = FREE_WINDOW_AI) {
   if (!account) return null
   let found = null
   for (const path of freeWindowLedger(cwd, env, home)) {
@@ -2588,26 +3329,36 @@ function freeWindowRows(account, now = Date.now(), cwd = process.cwd(), env = pr
   // way this ledger is written; one rewritten in place (a rotation or a
   // compaction) moves mtime even when its size lands the same.
   const file = path + "|" + st.mtimeMs + ":" + st.size
-  // the key carries the account and the build: one account's rows are its
-  // own, and the two builds' chains over one ledger must not answer for
-  // each other (the same phone number can be signed in to both)
-  const key = file + "|" + win.provider + "|" + account
-  if (ledgerParsed?.key === key) return ledgerParsed.rows
+  // the key carries the account, the build and the model: one account's
+  // rows are its own, the two builds' chains over one ledger must not
+  // answer for each other (the same phone number can be signed in to both),
+  // and two windows of one build count different models
+  const key = file + "|" + win.provider + "|" + win.model + "|" + account
   let got
-  try {
-    got = readLedgerTail(path, st, now, undefined, account, win)
-  } catch {
-    return null
+  if (ledgerParsed?.key === key) {
+    got = ledgerParsed
+  } else {
+    try {
+      got = readLedgerTail(path, st, now, undefined, account, win)
+    } catch {
+      return null
+    }
+    if (got.bad && ledgerBad.key !== file) {
+      ledgerBad = { key: file, count: got.bad }
+      console.error(
+        `workbuddy: ${got.bad} whole line${got.bad === 1 ? "" : "s"} of ${path} could not be decoded ` +
+          `(not the last line, so not a write in progress); the free-token window may read short`,
+      )
+    }
+    ledgerParsed = { key, rows: got.rows }
   }
-  if (got.bad && ledgerBad.key !== file) {
-    ledgerBad = { key: file, count: got.bad }
-    console.error(
-      `workbuddy: ${got.bad} whole line${got.bad === 1 ? "" : "s"} of ${path} could not be decoded ` +
-        `(not the last line, so not a write in progress); the free-token window may read short`,
-    )
-  }
-  ledgerParsed = { key, rows: got.rows }
-  return got.rows
+  const routes = freeWindowRouting(dirname(path), now)
+  const current = new Set(routes)
+  for (const [key, held] of routingParsed) if (!current.has(held.path)) routingParsed.delete(key)
+  const refused = []
+  for (const route of routes) refused.push(...(await routingRefusalRows(route, route.endsWith(".gz"), now, account, win)))
+  const rows = [...got.rows, ...refused].sort((a, b) => Date.parse(a.t) - Date.parse(b.t))
+  return rows
 }
 
 // LEDGER_T is where a row's time sits: "t" is among the first keys
@@ -2655,15 +3406,15 @@ function rowAccount(line) {
 }
 
 // ofAccount is whether a row belongs to the chain read for account: this
-// account's own row of the build's free model, either id. A refusal of
-// another account's, of the other build, or of a paid model says nothing
-// about where this chain opens.
+// account's own row of the window's model, either id. A refusal of another
+// account's, of the other build, or of another model says nothing about
+// where this chain opens.
 function ofAccount(row, account, win = FREE_WINDOW_AI) {
   return (
     row?.provider === win.provider &&
     row.providerAccount === account &&
     typeof row.model === "string" &&
-    row.model.startsWith(FREE_WINDOW_MODEL)
+    windowModel(row.model, win)
   )
 }
 
@@ -2811,7 +3562,7 @@ function pinned(rows, account) {
   // the same job and keeps the latest.
   let denied = null
   for (let i = rows.length - 1; i >= 0; i--) {
-    const reset = Number(rows[i]?.status) === 429 ? windowReset(rows[i].err) : NaN
+    const reset = Number(rows[i]?.status) === 429 ? resetOf(rows[i]) : NaN
     if (Number.isFinite(reset)) denied = reset
   }
   if (denied !== null) return denied - FREE_WINDOW_LEAD
@@ -2867,7 +3618,7 @@ function pinning() {
     const status = Number(row?.status)
     if (status === 429) {
       if (denied === null) {
-        const reset = windowReset(row.err)
+        const reset = resetOf(row)
         if (Number.isFinite(reset)) denied = reset
       }
       return 0
@@ -2916,15 +3667,55 @@ function pinning() {
 // the client's resolveCreditGroup does (PLAN_CODES, see planCodes). A
 // summary with only one kind keeps the one "Credits" window, as before.
 //
-// Only one of the two stops the account at a time: WorkBuddy serves it
-// while any credits are left, so the one set aside is the one whose
-// running out doesn't stop it — "Extra credits", until the plan's are
-// spent and extra ones are left.
+// Neither of the two stops the account: WorkBuddy serves it while any
+// credits are left, of either kind. Both are set aside, and the account's
+// whole is a third window, "Total credits", which stops it (totalOf).
+// Before, the one that stopped it was the plan's until its credits were
+// spent and the extra one's after, so magpie's Routing page said the
+// plan's "500 / 500" alone on one account and the extra credits on
+// another, and an account at 90% of its plan's credits was kept for last
+// with its extra ones untouched (ferock on Discord, 0.2.22).
 function usageOf(sum, plan, site) {
   const out = { plan: plan || (sum?.IsPaidUser ? "Pro" : "Free plan"), windows: [] }
+  const { plan: mine, extra, left, bags } = kindsOf(sum, site)
+  if (mine.total > 0 && extra.total > 0) {
+    const credits = creditWindow("Credits", mine), more = creditWindow("Extra credits", extra)
+    out.windows.push(credits, more, totalOf(credits, more))
+  } else {
+    const total = mine.total + extra.total, used = mine.used + extra.used
+    if (total > 0) out.windows.push(creditWindow("Credits", { used, total }))
+  }
+  const total = mine.total + extra.total
+  if (bags > 0 && (total === 0 || left > 0)) out.windows.push({ name: "Prepaid credits", balance: left, display: `${compact(left)} credits`, unit: "credits" })
+  return out
+}
+
+// creditWindow is a window of credits used of a total.
+const creditWindow = (name, { used, total }) => ({ name, used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
+
+// totalOf is the account's whole credits, the plan's and the extra ones,
+// as the window that stops it, and sets the two aside (see usageOf). It
+// renews with the plan's (its cycle, resetsAt and span), and says the
+// soonest of the two to lapse (runsOutAt, runsOut), as routing reads no
+// window set aside.
+function totalOf(plan, extra) {
+  plan.aside = extra.aside = true
+  const w = creditWindow("Total credits", { used: plan.amount + extra.amount, total: plan.limit + extra.limit })
+  if (plan.resetsAt) w.resetsAt = plan.resetsAt
+  if (plan.span) w.span = plan.span
+  const at = (x) => (x.runsOutAt ? Date.parse(x.runsOutAt) : 0)
+  const [a, b] = [at(plan), at(extra)]
+  const soon = a > 0 && (!(b > 0) || a <= b) ? plan : b > 0 ? extra : null
+  if (soon) Object.assign(w, { runsOutAt: soon.runsOutAt, runsOut: soon.runsOut + (a > 0 && a === b ? extra.runsOut : 0) })
+  return w
+}
+
+// kindsOf is the summary's credits, the plan's and the extra ones (see
+// usageOf), and what is left in its packages with no total (a prepaid
+// balance).
+function kindsOf(sum, site) {
   const ofPlan = planCodes(sum, site)
-  const kinds = { plan: { total: 0, used: 0 }, extra: { total: 0, used: 0 } }
-  let left = 0, bags = 0
+  const kinds = { plan: { total: 0, used: 0 }, extra: { total: 0, used: 0 }, left: 0, bags: 0 }
   const hasTotal = (p) => p?.CycleTotalCapacity != null && p.CycleTotalCapacity !== ""
   const add = (k, p) => ((k.total += capacity(p.CycleTotalCapacity)), (k.used += capacity(p?.CycleUsedCapacity)))
   const groups = (Array.isArray(sum?.CreditGroups) ? sum.CreditGroups : []).filter(hasTotal)
@@ -2933,24 +3724,45 @@ function usageOf(sum, plan, site) {
     if (hasTotal(p)) {
       if (!groups.length) add(kinds[ofPlan(p?.PackageCode) ? "plan" : "extra"], p)
     } else if (p?.CycleRemainCapacity != null && p.CycleRemainCapacity !== "") {
-      left += capacity(p.CycleRemainCapacity)
-      bags++
+      kinds.left += capacity(p.CycleRemainCapacity)
+      kinds.bags++
     }
   }
-  const window = (name, { used, total }) => ({ name, used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
-  const { plan: mine, extra } = kinds
-  if (mine.total > 0 && extra.total > 0) {
-    const credits = window("Credits", mine), more = window("Extra credits", extra)
-    if (mine.used >= mine.total && extra.used < extra.total) credits.aside = true
-    else more.aside = true
-    out.windows.push(credits, more)
-  } else {
-    const total = mine.total + extra.total, used = mine.used + extra.used
-    if (total > 0) out.windows.push(window("Credits", { used, total }))
+  return kinds
+}
+
+// listedExtra is the extra credits of the detail lists (packagesOf) that
+// the summary doesn't list at all, as WorkBuddy's own usage panel counts
+// them (jiabubu on Discord, magpie 0.1.2774, a China-site free account:
+// magpie's card read "0 / 500" alone, while the panel shows the extra
+// kinds beside the plan's). The panel's groups come from the detail
+// lists, not the summary (buildCreditGroups over fetchUserResources' paid
+// and free lists), and leave out a package past its end; a slice package
+// (CapacityType 4) counts the day's slice, as resolveResourceCapacity
+// does. null when there are none with credits.
+function listedExtra(sum, packages, site, now = Date.now()) {
+  const summed = new Set((sum?.Packages ?? []).map((p) => p?.PackageCode))
+  const codes = site?.ai ? [...EXTRA_CODES, ...EXTRA_AI] : EXTRA_CODES
+  let total = 0, left = 0, at = 0, lapsing = 0
+  for (const p of packages ?? []) {
+    const code = p?.PackageCode
+    if (!codes.includes(code) || summed.has(code)) continue
+    const end = endOf(p)
+    if (end > 0 && end <= now) continue
+    const slice = String(p?.CapacityType) === SLICE ? p?.SlicePeriodUsageDetails?.[0] : null
+    const of = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0 }
+    const t = of(slice ? slice.SlicePeriodCapacitySizePrecise : p?.CycleCapacitySizePrecise)
+    const l = Math.min(t, of(slice ? slice.SlicePeriodCapacityRemainPrecise : p?.CycleCapacityRemainPrecise))
+    if (!(t > 0)) continue
+    total += t
+    left += l
+    if (l > 0 && end > 0 && !slice) {
+      if (!at || end < at) at = end, lapsing = l
+      else if (end === at) lapsing += l
+    }
   }
-  const total = mine.total + extra.total
-  if (bags > 0 && (total === 0 || left > 0)) out.windows.push({ name: "Prepaid credits", balance: left, display: `${compact(left)} credits`, unit: "credits" })
-  return out
+  if (!(total > 0)) return null
+  return { total, used: total - left, ...(at ? { runsOutAt: new Date(at).toISOString(), runsOut: lapsing } : {}) }
 }
 
 // enterpriseUsageOf is an enterprise (team) account's credits, from
@@ -3018,6 +3830,16 @@ const PLAN_CODES = [CODE("002", "AkiJS3ZHF5"), CODE("005", "maRGyrHhw1"), CODE("
   CODE("039", "KRcQj7wUat"), CODE("040", "mi9rCYg46x")]
 const FREE_MON = CODE("008", "cfWoLwvjU4")
 
+// EXTRA_CODES are the kinds of extra credits WorkBuddy's own usage panel
+// shows beside the plan's base (WorkBuddy 5.5.6, the China build's
+// resolveCreditGroup): the plan's bonus (bonus28, bonusIntl), top-ups
+// (extra 009, extra38 038, extraIntl 036) and platform rewards (activity
+// 007, bonus29, bonus30), and on WorkBuddy AI the free month (008) and
+// gift (006) too. The China build puts gift in no group, so it shows none.
+const EXTRA_CODES = [CODE("028", "NtpWi0jzXs"), CODE("037", "WxOD3MpI2o"), CODE("009", "0XmEQc2xOf"), CODE("038", "OhvqZtiPKr"),
+  CODE("036", "lupO5WgNdG"), CODE("007", "nzdH5h4Nl0"), CODE("029", "6wCGEWquYy"), CODE("030", "BjSt89qTvr")]
+const EXTRA_AI = [FREE_MON, CODE("006", "DbXS0lrypC")]
+
 // planCodes says whether a package of the summary is the plan's own: one
 // of PLAN_CODES on that site, or the subscription the summary names.
 function planCodes(sum, site) {
@@ -3068,8 +3890,15 @@ function endOf(p) {
 // the account whose credits expire first. Only packages the summary
 // counts, with credits left, and not the daily slice; null when none.
 // only narrows it to the packages of one window (the split's, usageOf).
-function runsOutOf(sum, packages, now = Date.now(), only = () => true) {
+//
+// A reward the summary doesn't list but the detail lists do (a daily
+// check-in's credits, each with its own end) is counted too when site is
+// given, as WorkBuddy's own panel counts them (see listedExtra): the
+// account serves them like any others, so an account whose check-in
+// credits lapse first is spent first (cdredfox on X).
+function runsOutOf(sum, packages, now = Date.now(), only = () => true, site = null) {
   const counted = new Set((sum?.Packages ?? []).map((p) => p?.PackageCode))
+  if (site) for (const c of site.ai ? [...EXTRA_CODES, ...EXTRA_AI] : EXTRA_CODES) counted.add(c)
   let at = 0, amount = 0
   for (const p of packages ?? []) {
     if (!counted.has(p?.PackageCode) || !only(p?.PackageCode) || p?.PackageCode === DAILY_CODE || String(p?.CapacityType) === SLICE) continue
@@ -3137,9 +3966,9 @@ function variants(efforts) {
 // kimi-k3 with a two-colour PNG named both colours (plugins#572). Declared
 // text-only, as before, every model read as one that can't see.
 function configModels(site) {
-  return Object.fromEntries(site.models.map(([id, name, context, efforts]) => [id, {
+  return Object.fromEntries(site.models.map(([id, name, context, efforts, output]) => [id, {
     name,
-    limit: { context, output: 0 },
+    limit: { context, output: output ?? 0 },
     tool_call: true,
     attachment: !textOnly(site, id),
     modalities: { input: textOnly(site, id) ? ["text"] : ["text", "image"], output: ["text"] },
@@ -3340,32 +4169,52 @@ async function liveModels(site, a) {
   headers.set("User-Agent", cliAgent(site))
   headers.set("X-Requested-With", "XMLHttpRequest")
   headers.set("Accept", "application/json")
-  const res = await fetch(site.endpoint + "/v3/config", { headers, signal: AbortSignal.timeout(15000) })
+  const res = await fetch(endpointOf(site, a) + "/v3/config", { headers, signal: AbortSignal.timeout(15000) })
   const env = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(`${site.name}'s config: HTTP ${res.status}`)
   if (env.code) throw new Error(`${site.name}'s config: ${env.msg} (${env.code})`)
   const cfg = env.data ?? {}
+  const models = Array.isArray(cfg.models) ? cfg.models : []
   const out = []
+  const seen = new Set()
+  const add = (id, d) => {
+    seen.add(id)
+    const m = { id, name: d?.name || id }
+    if (d) {
+      m.context = d.maxInputTokens
+      m.output = d.maxOutputTokens
+      m.images = d.supportsImages === true && !textOnly(site, id)
+      Object.assign(m, priceOf(d, cfg.modelPromotions))
+      const es = effortsOf(d, site, id)
+      if (es.length) {
+        const canOff = d.reasoning?.canDisableThinking
+        const off = (!d.onlyReasoning && (canOff == null || canOff)) || OFF_TAKEN.has(id)
+        m.efforts = [...(off ? ["none"] : []), ...es]
+        const def = defaultEffortOf(d, es)
+        if (def) m.effort = def
+      }
+    }
+    out.push(m)
+  }
+  let cli = false
   for (const agent of cfg.agents ?? []) {
     if (agent.name !== "cli") continue
-    for (const id of agent.models ?? []) {
-      const d = (cfg.models ?? []).find((x) => x.id === id)
-      const m = { id, name: d?.name || id }
-      if (d) {
-        m.context = d.maxInputTokens
-        m.output = d.maxOutputTokens
-        m.images = d.supportsImages === true && !textOnly(site, id)
-        Object.assign(m, priceOf(d, cfg.modelPromotions))
-        const es = effortsOf(d, site, id)
-        if (es.length) {
-          const canOff = d.reasoning?.canDisableThinking
-          const off = (!d.onlyReasoning && (canOff == null || canOff)) || OFF_TAKEN.has(id)
-          m.efforts = [...(off ? ["none"] : []), ...es]
-          const def = defaultEffortOf(d, es)
-          if (def) m.effort = def
-        }
-      }
-      out.push(m)
+    cli = true
+    for (const id of agent.models ?? []) add(id, models.find((x) => x.id === id))
+  }
+  // An enterprise's own models ("custom:<name>|<name>", modelType
+  // "enterprise") come in the config's models, not in the cli agent's
+  // list: WorkBuddy's CLI (as bundled in WorkBuddy 5.5.6, read from its
+  // AgentManager.computeModels) appends every model whose id starts with
+  // "custom:" to the agent's list itself, after the ones the agent names,
+  // in the config's order (plugins#1015). The id is sent as it is, "|" and
+  // all: WorkBuddy serves a chat to it. The CLI
+  // appends models tagged "custom" or "chat" too; those in a desktop's
+  // config are its own local models, with their own url and apiKey, and
+  // aren't WorkBuddy's to serve, so they stay out.
+  if (cli) {
+    for (const d of models) {
+      if (typeof d?.id === "string" && d.id.startsWith("custom:") && !seen.has(d.id)) add(d.id, d)
     }
   }
   // tell apart models the config names alike: deepseek-v4.1-flash and
@@ -3416,6 +4265,97 @@ function replyAfterToolsOn(b) {
   if (i === msgs.length - 1 || i < 0 || msgs[i]?.role !== "tool") return false
   msgs.splice(i + 1, 0, { role: "assistant", content: "" })
   return true
+}
+
+// HIDE_DSH is the switch, on unless the user turns it off, that takes
+// DeepSeek Harness's name out of what it sends (NancyTom on X: an account
+// used from dsh through magpie was banned, and a reply there had Tencent
+// recognize dsh's built-in prompt). FLAGGED's comma gets a chat past the
+// live 11128 check; this is for a check that reads the prompt afterwards.
+// The lines are dsh 0.2.1's own (@deepseek-ai/dsh-system-prompt and
+// dsh-harness-dev-context): the opener, the checkout and Web GUI lines in
+// the system prompt and in the runtime context dsh sends as a user message,
+// and their earlier wording (LEGACY_SOURCE, LEGACY_WEB_SURFACE). Only the
+// name in prose goes: lower-case dsh, which names paths (~/.dsh), commands,
+// URIs (dsh-session:) and skills the agent calls, stays, as does a tool's
+// result, which is what a file or command said. Case counts, so the name
+// in an identifier (DSH_HOME) is left too.
+//
+// The bare name is taken out only where dsh wrote it: the system prompt and
+// the tools' descriptions (DSH_PROSE). The user's and the assistant's text
+// get dsh's own lines alone (DSH_LINES: its runtime context comes as a user
+// message, and the model can quote a line back); a bare DSH or "DeepSeek
+// Harness" there is the user's own word. liby233 on Discord: a user asked
+// for "/root/DSH/Work/OC-182.92.66.95/" word for word and got
+// "/root/the agent harness/Work/…" back. Even in the system prompt a name
+// in a path or a file name (/root/DSH/, C:\DSH\, DSH.md) is never prose
+// (IN_PATH_BEFORE, IN_PATH_AFTER), so a working directory dsh writes there stays as it is.
+const HIDE_DSH = "hide_dsh"
+const DSH_LINES = [
+  [/You are an AI agent,? powered by DeepSeek Harness\.?/g, "You are an AI agent."],
+  [/DeepSeek Harness (Web GUI)/g, "$1"],
+  [/DeepSeek Harness (implementation checkout)/g, "agent $1"],
+  [/\bDSH itself\b/g, "the agent itself"],
+]
+// before and after a name, what makes it part of a path, a file's name or
+// an identifier rather than a word of prose
+const IN_PATH_BEFORE = String.raw`(?<![\w/\\.~:@-])`
+const IN_PATH_AFTER = String.raw`(?![\w/\\@-]|\.\w)`
+const DSH_PROSE = [
+  ...DSH_LINES,
+  [new RegExp(IN_PATH_BEFORE + "([Tt]he )?DeepSeek Harness" + IN_PATH_AFTER, "g"), (_, the) => (the ?? "the ") + "agent harness"],
+  [new RegExp(IN_PATH_BEFORE + "DSH" + IN_PATH_AFTER, "g"), "the agent harness"],
+]
+
+// dshHidden takes the name out of text dsh wrote (the system prompt, a
+// tool's description); in the user's or the assistant's text (said) only
+// dsh's own lines are reworded.
+function dshHidden(text, said = false) {
+  for (const [re, to] of said ? DSH_LINES : DSH_PROSE) text = text.replace(re, to)
+  return text
+}
+
+// hideDsh puts dshHidden on the text of a chat's messages (Chat
+// Completions or Messages: a string, or a part of type text), on Messages'
+// system, and on the tools' descriptions; true when it changed any.
+// A tool's result (role tool, or a tool_result part) is left as it came.
+function hideDsh(chat) {
+  if (!chat || typeof chat !== "object") return false
+  let changed = false
+  const parts = (content, said) => {
+    if (typeof content === "string") {
+      const t = dshHidden(content, said)
+      if (t !== content) changed = true
+      return t
+    }
+    if (!Array.isArray(content)) return content
+    return content.map((p) => {
+      if (!p || typeof p.text !== "string" || (p.type !== undefined && p.type !== "text")) return p
+      const t = dshHidden(p.text, said)
+      if (t === p.text) return p
+      changed = true
+      return { ...p, text: t }
+    })
+  }
+  if (Array.isArray(chat.messages))
+    for (const m of chat.messages)
+      if (m && typeof m === "object" && m.role !== "tool") m.content = parts(m.content, m.role !== "system" && m.role !== "developer")
+  if (chat.system !== undefined) chat.system = parts(chat.system, false)
+  const described = (o) => {
+    if (!o || typeof o !== "object") return
+    if (Array.isArray(o)) return o.forEach(described)
+    for (const k of Object.keys(o)) {
+      if (k === "description" && typeof o[k] === "string") {
+        const t = dshHidden(o[k])
+        if (t !== o[k]) {
+          o[k] = t
+          changed = true
+        }
+      } else described(o[k])
+    }
+  }
+  if (Array.isArray(chat.tools)) described(chat.tools)
+  return changed
 }
 
 // FREE_ONLY is the switch that keeps an account off credits (#430): its
@@ -3488,6 +4428,9 @@ function makePlugin(site) {
     }
   }
   const freeOnly = () => magpie?.option?.(site.id, FREE_ONLY) === true
+  // on by default: magpie hands over the user's value, else the default;
+  // OpenCode, with no magpie, has it on
+  const dshOff = () => magpie?.option?.(site.id, HIDE_DSH) !== false
   // onlyFree is a list with the switch on: its free models, or a failure
   // when there are none to tell (magpie then keeps the list it had)
   const onlyFree = (ms) => {
@@ -3559,6 +4502,7 @@ function makePlugin(site) {
       // which doesn't call this. Desktop's sign-in has no expiry stored
       // and is renewed as before.
       refreshLead: LEAD_MS,
+      rotating: true,
       refresh: (auth) => refreshed(site, auth),
       // the account's daily check-in: magpie can run it once a day per
       // account, when its WorkBuddy check-in switch is on; the button in
@@ -3598,19 +4542,33 @@ function makePlugin(site) {
         },
         // the China build's chats only: the AI build has the one format, and
         // its switch would be one that changed nothing (formatOf)
-        ...(site.ai ? [] : [{
-          key: FORMAT_SWITCH,
-          label: "Send as CodeBuddy CLI 2.108.1",
-          description: `Sends a chat in the shape of Tencent's official CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 instead of WorkBuddy's desktop app. Off sends the app's shape. Both sign in as the same account; what differs is the client the endpoint reads.`,
-          // the same words in magpie's other languages (plugins#590)
-          labels: { zh: "按 CodeBuddy CLI 2.108.1 发送", "zh-TW": "以 CodeBuddy CLI 2.108.1 送出", ja: "CodeBuddy CLI 2.108.1 として送信", de: "Als CodeBuddy CLI 2.108.1 senden" },
+        ...(site.ai ? [] : [
+            {
+              key: FORMAT_SWITCH,
+              label: "Send as CodeBuddy CLI 2.108.1",
+              description: "Sends a chat in the shape of Tencent's official CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 instead of WorkBuddy's desktop app. Off sends the app's shape. Both sign in as the same account; what differs is the client the endpoint reads.",
+              labels: { zh: "按 CodeBuddy CLI 2.108.1 发送", "zh-TW": "以 CodeBuddy CLI 2.108.1 送出", ja: "CodeBuddy CLI 2.108.1 として送信", de: "Als CodeBuddy CLI 2.108.1 senden" },
+              descriptions: {
+                zh: "按腾讯官方 CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 的形状发送，而不是 WorkBuddy 桌面端。关掉就发桌面端的形状。两者登录的是同一个账号，差别只在服务端读到的客户端。",
+                "zh-TW": "以騰訊官方 CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 的形狀送出，而不是 WorkBuddy 桌面端。關掉就送桌面端的形狀。兩者登入的是同一個帳號，差別只在伺服端讀到的用戶端。",
+                ja: "WorkBuddy のデスクトップアプリではなく、Tencent 公式の CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 の形で送信します。オフにするとアプリの形で送信します。どちらも同じアカウントでサインインし、違いはエンドポイントが読むクライアントだけです。",
+                de: "Sendet einen Chat in der Form von Tencent's offizieller CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 statt der WorkBuddy-Desktop-App. Aus sendet die Form der App. Beide melden dasselbe Konto an; unterschiedlich ist nur der Client, den der Endpunkt liest.",
+              },
+            }
+        ]),
+        {
+          key: HIDE_DSH,
+          label: "Hide DeepSeek Harness's name",
+          description: `Takes DeepSeek Harness's name out of what it sends to ${site.name}: its opening line, and the lines naming its checkout and Web GUI. Paths, commands and tools stay as they are.`,
+          default: true,
+          labels: { zh: "隐去 DeepSeek Harness 的名字", "zh-TW": "隱去 DeepSeek Harness 的名字", ja: "DeepSeek Harness の名前を伏せる", de: "Namen von DeepSeek Harness ausblenden" },
           descriptions: {
-            zh: `以腾讯官方 CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 的请求形状发送聊天，而不是 WorkBuddy 桌面端。关闭时按桌面端的形状发送。两者登录同一个账号，区别只在服务端据此识别的客户端。`,
-            "zh-TW": `以騰訊官方 CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 的請求形狀送出聊天，而不是 WorkBuddy 桌面端。關閉時以桌面端的形狀送出。兩者登入同一個帳號，差別只在伺服端據此識別的用戶端。`,
-            ja: `Tencent 公式の CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 のリクエスト形式でチャットを送信し、WorkBuddy デスクトップアプリの形式では送信しません。オフのときはアプリの形式で送信します。どちらも同じアカウントで、違いはサーバーがどのクライアントと見るかだけです。`,
-            de: `Sendet einen Chat im Format von Tencent's offizieller CodeBuddy CLI @tencent-ai/codebuddy-code 2.108.1 statt im Format der WorkBuddy-Desktop-App. Aus bleibt das Format der App. Beide nutzen dasselbe Konto; unterschiedlich ist nur, als welcher Client der Endpunkt die Anfrage liest.`,
+            zh: `把 DeepSeek Harness 的名字从发给 ${site.name} 的内容里去掉：开头那句，以及说明它源码目录和 Web GUI 的几行。路径、命令和工具保持不变。`,
+            "zh-TW": `把 DeepSeek Harness 的名字從送給 ${site.name} 的內容裡去掉：開頭那句，以及說明它原始碼目錄和 Web GUI 的幾行。路徑、指令和工具保持不變。`,
+            ja: `${site.name} に送る内容から DeepSeek Harness の名前を外します。冒頭の一文と、チェックアウトや Web GUI を示す行が対象です。パス、コマンド、ツールはそのままです。`,
+            de: `Entfernt den Namen von DeepSeek Harness aus dem, was an ${site.name} gesendet wird: die erste Zeile sowie die Zeilen zu seinem Checkout und seiner Web-GUI. Pfade, Befehle und Tools bleiben unverändert.`,
           },
-        }]),
+        },
       ],
       async loader(getAuth) {
         const auth = await getAuth()
@@ -3650,6 +4608,7 @@ function makePlugin(site) {
             let chat, changed, names
             ;({ body, chat, changed, names } = prepared(body, native))
             if (native) names = {}
+            if (dshOff() && hideDsh(chat)) changed = true
             // the switch is checked before anything is sent: a model not
             // free, or one whose price can't be read, never reaches
             // WorkBuddy. The model is read off the chat parsed above; a body
@@ -3698,17 +4657,32 @@ function makePlugin(site) {
               chatHeaders(site, headers)
             }
             let who = scopeOf(a)
-            // a 2.108.1 chat carries no conversation ids at all, so attendChat
-            // is skipped — and `ids` stays empty so the resend path's reattend
-            // adds none either
             let ids = fmt === FORMAT_2108 ? { set: [], turn: "", conv: "" } : attendChat(headers, chat, session, who)
+            // the growth event WorkBuddy AI's client sends with a chat (#691),
+            // for the conversation id the chat goes with
+            let grownFor = ""
+            // a chat nothing else changes has the vars set into its own
+            // bytes (withVars), so it isn't written out again whole for
+            // them (plugins#461); one that named extra_vars is written out
+            const hadVars = !!chat && typeof chat === "object" && Object.hasOwn(chat, "extra_vars")
+            if (completion && withGrowth(site, chat, headers.get("X-Conversation-ID") ?? "")) {
+              if (hadVars) changed = true
+              grownFor = headers.get("X-Conversation-ID")
+            }
+            // what the step's activity reports (#691) need of the chat,
+            // read now: the chat is let go before it is sent
+            const step = completion && site.ai && Array.isArray(chat?.messages) ? stepOf(chat) : null
             const post = (b) => {
+              // sent as another account (reattend), the chat's conversation
+              // id is that account's, and so is its growth event's
+              const conv = headers.get("X-Conversation-ID") ?? ""
+              if (grownFor && conv && conv !== grownFor) b = regrown(site, b, grownFor, conv) ?? b
               // a chat goes gzipped, as WorkBuddy's client sends it
               // (gzipped); its size on the wire is what unanswered weighs
               const z = gzipOn(fmt, completion, b, gzipped)
               if (z) headers.set("Content-Encoding", "gzip")
               else headers.delete("Content-Encoding")
-              return fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: z ?? b }).catch((e) => unanswered(site, a, z ?? b, e, init?.signal))
+              return fetch(moved(site, a, String(req ? req.url : input)), { ...init, method: init?.method ?? req?.method, headers, body: z ?? b }).catch((e) => unanswered(site, a, z ?? b, e, init?.signal))
             }
             // a 401 is answered once, on whichever try meets it: by a
             // sign-in with another access token (reissued), the request
@@ -3776,6 +4750,7 @@ function makePlugin(site) {
             const shaped = (b) => (!native && endsAfterTools.has(model) ? replyAfterTools(b) ?? b : b)
             if (!native && endsAfterTools.has(model) && replyAfterToolsOn(chat)) changed = true
             if (changed) body = JSON.stringify(chat)
+            else if (grownFor) body = withVars(body, chat.extra_vars)
             chat = null
             let res = await send(body)
             // a signature WorkBuddy's own signing didn't make — a session
@@ -3832,9 +4807,17 @@ function makePlugin(site) {
               }
             }
             if (ours.has(res)) return res
-            // renewed here: a mark the account had comes off
+            // a client that asked for one whole reply: 2.108.1 receives the
+            // vendor's stream and is answered with one chat.completion, as the
+            // CLI does. Only the success path: an error keeps its own shape.
             if (res.status < 400 && forcedStream) res = await whole(res, model)
-            return res.status >= 400 ? explained(res) : kept(native ? res : unsaid(await renamed(res, names)), renewed ? "renewed" : "kept")
+            // renewed here: a mark the account had comes off
+            if (res.status >= 400) return explained(res)
+            const told = native ? res : unsaid(await renamed(res, names))
+            // the ids are the ones the chat went with, after any renewal
+            const conv = headers.get("X-Conversation-ID") ?? ""
+            const t = step && conv ? { ...step, conv, turn: headers.get("X-Conversation-Request-ID") ?? "", message: headers.get("X-Conversation-Message-ID") ?? "" } : null
+            return kept(t ? reporting(site, a, t, told) : told, renewed ? "renewed" : "kept")
           },
         }
       },
@@ -3899,30 +4882,56 @@ function makePlugin(site) {
               const packages = await packagesOf(site, a)
               Object.assign(credits, cycleOf(sum, packages) ?? {})
               const ofPlan = planCodes(sum, site)
-              const stops = extra && !extra.aside ? extra : credits
-              Object.assign(stops, runsOutOf(sum, packages) ?? {})
-              const aside = extra ? (stops === credits ? extra : credits) : null
-              if (aside) Object.assign(aside, runsOutOf(sum, packages, Date.now(), (code) => ofPlan(code) === (aside === credits)) ?? {})
+              if (extra) {
+                // split by the summary (usageOf): each says its own
+                // packages' soonest lapse, the whole the soonest of both
+                Object.assign(credits, runsOutOf(sum, packages, Date.now(), ofPlan) ?? {})
+                Object.assign(extra, runsOutOf(sum, packages, Date.now(), (code) => !ofPlan(code), site) ?? {})
+                out.windows.splice(out.windows.findIndex((w) => w.name === "Total credits"), 1, totalOf(credits, extra))
+              } else {
+                // the summary of the plan's credits alone: the extra ones
+                // only the detail lists have (listedExtra) are their window,
+                // and the whole stops the account, as with the summary's
+                // split (ferock on Discord: WorkBuddy goes on serving an
+                // account at "500 / 500" on its extra credits)
+                const kinds = kindsOf(sum, site)
+                const more = kinds.plan.total > 0 && kinds.extra.total === 0 ? listedExtra(sum, packages, site) : null
+                // with no window of their own, their lapse is the one window's
+                Object.assign(credits, runsOutOf(sum, packages, Date.now(), () => true, more ? null : site) ?? {})
+                if (more) {
+                  const { runsOutAt, runsOut, ...counts } = more
+                  const w = { ...creditWindow("Extra credits", counts), ...(runsOutAt ? { runsOutAt, runsOut } : {}) }
+                  out.windows.splice(out.windows.indexOf(credits) + 1, 0, w, totalOf(credits, w))
+                }
+              }
             } catch {}
           }
           await spareFree(site, a, out.windows)
-          // the free model's own window, which the credit meter above does
-          // not show: what actually refuses a chat long before 160 credits
-          // are spent. Both builds: WorkBuddy AI at 1e8 (ten days of
-          // refusals), the China build's at about 2e8 (2026-11-02). Set
-          // aside until the vendor refuses (see the window definitions above)
+          // each measured model's own window, which the credit meter above
+          // does not show: what actually refuses a chat long before the
+          // credits are spent. WorkBuddy AI has one (deepseek, 1e8, ten days
+          // of refusals); the China build's are measured one model at a time
+          // (deepseek at about 2e8, 2026-11-02), each its own card. Shown
+          // only, set aside: the vendor's refusal is what stops a model
+          // (see the window definitions above)
           {
             const account = a.accountId || a.user || a.uid || ""
-            const win = site.ai ? FREE_WINDOW_AI : FREE_WINDOW_CN
-            const rows = freeWindowRows(account, Date.now(), process.cwd(), process.env, homedir(), win)
-            const w = rows && freeWindowOf(rows, account, Date.now(), win)
-            if (w) out.windows.push(w)
+            const wins = site.ai ? [FREE_WINDOW_AI] : CN_ESTIMATED_WINDOWS
+            for (const win of wins) {
+              const rows = await freeWindowRows(account, Date.now(), process.cwd(), process.env, homedir(), win)
+              const w = rows && freeWindowOf(rows, account, Date.now(), win)
+              if (w) out.windows.push(w)
+            }
           }
           return { ...out, signIn: said }
         } catch (e) {
           return { error: e?.message ?? String(e), signIn: "kept" }
         }
       },
+      // magpie's "Import accounts from a file…" (OpenCode ignores these)
+      importFrom: importFrom(site).en,
+      importFroms: importFrom(site).froms,
+      import: (texts) => importSignIns(site, Array.isArray(texts) ? texts : [texts]),
       methods: [
         {
           type: "oauth",
@@ -4060,4 +5069,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { planCodes, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, SMALL_BUDGET, defaultEffortOf, gzipped, FREE_ONLY, FORMAT_SWITCH, FORMAT_SWITCHES, FORMAT_2108, FORMAT_MAGPIE, formatOf, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, pinning, rowTime, rowAccount, ofAccount, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_CN, FREE_WINDOW_AI, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { FORMAT_KEY, FORMAT_MAGPIE, FORMAT_2108, FORMATS, headersOn, bodyOn, streamed, whole, gzipOn, FORMAT_SWITCH, FORMAT_SWITCHES, formatOf, replyFacts, reportEvents, stepOf, reporting, machineOf, endpointOf, moved, at, signInsIn, importSignIns, importFrom, otherSite, withGrowth, inputLengthOf, HIDE_DSH, hideDsh, dshHidden, planCodes, listedExtra, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, SMALL_BUDGET, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, freeWindowRouting, routingRefusalRows, readRoutingRefusals, readLedgerTail, pinned, pinning, rowTime, rowAccount, ofAccount, windowOffset, windowReset, CN_ESTIMATED_WINDOWS, FREE_WINDOW_AI, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM, routingReads, routingParsed, restIdentity, routingLines, ROUTING_LINE_MAX }

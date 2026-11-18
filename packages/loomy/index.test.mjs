@@ -96,6 +96,10 @@ describe("sign-in methods", () => {
     expect(result.access).toBe("sess-1")
     expect(result.expires).toBeGreaterThan(Date.now() + 13 * 86400e3)
     expect(result.accountId).toBe("138****8000")
+    // the vendor's user id beside the masked phone, so two phones masked
+    // alike stay two accounts in magpie's host; and when it was signed in
+    expect(result.uid).toBe("261014155255771375")
+    expect(Math.abs(result.signedInAt - Date.now())).toBeLessThan(60e3)
   })
 
   test("SMS: an invalid phone is refused before anything is sent", async () => {
@@ -114,6 +118,108 @@ describe("sign-in methods", () => {
     expect(result.type).toBe("success")
     expect(result.access).toBe("pasted")
     expect(await method.authorize({ session: "" })).toMatchObject({ type: "failed" })
+  })
+
+  // magpie's host keeps one account per accountId: one name for every paste
+  // put a second pasted account over the first
+  test("two pasted sessions are two accounts", async () => {
+    const method = plugin.auth.methods.find((m) => m.label.includes("Paste"))
+    const one = await (await method.authorize({ session: "session-aaaaaa111111" })).callback()
+    const two = await (await method.authorize({ session: "session-bbbbbb222222" })).callback()
+    expect(one.accountId).not.toBe(two.accountId)
+    expect(one.accountId).toContain("111111")
+    expect(one.accountId).not.toContain("session-aaaaaa")
+  })
+})
+
+// The real gateway refuses a session with HTTP 200 and code 100002 on every
+// path, never with a 401 or 403 (measured 2026-11-16 and 2026-11-17). A 401
+// or 403 without that code came from a proxy or firewall on the way, and
+// read as "signed out" it marked a good account for sign-in again
+// (jenxingyoung on X: four accounts on a proxy, a different one dropped
+// each day).
+describe("a 401 or 403 from something on the way", () => {
+  const waf = (status) => ({ status, type: "text/html", body: "<html><body>403 Forbidden - Access denied</body></html>" })
+
+  test("a chat or a draw fails this try and leaves the sign-in as it is", async () => {
+    for (const status of [401, 403]) {
+      fake.state.denied = waf(status)
+      const loader = await plugin.auth.loader(getAuth)
+      for (const [path, body] of [
+        ["/api/v1/chat/completions", JSON.stringify({ model: "spark-x", stream: true, messages: [{ role: "user", content: "hi" }] })],
+        ["/api/v1/images/generations", JSON.stringify({ model: "doubao-seedream-5-lite", prompt: "a cat" })],
+      ]) {
+        const res = await loader.fetch(`${fake.gatewayUrl}${path}`, { method: "POST", body })
+        expect(res.status).toBe(502)
+        expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
+        const msg = (await res.json()).error.message
+        expect(msg).toContain(`HTTP ${status}`)
+        expect(msg).toContain("不是登录失效")
+        expect(msg).toContain("Access denied")
+      }
+    }
+  })
+
+  test("one that carries the sign-in code still says the sign-in expired", async () => {
+    fake.state.denied = { status: 401, type: "application/json", body: JSON.stringify({ code: "100002", desc: "登录已失效，请重新登录" }) }
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "spark-x", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(401)
+    expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.signIn).toBe("expired")
+    expect(usage.error).toContain("登录已失效")
+  })
+
+  test("a usage read is an error that keeps the sign-in", async () => {
+    for (const status of [401, 403]) {
+      fake.state.denied = waf(status)
+      const usage = await plugin.auth.usage(getAuth)
+      expect(usage.signIn).toBe("kept")
+      expect(usage.error).toContain(`HTTP ${status}`)
+      expect(usage.error).toContain("不是登录失效")
+    }
+  })
+
+  test("a check-in fails, it doesn't say the sign-in expired", async () => {
+    fake.state.denied = waf(403)
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("failed")
+    expect(result.message).toContain("HTTP 403")
+  })
+})
+
+describe("a lapsed account says when it was signed in", () => {
+  // 2026-11-03 10:00 Beijing
+  const at = Date.UTC(2026, 10, 3, 2, 0, 0)
+
+  test("from the time an SMS sign-in kept", async () => {
+    saved = { type: "oauth", access: "dropped", expires: at + 14 * 86400e3, signedInAt: at, accountId: "138****8000" }
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.signIn).toBe("expired")
+    expect(usage.error).toContain("11 月 3 日")
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "spark-x", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(401)
+    expect((await res.json()).error.message).toContain("11 月 3 日")
+  })
+
+  test("from the 14-day end of an account signed in before 0.1.12", async () => {
+    saved = { type: "oauth", access: "dropped", expires: at + 14 * 86400e3, accountId: "138****8000" }
+    expect((await plugin.auth.usage(getAuth)).error).toContain("11 月 3 日")
+  })
+
+  test("a pasted session, whose day isn't known, names none", async () => {
+    saved = { type: "oauth", access: "dropped", expires: 0, accountId: "手动粘贴 ···ropped" }
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.signIn).toBe("expired")
+    expect(usage.error).not.toContain("月")
   })
 })
 
@@ -238,6 +344,48 @@ describe("chat", () => {
     expect(res.status).toBe(401)
   })
 
+  // the real gateway refuses a dropped session with HTTP 200 and code
+  // 100002, a stream asked for too; passed through as a 200 it was a
+  // success to magpie, which took the account's signed-out mark off until
+  // the next usage read put it back (jenxingyoung on X, "轮着掉登录")
+  test("a dropped session's 200 with code 100002 is a 401 that says the sign-in expired", async () => {
+    for (const stream of [true, false]) {
+      saved = { type: "oauth", access: "dropped", expires: 0 }
+      const loader = await plugin.auth.loader(getAuth)
+      const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({ model: "spark-x", stream, messages: [{ role: "user", content: "hi" }] }),
+      })
+      expect(res.status).toBe(401)
+      expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
+      expect((await res.json()).error.message).toContain("登录已失效")
+    }
+  })
+
+  test("another business code in a 200 is a 502 with the vendor's words, the sign-in left alone", async () => {
+    fake.state.chatCode = { code: "100005", desc: "积分不足" }
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "spark-x", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(502)
+    expect(res.headers.get("x-magpie-sign-in")).toBeNull()
+    const msg = (await res.json()).error.message
+    expect(msg).toContain("积分不足")
+    expect(msg).toContain("100005")
+  })
+
+  test("a completion that isn't streamed comes back whole", async () => {
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "spark-x", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ id: "c1", model: "spark-x", choices: [{ index: 0, message: { role: "assistant", content: "你好" }, finish_reason: "stop" }] })
+  })
+
   test("only chat completions and image generations are served", async () => {
     const loader = await plugin.auth.loader(getAuth)
     for (const path of ["/api/v1/embeddings", "/api/v1/images/edits"]) {
@@ -276,14 +424,24 @@ describe("images (#609)", () => {
     expect(fake.state.imageCalls[0].body.model).toBe("doubao-seedream-5-lite")
   })
 
-  test("a refused session says 401, as chat does", async () => {
+  test("a bare 401 or 403 is no sign-in verdict: the vendor's is code 100002", async () => {
     for (const status of [401, 403]) {
       fake.state.imageStatus = status
       const loader = await plugin.auth.loader(getAuth)
       const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/images/generations`, { method: "POST", body: drawBody })
-      expect(res.status).toBe(401)
-      expect((await res.json()).error.message).toContain("登录态已失效")
+      expect(res.status).toBe(502)
+      expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
+      expect((await res.json()).error.message).toContain(`refused ${status}`)
     }
+  })
+
+  test("a dropped session's 200 with code 100002 is a 401 that says the sign-in expired", async () => {
+    saved = { type: "oauth", access: "dropped", expires: 0 }
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.gatewayUrl}/api/v1/images/generations`, { method: "POST", body: drawBody })
+    expect(res.status).toBe(401)
+    expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
+    expect(fake.state.imageCalls).toHaveLength(0)
   })
 
   test("another upstream error keeps its status and says what came back", async () => {
@@ -361,6 +519,24 @@ describe("models", () => {
     expect(list["glm-5.3-flash"].modalities).toEqual({ input: ["text", "image"], output: ["text"] })
     expect(list["plain"].rate).toBeUndefined()
     expect(list["plain"].name).toBe("No Suffix At All")
+    expect(list[Symbol.for("magpie.fellBack")]).toBeUndefined()
+    // the catalog's own field names, and both spellings of the output cap:
+    // spark-x carries context_length/max_output_tokens, deepseek carries the
+    // resolved limit{} shape. Reading only `max_tokens` left output unset for
+    // every live model, because the catalogue never spells it that way.
+    expect(list["spark-x"].limit).toEqual({ context: 128000, output: 8192 })
+    expect(list["plain"].limit).toBeUndefined()
+  })
+
+  // Archivemylife on X (agy-cli's sibling): a list that isn't the account's
+  // own, handed back as if it were, dropped the models the user picked
+  test("a refusal in a 200 gives the static table marked as not the account's", async () => {
+    fake.state.modelsCode = "100500"
+    const p = { models: { ..._internal.STATIC_MODELS } }
+    const list = await plugin.provider.models(p, { auth: saved })
+    expect(Object.keys(list)).toEqual(Object.keys(_internal.STATIC_MODELS))
+    expect(list[Symbol.for("magpie.fellBack")]).toBe(true)
+  })
 
   // plugins#1141: the host reads a listed model by OpenCode's shape
   // (capabilities.input.image, capabilities.reasoning, capabilities.toolcall),
@@ -368,7 +544,8 @@ describe("models", () => {
   test("the vendor's capabilities, in the shape the host reads", async () => {
     // glm-5.3-flash is the entry the vendor's catalogue says nothing of
     // outside its capabilities: what magpie handed in is what it keeps.
-    const p = { models: { "glm-5.3-flash": { id: "glm-5.3-flash", name: "GLM", limit: { context: 1000000, output: 64000 }, capabilities: { temperature: true, reasoning: false, attachment: false, toolcall: true, input: { text: true, image: false }, output: { text: true } }, api: { id: "glm-5.3-flash", npm: "@ai-sdk/openai-compatible" } } } }
+    const was = (id, npmId) => ({ id, name: id === "glm-5.3-flash" ? "GLM" : "DS", limit: { context: 1000000, output: 64000 }, capabilities: { temperature: true, reasoning: false, attachment: false, toolcall: true, input: { text: true, image: false }, output: { text: true } }, api: { id: npmId, npm: "@ai-sdk/openai-compatible" } })
+    const p = { models: { "glm-5.3-flash": was("glm-5.3-flash", "glm-5.3-flash"), "deepseek-v4-flash": was("deepseek-v4-flash", "deepseek-v4-flash") } }
     const list = await plugin.provider.models(p, { auth: saved })
     expect(list["glm-5.3-flash"].capabilities.input.image).toBe(true)
     expect(list["glm-5.3-flash"].capabilities.attachment).toBe(true)
@@ -382,14 +559,8 @@ describe("models", () => {
     // and what the vendor does say is its own word: the catalogue's
     // 64000/16384 for deepseek-v4-flash, not what magpie handed in
     expect(list["deepseek-v4-flash"].limit).toEqual({ context: 64000, output: 16384 })
-  })
-    // the catalog's own field names, and both spellings of the output cap:
-    // spark-x carries context_length/max_output_tokens, deepseek carries the
-    // resolved limit{} shape. Reading only `max_tokens` left output unset for
-    // every live model, because the catalogue never spells it that way.
-    expect(list["spark-x"].limit).toEqual({ context: 128000, output: 8192 })
-    expect(list["deepseek-v4-flash"].limit).toEqual({ context: 64000, output: 16384 })
-    expect(list["plain"].limit).toBeUndefined()
+    expect(list["deepseek-v4-flash"].api.npm).toBe("@ai-sdk/openai-compatible")
+    expect(list["deepseek-v4-flash"].rate).toBe("x3.0")
   })
 })
 
@@ -436,19 +607,25 @@ describe("usage", () => {
       // the daily wallet at 100% is shown, set aside
       expect(ws.find((w) => w.name === "每日赠送积分")).toMatchObject({ used: 100, aside: true })
       expect(ws.find((w) => w.name === "永久积分")).toMatchObject({ display: "1200 credits", aside: true })
-      // nothing of the daily wallet left: nothing lapses at midnight
-      expect(total.runsOutAt).toBeUndefined()
-      expect(total.resetsAt).toBe(_internal.nextBeijingMidnight())
+      // nothing of the daily wallet left: nothing lapses at midnight, so the
+      // total names no reset and smart routing puts accounts whose reset
+      // loses credits ahead of it (plugins#1153); the daily wallet beside it
+      // still shows midnight
+      expect(total.resetsAt).toBeUndefined()
+      expect(total.span).toBeUndefined()
+      expect(ws.find((w) => w.name === "每日赠送积分").resetsAt).toBe(_internal.beijingMidnight())
 
       // both gone: used up, back at Beijing midnight
       ws = await read({ balance: 0, dailyBalance: 0, dailyLimitPoints: 5000, dailyRemainingPoints: 0 })
       expect(counted(ws)[0]).toMatchObject({ used: 100, amount: 5000, limit: 5000 })
+      expect(counted(ws)[0].resetsAt).toBe(_internal.beijingMidnight())
 
       // 3,000 daily credits left are lost at midnight: runsOutAt / runsOut
       ws = await read({ balance: 1200, dailyBalance: 3000, dailyLimitPoints: 5000, dailyRemainingPoints: 3000 })
       total = counted(ws)[0]
       expect(total).toMatchObject({ amount: 2000, limit: 6200, runsOut: 3000, span: 86400 })
       expect(total.runsOutAt).toBe(_internal.nextBeijingMidnight())
+      expect(total.runsOutAt).toBe(_internal.beijingMidnight())
 
       // without the limit pair the daily wallet is what is left: the total
       // is a balance, used up only when both are 0

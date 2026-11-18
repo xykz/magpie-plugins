@@ -28,7 +28,7 @@
 //
 // OpenCode speaks chat completions to it (@ai-sdk/openai-compatible); the
 // fetch here answers them.
-import { NATIVE_LIMITS, nativeSessions, NativeSessionError, nativeFields, nativeMcpArgs, pendingCalls, Quiet, setWireTrace, StepCalls } from "./native-session.mjs"
+import { NATIVE_LIMITS, nativeSessions, NativeSessionError, nativeFields, nativeMcpArgs, pendingCalls, Quiet, setWebSearch, setWireTrace, StepCalls, webSearchAnswer, webSearchDir, webSearchQuery } from "./native-session.mjs"
 import { isDeepStrictEqual } from "node:util"
 import http2 from "node:http2"
 import { STATUS_CODES } from "node:http"
@@ -36,7 +36,7 @@ import { gunzipSync } from "node:zlib"
 import { Duplex } from "node:stream"
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { execFile } from "node:child_process"
-import { readFile, stat, readdir, realpath } from "node:fs/promises"
+import { readFile, stat, readdir, realpath, writeFile, mkdir, rename } from "node:fs/promises"
 import { homedir, platform, tmpdir } from "node:os"
 import { basename, dirname, join } from "node:path"
 
@@ -647,6 +647,20 @@ const INCLUDED_ONLY = "included_only"
 // magpie's folder (plugins#550): see WireTrace for what one holds.
 const WIRE_TRACE = "wire_trace"
 
+// WEB_SEARCH is a test switch (off by default) for plugins#635: on, a Run
+// lets Cursor's own web search through and approves it when Cursor asks,
+// and a Run in which Cursor asked to search saves its frames as Wire trace
+// does, whether it succeeded or failed. Off, Cursor's web search is refused
+// like its other tools.
+const WEB_SEARCH = "web_search_test"
+
+// allowedTools is x-cursor-agent-allowed-tools: names of ToolCall's oneof
+// fields. Only the caller's tools (MCP), and Cursor's web search
+// (web_search_tool_call, 18) under the web-search test switch.
+function allowedTools(search) {
+  return "mcp_tool_call,get_mcp_tools_tool_call" + (search ? ",web_search_tool_call" : "")
+}
+
 // enterpriseUsage is the allowance GetCurrentPeriodUsage leaves out on an
 // Enterprise account. That call answers with only the billing cycle there;
 // the website's usage-summary has individualUsage.overall, in cents, and
@@ -1082,6 +1096,69 @@ function modelsOf(picker, ids, listed = []) {
   return out
 }
 
+// slugFor is the id of a variant the full catalog (AvailableModels with
+// scope 3) gives no legacySlug: the one of the model's legacySlugs that says
+// the variant's effort (any, when it has none), thinking and fast; an id
+// with no effort in it (gpt-5.3-codex) stands for the default's effort. With
+// none, or more than one, "": a guess could send an id Cursor refuses.
+function slugFor(m, v) {
+  if (v.legacySlug) return v.legacySlug
+  const have = valuesOf(v)
+  const level = (p) => String(p[EFFORT_PARAMS.find((k) => p[k])] ?? "").replace("extra-high", "xhigh")
+  const effort = level(have)
+  const slugs = (Array.isArray(m.legacySlugs) ? m.legacySlugs : []).filter((id) => typeof id === "string" && id).map((id) => ({ id, ...familyOf(id) }))
+  const says = (s, at) =>
+    (at === null || s.effort === at) &&
+    (have.thinking === undefined || s.family.endsWith("-thinking") === (have.thinking === "true")) &&
+    (have.fast === undefined || s.fast === (have.fast === "true"))
+  let hits = slugs.filter((s) => says(s, effort || null))
+  const def = m.variants.find((x) => x?.isDefaultNonMaxConfig)
+  if (!hits.length && effort && level(valuesOf(def)) === effort) hits = slugs.filter((s) => says(s, ""))
+  return hits.length === 1 ? hits[0].id : ""
+}
+
+// withSlugs is a catalog model with each variant's own id filled in, and
+// only the parameters the model defines: the full catalog is the admin
+// settings one, and carries what the picker's variants don't (cyber=false
+// on Opus 4.7 to 5.5, which cursor-agent never sends). A variant slugFor
+// can't name keeps no id of its own, but never goes without one: served()
+// leaves a variant with no legacySlug in, and one the account can't run
+// would be listed. So it gets a mark no usable id has, and modelsOf lists
+// it as it does a variant the account hasn't got. The variants are never
+// null.
+const NO_ID = "\u0000no-id"
+function withSlugs(m) {
+  const defined = new Set((Array.isArray(m.parameterDefinitions) ? m.parameterDefinitions : []).map((d) => d?.id))
+  const vs = (Array.isArray(m.variants) ? m.variants : [])
+    .filter((v) => v && typeof v === "object" && Array.isArray(v.parameterValues ?? []))
+    .map((v) => ({ ...v, parameterValues: (v.parameterValues ?? []).filter((p) => defined.has(p?.id)) }))
+  const full = { ...m, variants: vs }
+  return { ...full, variants: vs.map((v) => (v.legacySlug ? v : { ...v, legacySlug: slugFor(full, v) || NO_ID })) }
+}
+
+// fromCatalog is the live models of Cursor's full catalog (AvailableModels
+// with scope 3, which also lists the models Cursor hides from some accounts:
+// Claude, from a Pro one) that the picker lacks, as picker models, with only
+// the variants the account can run (withSlugs). modelsOf lists them as it
+// does the picker's: once for each context size, thinking a parameter, the
+// efforts the account is served. Only Anthropic's are taken: the models the
+// picker lists, and every other id of the usable list, stay as they are.
+// Not offered: one the picker has or lists under another name, a hidden one
+// (isHidden: no longer offered), Auto, one the picker leaves out (chat-only,
+// Tab-only, no agent), and one with no variant the account has an id for.
+function fromCatalog(picker, catalog, ids) {
+  const have = new Set(picker.map((m) => m?.name))
+  const out = []
+  for (const m of Array.isArray(catalog) ? catalog : []) {
+    if (!m?.name || have.has(m.name) || m.isHidden || m.name === "default") continue
+    if (m.vendor?.id !== "MODEL_VENDOR_ID_ANTHROPIC") continue
+    if (m.isChatOnly || m.onlySupportsCmdK || m.supportsAgent === false || PICKER_SKIP.has(m.name)) continue
+    const full = withSlugs(m)
+    if (full.variants.some((v) => ids.has(v.legacySlug))) out.push(full)
+  }
+  return out
+}
+
 // fastAt is whether Cursor has a fast variant the account is served at
 // the context size (any, for a model without sizes): what magpie offers
 // fast for, which 0.1.x said with a -fast model of its own.
@@ -1215,15 +1292,23 @@ function listing(tok, h) {
   let p = listings.get(h)
   if (p) return p
   p = (async () => {
-    const [j, listed] = await Promise.all([
+    const [j, listed, catalog] = await Promise.all([
       unary(API, "aiserver.v1.AiService/AvailableModels", tok, { useModelParameters: true, doNotUseMarkdown: true }, 30_000),
       unary(API, "agent.v1.AgentService/GetUsableModels", tok, {}, 8_000).then(
         (u) => (Array.isArray(u?.models) ? u.models : []),
         () => [],
       ),
+      // the full catalog, scope 3: the live models the picker lacks (Claude,
+      // on an account Cursor blocks it for); without it the list is the
+      // picker's and the usable list's, as before
+      unary(API, "aiserver.v1.AiService/AvailableModels", tok, { useModelParameters: true, doNotUseMarkdown: true, scope: 3 }, 8_000).then(
+        (c) => (Array.isArray(c?.models) ? c.models : []),
+        () => [],
+      ),
     ])
     const ids = new Set(listed.flatMap((m) => [m?.modelId, m?.displayModelId]).filter(Boolean))
-    const raw = modelsOf(Array.isArray(j?.models) ? j.models : [], ids.size ? ids : null, listed)
+    const picker = Array.isArray(j?.models) ? j.models : []
+    const raw = modelsOf(ids.size ? [...picker, ...fromCatalog(picker, catalog, ids)] : picker, ids.size ? ids : null, listed)
     if (!raw.length) throw new Error("Cursor listed no models")
     lists.set(h, { at: Date.now(), raw })
     listFailed.delete(h)
@@ -1330,7 +1415,16 @@ function named(raw, id) {
       return { entry: near, seed: undefined, effort: "", fast: false }
     }
     const old = named(raw, sized[1])
-    if (old) return { ...old, max: !old.entry.size && want > old.entry.context }
+    if (old) {
+      // the name's model at the nearest size it has (claude-opus-4-8-thinking@1m,
+      // an id an earlier list had, is Opus 4.8 at 1m with thinking)
+      const sizes = raw.filter((e) => e.size && e.model === old.entry.model)
+      if (old.entry.size && sizes.length) {
+        const near = sizes.reduce((a, b) => (Math.abs(tokensOf(b.size) - want) < Math.abs(tokensOf(a.size) - want) ? b : a))
+        return { ...old, entry: near }
+      }
+      return { ...old, max: !old.entry.size && want > old.entry.context }
+    }
   }
   return null
 }
@@ -1592,6 +1686,9 @@ function statusOf(status, code, msg) {
   const low = msg.toLowerCase()
   // magpie names the provider before the message itself
   const out = (status, message) => ({ status, message })
+  // Cursor labels this prompt refusal unauthenticated too. Asking the user
+  // to sign in again would misdiagnose a request error as an account fault.
+  if (low.includes("the provider refused to serve this request based on the content")) return out(400, msg)
   if (regional(msg)) return out(403, msg + " — Cursor serves your team only in some regions and turned this request away; signing in again won't change that")
   if (code === "permission_denied") return out(403, msg)
   if (code === "unauthenticated" || status === 401 || low.includes("expired"))
@@ -1852,15 +1949,17 @@ function conversationID(chat, session) {
   return uuidOf(sum)
 }
 
-// usageOf is a TurnEndedUpdate as magpie counts usage, as the built-in's
-// cursorUsage has it (magpie #498). Its input_tokens is the whole prompt,
-// what was read from the cache and written to it included, as Cursor's
-// own client has it (it takes both out to get the prompt's uncached
-// rest); input is that rest, the cache added back for prompt_tokens. Its
-// reasoning_tokens is kept as reasoning.
-function usageOf(uf) {
-  const [inp, cr, cw] = [pbNum(uf, 1), pbNum(uf, 3), pbNum(uf, 4)]
-  return { input: Math.max(inp - cr - cw, 0), output: pbNum(uf, 2), cacheRead: cr, cacheWrite: cw, reasoning: pbNum(uf, 5) }
+// usageOf is a TurnEndedUpdate or ModelCallCompletedUpdate as magpie
+// counts usage, as the built-in's cursorUsage has it (magpie #498). Its
+// input_tokens is the whole prompt, what was read from the cache and
+// written to it included, as Cursor's own client has it (it takes both out
+// to get the prompt's uncached rest); input is that rest, the cache added
+// back for prompt_tokens. Its reasoning_tokens is kept as reasoning.
+// ModelCallCompletedUpdate carries model_call_id at field 1 and the five
+// token counts at 2..6 (one after TurnEndedUpdate's 1..5).
+function usageOf(uf, shift = 0) {
+  const [inp, cr, cw] = [pbNum(uf, 1 + shift), pbNum(uf, 3 + shift), pbNum(uf, 4 + shift)]
+  return { input: Math.max(inp - cr - cw, 0), output: pbNum(uf, 2 + shift), cacheRead: cr, cacheWrite: cw, reasoning: pbNum(uf, 5 + shift) }
 }
 
 // A step that calls the caller's tools has no TurnEndedUpdate: Cursor ends
@@ -1934,11 +2033,13 @@ function addUsage(a, b) {
 // event timestamps before its start: its authoritative final must never be
 // collected as an earlier Run. Keep that bound when a later stateless Run
 // adds unbounded debt. Ordinary stateless debt retains its original shape.
+// A debt owed with a tag is one Run's event, kept in a group of its own: the
+// tag says whether a step collected it (and what) or the Run withdrew it.
 const DEBT_GROUP_LIMIT = 64
-function owe(key, { since = Date.now(), n = 0, ready = Date.now(), carry = null, before }) {
+function owe(key, { since = Date.now(), n = 0, ready = Date.now(), carry = null, before, tag }) {
   for (const [k, d] of owed) {
     if (d.groups) {
-      d.groups = d.groups.filter((g) => Date.now() - g.since <= STEP_WAIT.owedFor)
+      d.groups = d.groups.filter((g) => Date.now() - g.since <= STEP_WAIT.owedFor && g.tag?.state !== "withdrawn")
       d.n = d.groups.reduce((sum, g) => sum + g.n, 0)
       if (Date.now() - d.since > STEP_WAIT.owedFor) d.carry = null
       if (!d.n && !d.carry) owed.delete(k)
@@ -1947,15 +2048,16 @@ function owe(key, { since = Date.now(), n = 0, ready = Date.now(), carry = null,
   }
   if (n <= 0 && !carry) return
   const d = owed.get(key)
+  if (!d && tag) return void owed.set(key, { since, n, ready, carry: carry && { ...carry }, groups: [{ since, n, ready, before, tag }] })
   if (!d) return void owed.set(key, { since, n, ready, carry: carry && { ...carry }, ...(before !== undefined ? { before } : {}) })
-  if (n > 0 && (d.groups || d.before !== undefined || before !== undefined)) {
+  if (n > 0 && (d.groups || d.before !== undefined || before !== undefined || tag)) {
     const groups = d.groups ?? (d.n > 0 ? [{ since: d.since, n: d.n, ready: d.ready, before: d.before }] : [])
-    const same = groups.find((g) => g.before === before)
+    const same = !tag && groups.find((g) => !g.tag && g.before === before)
     if (same) {
       same.since = Math.min(same.since, since)
       same.n += n
       same.ready = Math.min(same.ready, ready)
-    } else groups.push({ since, n, ready, before })
+    } else groups.push({ since, n, ready, before, ...(tag ? { tag } : {}) })
     // As with expired dashboard debt, overflow stays unknown, never estimated
     // or merged across bounds into an authoritative native Run's event.
     groups.sort((a, b) => a.since - b.since)
@@ -1969,6 +2071,19 @@ function owe(key, { since = Date.now(), n = 0, ready = Date.now(), carry = null,
   }
   d.ready = Math.min(d.ready, ready)
   d.carry = addUsage(d.carry, carry)
+}
+
+// withdraw takes back the debt owed with tag while no step has collected it:
+// its Run was resumed after all, and its own final counts its event.
+function withdraw(key, tag) {
+  if (tag.state !== "owed") return
+  tag.state = "withdrawn"
+  const d = owed.get(key)
+  if (!d?.groups) return
+  d.groups = d.groups.filter((g) => g.tag !== tag)
+  d.n = d.groups.reduce((sum, g) => sum + g.n, 0)
+  if (!d.n && !d.carry) owed.delete(key)
+  else if (d.groups.length) d.since = Math.min(...d.groups.map((g) => g.since))
 }
 
 // usageEvents are the dashboard's events of conversation conv from since
@@ -2014,12 +2129,17 @@ async function usageEvents(tok, conv, since, want, { poll = false, first = STEP_
         // found already excludes timestamps claimed by earlier fetches. Two
         // distinct events in this response may share a millisecond; count both.
         if (at >= before()) continue
-        const group = groups?.findIndex((g, i) => counts[i] < g.n && at >= g.since - 1000 && at < (g.before ?? Infinity))
+        const group = groups?.findIndex((g, i) => counts[i] < g.n && g.tag?.state !== "withdrawn" && at >= g.since - 1000 && at < (g.before ?? Infinity))
         if (groups && group === -1) continue
         if (groups) counts[group]++
         claimed.set(key + "\0" + ev.timestamp, Date.now())
         const t = ev.tokenUsage
         const u = { input: num(t.inputTokens), output: num(t.outputTokens), cacheRead: num(t.cacheReadTokens), cacheWrite: num(t.cacheWriteTokens), reasoning: 0 }
+        const tag = groups?.[group].tag
+        if (tag) {
+          tag.state = "collected"
+          tag.usage = addUsage(tag.usage, u)
+        }
         usage = addUsage(usage ?? ZERO(), u)
         events.push({ at: num(ev.timestamp), usage: u })
         got++
@@ -2048,8 +2168,15 @@ function collect(tok, conv, { poll = false, first, signal, over = () => false, a
   const d = owed.get(key)
   if (!d) return Promise.resolve({ usage: null, carry: null, events: [], short: false })
   owed.delete(key)
+  // A handed-over Run's event still grows by the step that Run just ended
+  // (Cursor adds each step to a Run's one event as the step ends). It is
+  // looked for only from its own ready on, whatever else is owed with it
+  // sooner: until then it stays owed.
+  const now = Date.now()
+  const held = d.groups?.filter((g) => g.tag?.state === "owed" && g.ready > now) ?? []
+  for (const g of held) owe(key, { since: g.since, n: g.n, ready: g.ready, before: g.before, tag: g.tag })
   const p = (async () => {
-    const groups = (d.groups ?? [d]).filter((g) => (g.before === undefined && !d.groups) || Date.now() - g.since <= STEP_WAIT.owedFor)
+    const groups = (d.groups ?? [d]).filter((g) => !held.includes(g) && g.tag?.state !== "withdrawn" && ((g.before === undefined && !d.groups) || Date.now() - g.since <= STEP_WAIT.owedFor))
     const want = groups.reduce((sum, g) => sum + g.n, 0)
     let r = { usage: null, events: [], got: 0 }
     if (want > 0 && canRead(tok)) r = await usageEvents(tok, conv, Math.min(...groups.map((g) => g.since)), want, {
@@ -2058,9 +2185,10 @@ function collect(tok, conv, { poll = false, first, signal, over = () => false, a
     let short = false
     for (const [i, g] of groups.entries()) {
       const remaining = g.n - (d.groups ? r.counts?.[i] ?? 0 : r.got)
-      if (remaining > 0 && canRead(tok)) {
+      // a tag withdrawn while this was asked is its Run's own again
+      if (remaining > 0 && canRead(tok) && g.tag?.state !== "withdrawn") {
         short = true
-        owe(key, { since: g.since, n: remaining, ready: g.ready, before: g.before })
+        owe(key, { since: g.since, n: remaining, ready: g.ready, before: g.before, tag: g.tag })
       }
     }
     const carry = d.carry && { ...d.carry }
@@ -2120,10 +2248,21 @@ function ledger(tok, conv, since, signal, kept, { before } = {}) {
       }
       return r
     })
+  // heldUntil is when the latest handed-over event still held back
+  // (collect) becomes ready; 0 when none is
+  const heldUntil = () => {
+    const now = Date.now()
+    return Math.max(0, ...(owed.get(debtKey)?.groups ?? []).filter((g) => g.tag?.state === "owed" && g.ready > now).map((g) => g.ready))
+  }
   let collecting = null
   const debt = kept ? owed.get(debtKey) : undefined
   const timer = debt ? setTimeout(() => (collecting = gather()), Math.max(0, debt.ready - Date.now())) : null
   timer?.unref?.()
+  const sleep = (ms) => new Promise((r) => {
+    if (signal?.aborted) return r()
+    const t = setTimeout(r, ms)
+    signal?.addEventListener("abort", () => (clearTimeout(t), r()), { once: true })
+  })
   const takeMine = () => {
     const u = mine
     mine = null
@@ -2159,9 +2298,26 @@ function ledger(tok, conv, since, signal, kept, { before } = {}) {
       if (final) {
         await collecting
         await Promise.all([...(flights.get(debtKey) ?? [])])
+        // a handed-over event held back is waited for, up to its ready
+        const until = heldUntil()
+        if (until) await sleep(until - Date.now())
+        await Promise.all([...(flights.get(debtKey) ?? [])])
         if (owed.has(debtKey)) await gather({ poll: owed.get(debtKey).n > 0, first: 0, signal })
       }
       return take()
+    },
+    // handover: a later Run of the conversation began while this one waits
+    // on the caller's results. That Run collects from here on: what this one
+    // collected and has not given out goes to it, as does what an ask still
+    // going brings. A step that ends this Run after all still collects.
+    handover() {
+      clearTimeout(timer)
+      const give = () => {
+        const u = take()
+        if (u) owe(debtKey, { carry: u })
+      }
+      give()
+      collecting?.then(give, () => {})
     },
     done() {
       over = true
@@ -2217,6 +2373,7 @@ function buildRun(msgs, lastUser, tools, model, conv = "", { maxMode = false, pa
     .str(5, conv || randomUUID())
     .bytes(9, requested)
     .varint(19, 1) // inline images
+    .varint(37, 1) // emit_model_call_usage: ModelCallCompletedUpdate (31) per step
   return { first: pb().bytes(1, rr).done(), blobs }
 }
 
@@ -2608,11 +2765,128 @@ function nativeTransport(req, close, fail, limits = NATIVE_LIMITS) {
   }
 }
 
+// ---- the account's calls, for magpie's Usage page ---------------------------
+
+// mine are the conversation_ids this plugin's own Runs used, with when each
+// was last used: their usage events are calls magpie's gateway counted
+// already, so calls leaves them out. They are kept OWN_KEEP, in a file of
+// the plugin's own, so a restart still knows them.
+const OWN_KEEP = 40 * 86_400_000
+const mine = { ids: new Map(), read: null, timer: null, file: () => join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode-cursor-auth", "conversations.json") }
+function readMine() {
+  mine.read ??= readFile(mine.file(), "utf8")
+    .then((t) => {
+      const kept = JSON.parse(t)
+      for (const [id, at] of Object.entries(kept && typeof kept === "object" ? kept : {}))
+        if (typeof at === "number" && !mine.ids.has(id)) mine.ids.set(id, at)
+    })
+    .catch(() => {})
+  return mine.read
+}
+function saveMine() {
+  if (mine.timer) return
+  mine.timer = setTimeout(async () => {
+    mine.timer = null
+    await readMine()
+    const now = Date.now()
+    for (const [id, at] of mine.ids) if (now - at > OWN_KEEP) mine.ids.delete(id)
+    const file = mine.file()
+    try {
+      await mkdir(dirname(file), { recursive: true })
+      const tmp = file + "." + process.pid + ".tmp"
+      await writeFile(tmp, JSON.stringify(Object.fromEntries(mine.ids)))
+      await rename(tmp, file)
+    } catch {}
+  }, 1000)
+  mine.timer.unref?.()
+}
+function ownConversation(cid) {
+  mine.ids.set(cid, Date.now())
+  saveMine()
+}
+
+// mes are each token's account id (GetMe's userId), asked once an hour: a
+// team's events can be other members', which calls leaves out
+const mes = new Map()
+async function meOf(tok) {
+  const had = mes.get(tok)
+  if (had && Date.now() - had.at < 3600_000) return had.id
+  try {
+    const me = await unary(API, "aiserver.v1.DashboardService/GetMe", tok)
+    const id = me?.userId == null ? "" : String(me.userId)
+    mes.set(tok, { id, at: Date.now() })
+    return id
+  } catch {
+    return had?.id ?? ""
+  }
+}
+
+// CALLS_PAGE is how many events one GetFilteredUsageEvents page asks for,
+// and CALLS_PAGES how many pages one reading reads at most
+const CALLS_PAGE = 100
+const CALLS_PAGES = 50
+
+// callsOf are the account's own usage events from since on, as the
+// dashboard's Usage page lists them (GetFilteredUsageEvents), less the ones
+// of this plugin's own conversations: the calls the account made from
+// Cursor's editor, cursor-agent or anything else not through magpie. Each
+// has its event id (rid), time, model, tokens (in is the uncached rest, as
+// magpie counts it), its cost in USD and its conversation. A page Cursor
+// won't give fails the reading: magpie asks again from the same time.
+async function callsOf(tok, since, signal) {
+  await readMine()
+  const me = await meOf(tok)
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0)
+  const out = []
+  const end = Date.now()
+  for (let page = 1; page <= CALLS_PAGES; page++) {
+    const res = await fetch(API + "/aiserver.v1.DashboardService/GetFilteredUsageEvents", {
+      method: "POST",
+      headers: await headersFor(tok),
+      body: JSON.stringify({ ...await teamBody(tok), startDate: String(since), endDate: String(end), page, pageSize: CALLS_PAGE }),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+    })
+    const text = await res.text()
+    if (!res.ok) {
+      const f = failure(res.status, text)
+      const e = new Error(f.message)
+      e.status = f.status
+      throw e
+    }
+    const body = JSON.parse(text || "{}")
+    const evs = body?.usageEventsDisplay ?? []
+    for (const ev of evs) {
+      const t = ev?.tokenUsage
+      const at = num(ev?.timestamp)
+      if (!t || !at || at < since) continue
+      if (me && ev.owningUser != null && String(ev.owningUser) !== me) continue
+      if (ev.conversationId && mine.ids.has(ev.conversationId)) continue
+      const rid = String(ev.usageEventId ?? "") || `${ev.conversationId ?? ""}:${at}:${ev.model ?? ""}`
+      const cents = t.totalCents ?? ev.chargedCents
+      out.push({
+        rid,
+        t: at,
+        model: String(ev.model ?? ""),
+        in: num(t.inputTokens),
+        out: num(t.outputTokens),
+        cache_read: num(t.cacheReadTokens),
+        cache_write: num(t.cacheWriteTokens),
+        ...(cents == null ? {} : { cost: num(cents) / 100 }),
+        ...(ev.conversationId ? { session: String(ev.conversationId) } : {}),
+      })
+    }
+    const total = num(body?.totalUsageEventsCount)
+    if (evs.length < CALLS_PAGE || (total && page * CALLS_PAGE >= total)) break
+  }
+  return out.sort((a, b) => a.t - b.t)
+}
+
 // runNative opens a session-owned Run. Its background decoder survives the end
 // of each Chat segment; only terminal completion, failure, or cancellation
 // releases the transport.
 async function runNative({ tok, base, id, tools, conv, convID, signal, maxMode, params, native }) {
   const cid = convID || randomUUID()
+  ownConversation(cid)
   const since = Date.now()
   // Transport shutdown precedes final debt collection. Keep its cancellation
   // separate, and return any undelivered collection through the ledger's carry.
@@ -2620,8 +2894,32 @@ async function runNative({ tok, base, id, tools, conv, convID, signal, maxMode, 
   const book = ledger(tok, cid, since, accounting.signal, !!convID, { before: since })
   const debtKey = usageKey(tok, cid)
   let started = false, settled = false, deferred = null
+  // handed is this Run's step owed at a later Run's start while this one
+  // waited on results (handover): owed, collected (and what), or withdrawn
+  let handed = null
+  const owes = () => started && native.segments > 0 && !native.finalUsage && convID && canRead(tok)
   native.accounting = {
     started() { started = true },
+    // A later Run of the conversation began (NativeSessionPool.create) while
+    // this one waits on the caller's results. Its step's event is owed now,
+    // bounded before that start, for the later Run to collect, rather than
+    // when this one is abandoned at resultWait. Cursor stamps a Run's one
+    // event at its start and adds each step to it as the step ends.
+    handover() {
+      if (settled || handed && handed.state !== "withdrawn" || !owes()) return
+      handed = { state: "owed" }
+      owe(debtKey, { since, n: 1, ready: Date.now() + STEP_WAIT.owedAt, before: native.laterRunAt, tag: handed })
+      book.handover()
+    },
+    // resumed by its own results after all: a step not collected yet is this
+    // Run's to count again, in its final; one collected is counted (below)
+    resumed() {
+      if (handed?.state === "owed") withdraw(debtKey, handed)
+    },
+    // what a later Run collected of this Run's event: its final leaves it out
+    counted() {
+      return handed?.state === "collected" ? handed.usage : null
+    },
     async settle() {
       const more = await book.owed(true)
       if (settled) {
@@ -2645,10 +2943,14 @@ async function runNative({ tok, base, id, tools, conv, convID, signal, maxMode, 
       accounting.abort()
       if (deferred) owe(debtKey, { carry: deferred })
       deferred = null
+      // a step handed over is owed already, or was collected
+      if (handed && handed.state !== "withdrawn") return
       // Every handoff of this owner belongs to one Run. Only an abandoned
       // started/pending Run is owed; a final snapshot (including zero) is not.
-      if (started && native.segments > 0 && !native.finalUsage && convID && canRead(tok)) {
-        owe(debtKey, { since, n: 1, ready: Date.now() + STEP_WAIT.owedAt })
+      if (owes()) {
+        // laterRunAt: a later Run of this conversation began while this one
+        // was live (NativeSessionPool.create); its events are not this debt
+        owe(debtKey, { since, n: 1, ready: Date.now() + STEP_WAIT.owedAt, before: native.laterRunAt })
       }
     },
   }
@@ -2671,7 +2973,7 @@ async function runNative({ tok, base, id, tools, conv, convID, signal, maxMode, 
       "x-request-id": randomUUID(),
       ...await teamHeader(tok),
       // none of Cursor's own tools, only the caller's
-      "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
+      "x-cursor-agent-allowed-tools": allowedTools(native.search),
     },
     native.ac.signal,
     // Over HTTP/1.1 the history's blobs go up H1.atOnce at a time, as
@@ -2751,12 +3053,15 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
   // the Run's conversation_id, a new one when nothing names the session:
   // its usage event is found by it
   const cid = convID || randomUUID()
+  ownConversation(cid)
   const since = Date.now()
   // how its usage is counted: a debt of the conversation's is collected
   // while it goes, which only a conversation_id that names the session
   // could have run up
   const book = ledger(tok, cid, since, signal, !!convID)
   const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id, cid, { maxMode, params })
+  // the web-search test switch, as it is at the Run's start (plugins#635)
+  const search = webSearchDir()
   const o = await open(
     base,
     {
@@ -2769,7 +3074,7 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
       "x-request-id": randomUUID(),
       ...await teamHeader(tok),
       // none of Cursor's own tools, only the caller's
-      "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
+      "x-cursor-agent-allowed-tools": allowedTools(search),
     },
     signal,
   )
@@ -2778,7 +3083,7 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
   let closed = false
   let heartbeat
   // a Run Cursor stops answering ends, as a retained one does (#2672)
-  const quiet = new Quiet(NATIVE_LIMITS, () => close(), { path: "stateless", model: id, why })
+  const quiet = new Quiet(NATIVE_LIMITS, () => close(), { path: "stateless", model: id, why, search })
   const send = (msg) => {
     if (!closed && !req.destroyed && req.writable) {
       quiet.trace?.frame("out", msg)
@@ -2823,11 +3128,13 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
     stepUsage: book.own,
     owedUsage: book.owed,
     note: (name) => quiet.trace?.event(name),
+    search: search ? () => quiet.trace?.searchAsked() : null,
   })
   const wrapped = (async function* () {
     try {
       for await (const v of it) {
         if (v?.error) quiet.failed(v.error)
+        else if (v?.stop) quiet.ended()
         yield v
       }
     } finally {
@@ -2853,7 +3160,7 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
 
 // decode follows the server's messages into the answer's pieces until the
 // turn ends, or the model has made its tool calls.
-async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage, owedUsage, note, countWait = NATIVE_LIMITS.countWait }) {
+async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage, owedUsage, note, search, countWait = NATIVE_LIMITS.countWait }) {
   let calls = 0
   // answered: the step's calls answered here (a refusal, the MCP tool
   // list), which Cursor's count of the step's calls takes in too (#142)
@@ -2928,7 +3235,7 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage,
   // owed); and with what the conversation's earlier steps owed, which a
   // step that ends the turn waits for
   const settled = async () => {
-    if (calls > 0 && !ended && stepUsage) {
+    if (calls > 0 && !ended && !counted && stepUsage) {
       close?.()
       const u = await stepUsage().catch(() => null)
       if (u) usage = u
@@ -3024,9 +3331,16 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage,
                   break
                 case 27: // how many tool calls the step makes, sent before or after them
                   listed = pbNum(uf, 1)
+                  step.listed()
                   if (stepDone()) {
                     yield await settled()
                     return
+                  }
+                  break
+                case 31: // model_call_completed: the step's own token usage
+                  if (!ended && uf.some((f) => f.num >= 2 && f.num <= 6)) {
+                    usage = usageOf(uf, 1)
+                    counted = true
                   }
                   break
                 case 2: // a call started on the client
@@ -3061,10 +3375,12 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage,
           }
           case 3:
             // conversation_checkpoint_update: Cursor's state. Once the step
-            // has its count, a state waiting on just the calls handed to the
-            // caller is a step Cursor has finished: what more the count
-            // says will not come (plugins#550)
-            if (listed && calls > 0 && pendingCalls(m.data, fields) === calls) {
+            // has its count after the calls, a state waiting on just the
+            // calls handed to the caller is a step Cursor has finished: what
+            // more the count says will not come (plugins#550). An announced
+            // MCP call without an exec or completion must still be awaited,
+            // even if this checkpoint omits it.
+            if (listed && step.listedAfter && !step.pendingMcp && calls > 0 && pendingCalls(m.data, fields) === calls) {
               note?.("waited on")
               yield await settled()
               return
@@ -3086,6 +3402,19 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage,
                 send(pb().bytes(3, pb().varint(1, id).bytes(3, EMPTY)).done())
               }
             }
+            break
+          }
+          case 7: {
+            // interaction_query: Cursor's own web search, approved under the
+            // web-search test switch (plugins#635); anything else, or the
+            // switch off, goes unanswered as before
+            const q = search ? webSearchQuery(m.data, fields) : null
+            if (!q) {
+              count(seen.messages, m.num)
+              break
+            }
+            search()
+            send(webSearchAnswer(pb, q))
             break
           }
           default:
@@ -3425,6 +3754,14 @@ export async function CursorAuthPlugin(input) {
       return ""
     }
   })
+  // the web-search test switch (plugins#635): the same folder, "" while off
+  setWebSearch(() => {
+    try {
+      return input?.magpie?.option?.(ID, WEB_SEARCH) === true && input.directory ? join(input.directory, "cursor-traces") : ""
+    } catch {
+      return ""
+    }
+  })
   return {
     auth: {
       provider: ID,
@@ -3472,6 +3809,12 @@ export async function CursorAuthPlugin(input) {
           description:
             "For a bug report: when a Cursor request fails, saves the shape of what Cursor sent and what was sent back (each frame's kind, field numbers, size and time) to the cursor-traces folder in magpie's folder. No prompt or reply text, tool names or arguments, tokens, headers or account ids are written. The newest 20 are kept.",
         },
+        {
+          key: WEB_SEARCH,
+          label: "Cursor web search (test)",
+          description:
+            "A test for plugins#635: lets Cursor search the web itself and approves each search it asks for, and saves the trace of every request in which Cursor searched, as Wire trace does, whether it worked or not. Cursor's other tools stay refused.",
+        },
       ],
       // magpie's: how much of the plan's included usage is gone (the plan
       // is the one the sign-in read). The built-in's read, clean or not,
@@ -3494,6 +3837,13 @@ export async function CursorAuthPlugin(input) {
         const { credits: free = [], ...read } = u
         const windows = [...read.windows.filter((w) => !last(w)), ...bot, ...free, ...read.windows.filter(last)]
         return { ...read, windows, ...(plan ? { plan } : {}), signIn: "kept" }
+      },
+      // magpie's: the account's calls from since (ms) on that didn't go
+      // through magpie, for its Usage page (callsOf). A failure is thrown:
+      // magpie reads them again from the same time.
+      async calls(getAuth, provider, { since = Date.now() - 30 * 86_400_000, signal } = {}) {
+        const tok = await tokenOf(await getAuth())
+        return { calls: await callsOf(tok, Math.max(0, Number(since) || 0), signal) }
       },
     },
     // the session the request is part of, for the conversation_id
@@ -3535,4 +3885,4 @@ export async function CursorAuthPlugin(input) {
 }
 
 // for tests
-export const _internal = { credits, kvReply, listFor, lists, keychain, keychainToken, nativeTransport, onDemandOf,resetH1: () => (h1Until = 0), onH1: () => Date.now() < h1Until, resetTeam: () => { teamRead.at = 0; teamRead.info = null }, expireTeam: () => (teamRead.at = 0),H2, H1, h2Blocked, open, openH1, openH2, STEP_WAIT, stepUsage, usageKey, ledger, owed, flights, misses, unreadable, catalog, usable, request, modelsOf, tokensOf, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { mine, ownConversation, callsOf, slugFor, fromCatalog, credits, kvReply, listFor, lists, keychain, keychainToken, nativeTransport, onDemandOf,resetH1: () => (h1Until = 0), onH1: () => Date.now() < h1Until, resetTeam: () => { teamRead.at = 0; teamRead.info = null }, expireTeam: () => (teamRead.at = 0),H2, H1, h2Blocked, open, openH1, openH2, STEP_WAIT, stepUsage, usageKey, ledger, owed, flights, misses, unreadable, catalog, usable, request, modelsOf, tokensOf, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }

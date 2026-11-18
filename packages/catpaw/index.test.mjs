@@ -8,6 +8,7 @@ import { fakeCatPaw } from "./fake.mjs"
 import capturedRound from "./testdata/captured-round.json"
 import capturedTurn from "./testdata/captured-turn.json"
 import issue605 from "./testdata/issue-605.json"
+import issue933 from "./testdata/issue-933.json"
 
 // every test runs against the fake upstream in fake.mjs: no network, no real
 // token ever leaves this process. The upstream base is monkey-patched because
@@ -17,6 +18,7 @@ let fake
 let plugin
 let saved = {}
 let tmpDir
+let realFetch
 const client = { auth: { set: async ({ body }) => (saved = body) } }
 const getAuth = async () => saved
 
@@ -33,23 +35,47 @@ beforeAll(async () => {
   // the plugin reads ORIGIN at call time only inside gatewayHeaders/fetch, so
   // monkey-patching the global fetch to route to the fake works: we swap the
   // global fetch for one that rewrites the URL host to the fake server
-  const realFetch = globalThis.fetch
+  realFetch = globalThis.fetch
   globalThis.fetch = (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
     const patched = url.replace("https://ai.catpaw.meituan.com", fake.url).replace("https://catx.nocode.cn", fake.url)
-    return realFetch(patched, init)
+    return realFetch(input instanceof Request ? new Request(patched, input) : patched, init)
   }
   plugin = await CatPawAuthPlugin({ client })
 })
 
 afterAll(() => {
-  fake.server.stop(true)
-  rmSync(tmpDir, { recursive: true, force: true })
+  try {
+    fake.server.stop(true)
+    rmSync(tmpDir, { recursive: true, force: true })
+  } finally {
+    globalThis.fetch = realFetch
+  }
 })
 
 beforeEach(() => {
   fake.state.reset()
   saved = { type: "oauth", access: fake.state.token, expires: 0, source: "desktop", accountId: "Tester" }
+})
+
+describe("test fetch isolation", () => {
+  test("rewriting a Request keeps its method, headers and body", async () => {
+    const response = await globalThis.fetch(new Request("https://ai.catpaw.meituan.com/api/agent/maas/model-types", {
+      method: "POST",
+      headers: {
+        cookie: `X-Passport-Token=${fake.state.token}`,
+        "content-type": "application/json",
+        "m-appkey": "com.sankuai.mcopilot.cli",
+        "x-test-marker": "kept",
+      },
+      body: JSON.stringify({ probe: true }),
+    }))
+
+    expect(response.status).toBe(200)
+    expect(fake.state.modelTypeRequests).toEqual([
+      { method: "POST", marker: "kept", body: { probe: true } },
+    ])
+  })
 })
 
 describe("config", () => {
@@ -202,25 +228,414 @@ describe("chat", () => {
     expect(text).toContain("vendor broke")
   })
 
-  test("a request carrying tools is refused with a clear 400", async () => {
+  test("a tool request is answered with parsed tool_calls (non-stream)", async () => {
+    const callText = JSON.stringify({ tool_calls: [{ name: "Bash", arguments: { command: "ls" } }] })
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: callText }] } },
+        { message: { content: [{ type: "text", text: callText }] }, finished: true },
+      ],
+    ]
     const loader = await plugin.auth.loader(getAuth)
     const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
       method: "POST",
-      body: JSON.stringify({ model: "longcat-2.0", messages: [{ role: "user", content: "hi" }], tools: [{ type: "function", function: { name: "f" } }] }),
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "list the files" }],
+        tools: [{ type: "function", function: { name: "Bash", description: "run a shell command", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } }],
+      }),
     })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.error.message).toContain("cannot run tools")
+    expect(body.choices[0].finish_reason).toBe("tool_calls")
+    expect(body.choices[0].message.tool_calls[0].function.name).toBe("Bash")
+    expect(JSON.parse(body.choices[0].message.tool_calls[0].function.arguments)).toEqual({ command: "ls" })
+    // the instruction rode in the flattened prompt
+    expect(fake.state.conversations.at(-1).prompt).toContain("Bash")
+    expect(fake.state.rounds).toBe(1)
   })
 
-  test("a request carrying tool results is refused, images are refused", async () => {
+  test("tool results ride as text instead of a 400", async () => {
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [
+          { role: "user", content: "list the files" },
+          { role: "assistant", tool_calls: [{ id: "c1", function: { name: "Bash", arguments: "{\"command\":\"ls\"}" } }] },
+          { role: "tool", tool_call_id: "c1", content: "a.txt" },
+        ],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+      }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.choices[0].message.content).toBeTruthy()
+    expect(fake.state.conversations.at(-1).prompt).toContain("Tool result")
+  })
+
+  test("tool_choice=required retries once when the reply has no call", async () => {
+    const callText = JSON.stringify({ tool_calls: [{ name: "Bash", arguments: { command: "ls" } }] })
+    fake.state.turnFramesQueue = [
+      [{ message: { content: [{ type: "text", text: "我直接说明一下" }] }, finished: true }],
+      [{ message: { content: [{ type: "text", text: callText }] }, finished: true }],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "run ls" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+        tool_choice: "required",
+      }),
+    })
+    const body = await res.json()
+    expect(fake.state.rounds).toBe(2)
+    expect(body.choices[0].message.tool_calls[0].function.name).toBe("Bash")
+  })
+
+  test("tool_choice none keeps the plain passthrough", async () => {
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+        tool_choice: "none",
+      }),
+    })
+    expect(res.status).toBe(200)
+    expect(fake.state.rounds).toBe(1)
+    expect(fake.state.conversations.at(-1).prompt).not.toContain("Available tools")
+  })
+
+  test("a streaming tool request synthesizes tool_calls deltas", async () => {
+    const callText = JSON.stringify({ tool_calls: [{ name: "Bash", arguments: { command: "ls" } }] })
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: callText }] } },
+        { message: { content: [{ type: "text", text: callText }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "list the files" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+        stream: true,
+      }),
+    })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain('"tool_calls"')
+    expect(text).toContain('"finish_reason":"tool_calls"')
+    expect(text.endsWith("data: [DONE]\n\n")).toBe(true)
+  })
+
+  test("a streaming tool request with a prose reply streams content, not tool_calls", async () => {
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+        stream: true,
+      }),
+    })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    // deltas流式逐字输出，逐字断言而不是拼好的整句
+    expect(text).toContain("收到")
+    expect(text).toContain('"finish_reason":"stop"')
+    expect(text).not.toContain('"tool_calls"')
+  })
+
+  test("streaming + tool_choice=required + prose twice: the retry runs, then text goes out as text", async () => {
+    fake.state.turnFramesQueue = [
+      [{ message: { content: [{ type: "text", text: "我直接说明" }] }, finished: true }],
+      [{ message: { content: [{ type: "text", text: "我还是直接说明吧" }] }, finished: true }],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "run ls" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+        stream: true,
+        tool_choice: "required",
+      }),
+    })
+    const text = await res.text()
+    expect(fake.state.rounds).toBe(2)
+    expect(text).toContain("我还是直接说明吧")
+    expect(text).toContain('"finish_reason":"stop"')
+    expect(text).not.toContain('"tool_calls"')
+    // the failed first reply rides along so the retry can refer to it
+    const second = fake.state.conversations.at(-1).prompt
+    expect(second).toContain("我直接说明")
+    expect(second).toContain("did not include a valid tool call")
+  })
+
+  test("a truncated JSON head in streaming still flushes as content", async () => {
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: '{"tool_calls":[{"name":"Bash"' }] } },
+        { message: { content: [{ type: "text", text: '{"tool_calls":[{"name":"Bash"' }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "list files" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+        stream: true,
+      }),
+    })
+    const text = await res.text()
+    expect(res.status).toBe(200)
+    expect(text).toContain('"finish_reason":"stop"')
+    expect(text).not.toContain('"finish_reason":"tool_calls"')
+  })
+
+  test("multiple calls in one reply all come out", async () => {
+    const callText = JSON.stringify({ tool_calls: [{ name: "Bash", arguments: { command: "ls" } }, { name: "Bash", arguments: { command: "pwd" } }] })
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: callText }] } },
+        { message: { content: [{ type: "text", text: callText }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "ls and pwd" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+      }),
+    })
+    const body = await res.json()
+    expect(body.choices[0].message.tool_calls.length).toBe(2)
+    expect(JSON.parse(body.choices[0].message.tool_calls[1].function.arguments)).toEqual({ command: "pwd" })
+  })
+
+  test("an unknown tool name is dropped, not answered as text", async () => {
+    const callText = JSON.stringify({ tool_calls: [{ name: "TotallyUnknown", arguments: {} }] })
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: callText }] } },
+        { message: { content: [{ type: "text", text: callText }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+      }),
+    })
+    const body = await res.json()
+    expect(body.choices[0].finish_reason).toBe("stop")
+    expect(body.choices[0].message.content).toContain("TotallyUnknown")
+  })
+
+  test("a drifted name case is matched back to the declaration", async () => {
+    const callText = JSON.stringify({ tool_calls: [{ name: "bash", arguments: { command: "ls" } }] })
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: callText }] } },
+        { message: { content: [{ type: "text", text: callText }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "ls" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+      }),
+    })
+    const body = await res.json()
+    expect(body.choices[0].message.tool_calls[0].function.name).toBe("Bash")
+  })
+
+  test("a named tool_choice whose reply calls another tool gets the retry", async () => {
+    const wrongText = JSON.stringify({ tool_calls: [{ name: "Unknown", arguments: {} }] })
+    const rightText = JSON.stringify({ tool_calls: [{ name: "Bash", arguments: { command: "ls" } }] })
+    fake.state.turnFramesQueue = [
+      [{ message: { content: [{ type: "text", text: wrongText }] } }, { message: { content: [{ type: "text", text: wrongText }] }, finished: true }],
+      [{ message: { content: [{ type: "text", text: rightText }] } }, { message: { content: [{ type: "text", text: rightText }] }, finished: true }],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "run ls" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+        tool_choice: { type: "function", function: { name: "Bash" } },
+      }),
+    })
+    const body = await res.json()
+    expect(fake.state.rounds).toBe(2)
+    expect(body.choices[0].message.tool_calls[0].function.name).toBe("Bash")
+  })
+
+  test("a bare object without arguments is an answer, not a call", async () => {
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: '{"name":"Bash"}' }] } },
+        { message: { content: [{ type: "text", text: '{"name":"Bash"}' }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+      }),
+    })
+    const body = await res.json()
+    expect(body.choices[0].finish_reason).toBe("stop")
+    expect(body.choices[0].message.content).toContain('"name":"Bash"')
+  })
+
+  test("a quoted example inside prose is not a call", async () => {
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: '可以用 Bash，例如 {"name":"Bash","arguments":{"command":"rm -rf x"}} 之类' }] } },
+        { message: { content: [{ type: "text", text: '可以用 Bash，例如 {"name":"Bash","arguments":{"command":"rm -rf x"}} 之类' }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+      }),
+    })
+    const body = await res.json()
+    expect(body.choices[0].finish_reason).toBe("stop")
+    expect(body.choices[0].message.content).toContain("例如")
+  })
+
+  test("a call missing a required arg is dropped", async () => {
+    const callText = JSON.stringify({ tool_calls: [{ name: "Bash", arguments: {} }] })
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: callText }] } },
+        { message: { content: [{ type: "text", text: callText }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "Bash", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } }],
+      }),
+    })
+    const body = await res.json()
+    expect(body.choices[0].finish_reason).toBe("stop")
+    expect(body.choices[0].message.content).toContain("tool_calls")
+  })
+
+  test("a call JSON split across cumulative frames still becomes a call", async () => {
+    // frame 1 cuts mid-token — the head-hold in the streaming tool path
+    // exists for exactly this shape
+    const whole = JSON.stringify({ tool_calls: [{ name: "Bash", arguments: { command: "ls" } }] })
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: whole.slice(0, 19) }] } },
+        { message: { content: [{ type: "text", text: whole }] }, finished: true },
+      ],
+    ]
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "longcat-2.0",
+        messages: [{ role: "user", content: "list files" }],
+        tools: [{ type: "function", function: { name: "Bash" } }],
+        stream: true,
+      }),
+    })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain('"finish_reason":"tool_calls"')
+    expect(text).toContain('"name":"Bash"')
+    expect(text.endsWith("data: [DONE]\n\n")).toBe(true)
+  })
+
+  test("the keep-alive interval is torn down when the agent cancels mid-turn", async () => {
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: "你" }] } },
+        { message: { content: [{ type: "text", text: "你好" }] }, finished: true },
+      ],
+    ]
+    fake.state.turnDelayMs = 400
+    let created = 0
+    let cleared = 0
+    const origSet = globalThis.setInterval
+    const origClear = globalThis.clearInterval
+    globalThis.setInterval = (fn, ms) => {
+      created++
+      return origSet(fn, ms)
+    }
+    globalThis.clearInterval = (t) => {
+      cleared++
+      return origClear(t)
+    }
+    try {
+      const loader = await plugin.auth.loader(getAuth)
+      const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({
+          model: "longcat-2.0",
+          messages: [{ role: "user", content: "hi" }],
+          tools: [{ type: "function", function: { name: "Bash" } }],
+          stream: true,
+        }),
+      })
+      const reader = res.body.getReader()
+      await reader.read() // the role frame, then cancel mid-turn
+      await reader.cancel()
+      // the next delta arrives after the fake's delay; the push that hits a
+      // cancelled stream is where the interval must be cleared
+      await new Promise((r) => setTimeout(r, 800))
+      expect(created).toBeGreaterThanOrEqual(1)
+      expect(cleared).toBeGreaterThanOrEqual(created)
+    } finally {
+      globalThis.setInterval = origSet
+      globalThis.clearInterval = origClear
+    }
+  })
+
+  test("tool results ride as text, images are refused", async () => {
     const loader = await plugin.auth.loader(getAuth)
     const toolRes = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
       method: "POST",
       body: JSON.stringify({ model: "longcat-2.0", messages: [{ role: "user", content: "hi" }, { role: "tool", content: "result" }] }),
     })
-    expect(toolRes.status).toBe(400)
-    expect((await toolRes.json()).error.message).toContain("cannot continue a tool call")
+    expect(toolRes.status).toBe(200)
     const imgRes = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
       method: "POST",
       body: JSON.stringify({ model: "longcat-2.0", messages: [{ role: "user", content: [{ type: "image", image_url: { url: "data:image/png;base64,AAAA" } }] }] }),
@@ -337,6 +752,50 @@ describe("usage", () => {
     expect(usage.plan).toBe("体验版")
     expect(fake.state.balanceCalls).toBe(1)
   })
+
+  // plugins#867 (orinsid): the same response carries userPlan.nextRefreshTime,
+  // a ms epoch as a string, when the credits refresh. It is the window's
+  // reset, so Smart routing can rank the account by it.
+  test("the credits' refresh time is the window's reset (reporter's shape)", async () => {
+    fake.state.balancePlan = { nextRefreshTime: "1796054400000" }
+    const usage = await plugin.auth.usage(getAuth)
+    const w = usage.windows[0]
+    expect(w.aside).toBeUndefined()
+    expect(w.resetsAt).toBe("2026-11-30T16:00:00.000Z")
+    expect(new Date(w.resetsAt).getTime()).toBe(1796054400000)
+    expect(w.used).toBe(0) // the vendor gives no total: nothing to count spent against
+    expect(w.limit).toBeUndefined()
+    expect(w.display).toBe("1134.67 credit")
+  })
+
+  test("a numeric refresh time reads the same", async () => {
+    fake.state.balancePlan = { nextRefreshTime: 1796054400000 }
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.windows[0].resetsAt).toBe("2026-11-30T16:00:00.000Z")
+    expect(usage.windows[0].aside).toBeUndefined()
+  })
+
+  // a refresh time that can't be read is not known: the window stays aside,
+  // as before, rather than ranking the account by a made-up date
+  for (const [label, v] of [
+    ["missing", undefined],
+    ["null", null],
+    ["empty", ""],
+    ["garbage", "soon"],
+    ["seconds, not ms", "1796054400"],
+    ["a date string", "2026-12-01"],
+    ["negative", "-1796054400000"],
+    ["a fraction", "1796054400000.5"],
+    ["an object", { at: "1796054400000" }],
+  ]) {
+    test(`a refresh time that is ${label} keeps the window aside`, async () => {
+      fake.state.balancePlan = v === undefined ? {} : { nextRefreshTime: v }
+      const usage = await plugin.auth.usage(getAuth)
+      expect(usage.error).toBeUndefined()
+      expect(usage.windows[0].aside).toBe(true)
+      expect(usage.windows[0].resetsAt).toBeUndefined()
+    })
+  }
 
   test("a refused token says the sign-in expired", async () => {
     saved = { type: "oauth", access: "not-the-token", expires: 0, source: "manual" }
@@ -466,10 +925,226 @@ describe("source (plugins#605)", () => {
   })
 })
 
+describe("models the vendor added (the desktop client asks the gateway for its list)", () => {
+  const chatWith = async (model) => {
+    const loader = await plugin.auth.loader(getAuth)
+    return loader.fetch("https://ai.catpaw.meituan.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model, stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+  }
+  beforeEach(() => _internal.forgetLive())
+
+  test("the list is asked the way the client asks it", async () => {
+    await plugin.provider.models({ models: {} }, { auth: saved })
+    expect(fake.state.modelTypeCalls).toEqual([{ tenant: "CatDesk", scene: "CATX_APP", env: "EXTERNAL" }])
+  })
+
+  test("a listed model the table lacks is offered, under its table id when it has one", async () => {
+    const cfg = {}
+    await plugin.config(cfg)
+    const got = await plugin.provider.models({ models: cfg.provider.catpaw.models }, { auth: saved })
+    expect(got["longcat-2.5"]).toEqual({ name: "LongCat-2.5 (限时免费)", rate: 0, free: true })
+    expect(Object.keys(got)).toContain("longcat-2.0")
+    expect(got["longcat-2.0"].name).toBe("LongCat-2.0 (限时免费)")
+    // the user's own custom model (negative id) is not the gateway's to serve
+    expect(Object.keys(got)).not.toContain("my-own-model")
+  })
+
+  test("a table model takes the list's multiplier; the user's own value stays", async () => {
+    const got = await plugin.provider.models({ models: { "kimi-k3": { name: "Kimi-K3" } } }, { auth: saved })
+    expect(got["kimi-k3"]).toEqual({ name: "Kimi-K3", rate: 1.5 })
+    const own = await plugin.provider.models({ models: { "kimi-k3": { name: "Kimi-K3", rate: 9 } } }, { auth: saved })
+    expect(own["kimi-k3"].rate).toBe(9)
+  })
+
+  test("the multiplier is read as the client reads it, and a missing one is not 0", () => {
+    const row = (extendedInfo) => ({ modelTypeId: 5, modelTypeName: "X-1", extendedInfo })
+    expect(_internal.liveModels([row({ rateMultiplier: "2x" })])["x-1"].rate).toBe(2)
+    expect(_internal.liveModels([row(JSON.stringify({ rateMultiplier: 0.5 }))])["x-1"].rate).toBe(0.5)
+    expect("rate" in _internal.liveModels([row({})])["x-1"]).toBe(false)
+    expect("rate" in _internal.liveModels([row({ rateMultiplier: "abc" })])["x-1"]).toBe(false)
+    expect(_internal.liveModels([row({ shortName: "X One", marketingCopy: "新,限时免费" })])["x-1"]).toEqual({ name: "X One (新、限时免费)", type: 5, image: false, free: true })
+  })
+
+  test("a chat on the new model sends the listed modelType", async () => {
+    const res = await chatWith("longcat-2.5")
+    expect(res.status).toBe(200)
+    expect(fake.state.conversations.at(-1).modelType).toBe(120)
+  })
+
+  test("a table model costs no list request", async () => {
+    const res = await chatWith("kimi-k3")
+    expect(res.status).toBe(200)
+    expect(fake.state.modelTypeCalls).toEqual([])
+    expect(fake.state.conversations.at(-1).modelType).toBe(83)
+  })
+
+  test("the list is read once in five minutes", async () => {
+    await chatWith("longcat-2.5")
+    await chatWith("longcat-2.5")
+    expect(fake.state.modelTypeCalls.length).toBe(1)
+  })
+
+  test("a model neither the table nor the list has is still refused, naming what is known", async () => {
+    const res = await chatWith("not-a-model")
+    expect(res.status).toBe(400)
+    expect((await res.json()).error.message).toContain("longcat-2.5")
+  })
+
+  test("when the list cannot be read the table stands", async () => {
+    fake.state.modelTypesFail = true
+    const cfg = {}
+    await plugin.config(cfg)
+    const got = await plugin.provider.models({ models: cfg.provider.catpaw.models }, { auth: saved })
+    expect(Object.keys(got).sort()).toEqual(Object.keys(cfg.provider.catpaw.models).sort())
+    expect((await chatWith("longcat-2.5")).status).toBe(400)
+    expect((await chatWith("glm-5.3")).status).toBe(200)
+  })
+})
+
 describe("helpers", () => {
   test("model type mapping", () => {
     expect(_internal.modelTypeOf("longcat-2.0")).toBe(77)
     expect(_internal.modelTypeOf("kimi-k3")).toBe(83)
     expect(_internal.modelTypeOf("unknown")).toBe(77)
+  })
+})
+
+describe("out of credits (plugins#933)", () => {
+  const GATE = "当前余额不足以完成本次操作。[去购买更多](https://credit.catpaw.meituan.com/#/plan)，即可继续使用全部功能。"
+  const literal = issue933.sse.join("\n\n") + "\n\n"
+  const ask = async (body) => {
+    const loader = await plugin.auth.loader(getAuth)
+    return loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "glm-5.3-flash", messages: [{ role: "user", content: "hi" }], ...body }),
+    })
+  }
+  const tools = [{ type: "function", function: { name: "Bash", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } }]
+  const expectOutOfCredit = async (res) => {
+    expect(res.status).toBe(402)
+    const { error } = await res.json()
+    expect(error.type).toBe("insufficient_quota")
+    expect(error.code).toBe("insufficient_credits")
+    expect(error.help_url).toBe("https://credit.catpaw.meituan.com/#/plan")
+    expect(error.message).toBe("当前余额不足以完成本次操作。去购买更多 (https://credit.catpaw.meituan.com/#/plan)，即可继续使用全部功能。")
+    expect(error.upstream_message).toBe(GATE)
+  }
+  // a stream's text as the agent reads it
+  const streamed = async (res) => {
+    let text = ""
+    for (const line of (await res.text()).split("\n")) {
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue
+      const j = JSON.parse(line.slice(6))
+      if (j.error) throw new Error(j.error.message)
+      text += j.choices[0].delta.content ?? ""
+    }
+    return text
+  }
+
+  test("the reporter's frames are a 402, not an answer (non-stream)", async () => {
+    fake.state.turnRaw = literal
+    await expectOutOfCredit(await ask({ stream: false }))
+  })
+
+  test("the reporter's frames are a 402 before anything streams", async () => {
+    fake.state.turnRaw = literal
+    await expectOutOfCredit(await ask({ stream: true }))
+  })
+
+  test("with tools, a 402 and no second turn (no forced-tool retry)", async () => {
+    fake.state.turnRaw = literal
+    await expectOutOfCredit(await ask({ stream: false, tools, tool_choice: "required" }))
+    expect(fake.state.turns).toBe(1)
+    fake.state.reset()
+    fake.state.turnRaw = literal
+    await expectOutOfCredit(await ask({ stream: true, tools }))
+    expect(fake.state.turns).toBe(1)
+  })
+
+  test("the sentence split over frames is still the gate", async () => {
+    fake.state.turnFramesQueue = [
+      [
+        { message: { type: "assistant", content: [{ type: "text", text: "" }] } },
+        { message: { type: "assistant", content: [{ type: "text", text: "当前余额" }] } },
+        { message: { type: "assistant", content: [{ type: "text", text: "当前余额不足以完成" }] } },
+        { message: { type: "assistant", content: [{ type: "text", text: GATE }] }, finished: true },
+      ],
+    ]
+    await expectOutOfCredit(await ask({ stream: true }))
+  })
+
+  test("a model's answer quoting the sentence is an answer", async () => {
+    const m = issue933.modelAnswer
+    fake.state.turnFramesQueue = [
+      [
+        { message: { type: "assistant", ...m, content: [{ type: "text", text: "当前余额不足" }] } },
+        { message: { type: "assistant", ...m, content: [{ type: "text", text: GATE }] } },
+        { message: { type: "assistant", ...m, content: [{ type: "text", text: GATE + " 这是妙手的提示文案。" }] }, finished: true },
+      ],
+    ]
+    const res = await ask({ stream: true })
+    expect(res.status).toBe(200)
+    expect(await streamed(res)).toBe(GATE + " 这是妙手的提示文案。")
+    fake.state.turnFramesQueue = [[{ message: { type: "assistant", ...m, content: [{ type: "text", text: GATE }] }, finished: true }]]
+    const res2 = await ask({ stream: false })
+    expect(res2.status).toBe(200)
+    expect((await res2.json()).choices[0].message.content).toBe(GATE)
+  })
+
+  test("a head held as maybe the gate streams whole when it isn't", async () => {
+    fake.state.turnFramesQueue = [
+      [
+        { message: { content: [{ type: "text", text: "当前" }] } },
+        { message: { content: [{ type: "text", text: "当前余" }] } },
+        { message: { content: [{ type: "text", text: "当前余下三项任务" }] } },
+        { message: { content: [{ type: "text", text: "当前余下三项任务，先做第一项。" }] }, finished: true },
+      ],
+    ]
+    const res = await ask({ stream: true })
+    expect(res.status).toBe(200)
+    expect(await streamed(res)).toBe("当前余下三项任务，先做第一项。")
+    // a reply that is only such a head still goes out
+    fake.state.turnFramesQueue = [[{ message: { content: [{ type: "text", text: "当前" }] }, finished: true }]]
+    const res2 = await ask({ stream: true })
+    expect(await streamed(res2)).toBe("当前")
+  })
+
+  test("a bare 429 is a 429 with a wait and a sentence", async () => {
+    fake.state.roundStatus = 429
+    const res = await ask({ stream: true })
+    expect(res.status).toBe(429)
+    expect(res.headers.get("retry-after")).toBe("45")
+    const { error } = await res.json()
+    expect(error.type).toBe("rate_limit_error")
+    expect(error.message).toContain("妙手限流")
+    fake.state.reset()
+    fake.state.turnStatus = 429
+    expect((await ask({ stream: false })).status).toBe(429)
+  })
+
+  test("a bare 401 says the sign-in is gone", async () => {
+    fake.state.turnStatus = 401
+    const res = await ask({ stream: true, tools })
+    expect(res.status).toBe(401)
+    expect((await res.json()).error.message).toContain("请在妙手桌面端重新登录")
+  })
+
+  test("primed lets a slow turn stream as before", async () => {
+    async function* slow() {
+      await new Promise((r) => setTimeout(r, 50))
+      yield 1
+      yield 2
+    }
+    const got = []
+    for await (const v of await _internal.primed(slow(), 10)) got.push(v)
+    expect(got).toEqual([1, 2])
+    async function* lateFail() {
+      await new Promise((r) => setTimeout(r, 50))
+      throw new Error("late")
+    }
+    const it = await _internal.primed(lateFail(), 10)
+    await expect(it.next()).rejects.toThrow("late")
   })
 })

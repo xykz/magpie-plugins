@@ -40,7 +40,8 @@ export type DetectResult = { available: boolean; bin?: string; version?: string;
 /** Custom launch (Settings › Launch command). args are appended after the built-in arguments; prefixArgs (internal) go before them. */
 export type LaunchCommand = { cmd: string; prefixArgs?: string[]; args?: string[] };
 export type HistoryItem = { provider: string; sessionId: string; title: string; updatedAt: number; messageCount: number; imported: boolean };
-export type SendInput = { text: string; images: { path: string; mime: string }[] };
+/** text already carries the "Referenced files" section for mentions; mentions is there for Agents with a native form (ACP resource_link) */
+export type SendInput = { text: string; images: { path: string; mime: string }[]; mentions?: { path: string; isDir: boolean }[] };
 export type RespondAnswer = { optionId?: string; answers?: Record<string, string>; cancelled?: boolean };
 
 export interface Provider {
@@ -69,7 +70,11 @@ export interface ProviderSession {
   send(input: SendInput): Promise<void>;
   steer?(input: SendInput): Promise<void>;
   interrupt(): Promise<void>;
-  setModel(model: string | null): Promise<void>;
+  /**
+   * Resolves `false` only when the session deliberately skipped the model (ACP: not in the session's
+   * model options and not forced) — callers must not treat that model as applied. Anything else = applied.
+   */
+  setModel(model: string | null, opts?: { force?: boolean }): Promise<boolean | void>;
   setMode(mode: Mode): Promise<void>;
   setEffort(effort: string | null): Promise<void>;
   respond(requestId: string, answer: RespondAnswer): void;

@@ -41,16 +41,16 @@ const RETRY = 60 * 1000
 
 // ---- models ---------------------------------------------------------------------
 
-// Devin's list as `devin models list --format json` gave it (2026-10-14),
+// Devin's list as `devin models list --format json` gave it (2026-11-05),
 // less Adaptive and Fusion, which route between models inside Devin's own
 // agent and aren't served by the API: family id, label, aliases, and each
-// variant's id, label, context and output. Inkling and Claude Sonnet 4.5,
-// gone from that list, stay for the accounts still offered them. The
-// account's own list, from Devin (GetCliModelConfigs) or else the CLI,
-// replaces it.
+// variant's id, label, context and output. Models gone from that list —
+// Inkling, Claude Sonnet 4.5, SWE-1.7 Lightning and the rest at the end —
+// stay for the accounts still offered them. The account's own list, from
+// Devin (GetCliModelConfigs) or else the CLI, replaces it.
 const SNAPSHOT = [
   ["swe-2","SWE-2",["swe"],[["swe-2-high","SWE-2 High",262000,128000],["swe-2-medium","SWE-2 Medium",262000,128000],["swe-2-max","SWE-2 Max",262000,128000]]],
-  ["swe-1.7-lightning","SWE-1.7 Lightning",[],[["swe-1-7-lightning","SWE-1.7 Lightning Max",202752,96000],["swe-1-7-lightning-medium","SWE-1.7 Lightning Medium",202752,96000]]],
+  ["swe-2-flash","SWE-2 Flash",[],[["swe-2-flash-medium","SWE-2 Flash Medium",262144,131072],["swe-2-flash-high","SWE-2 Flash High",262144,131072],["swe-2-flash-max","SWE-2 Flash Max",262144,131072]]],
   ["claude-fable-5-1","Claude Fable 5.1",["fable"],[["claude-fable-5-1-medium","Claude Fable 5.1 Medium",1000000,128000],["claude-fable-5-1-low","Claude Fable 5.1 Low",1000000,128000],["claude-fable-5-1-high","Claude Fable 5.1 High",1000000,128000],["claude-fable-5-1-xhigh","Claude Fable 5.1 XHigh",1000000,128000],["claude-fable-5-1-max","Claude Fable 5.1 Max",1000000,128000]]],
   ["claude-opus-5-5","Claude Opus 5.5",[],[["claude-opus-5-5-medium","Claude Opus 5.5 Medium",1000000,128000],["claude-opus-5-5-low","Claude Opus 5.5 Low",1000000,128000],["claude-opus-5-5-high","Claude Opus 5.5 High",1000000,128000],["claude-opus-5-5-xhigh","Claude Opus 5.5 XHigh",1000000,128000],["claude-opus-5-5-max","Claude Opus 5.5 Max",1000000,128000],["claude-opus-5-5-low-fast","Claude Opus 5.5 Low Fast",1000000,128000],["claude-opus-5-5-medium-fast","Claude Opus 5.5 Medium Fast",1000000,128000],["claude-opus-5-5-high-fast","Claude Opus 5.5 High Fast",1000000,128000],["claude-opus-5-5-xhigh-fast","Claude Opus 5.5 XHigh Fast",1000000,128000],["claude-opus-5-5-max-fast","Claude Opus 5.5 Max Fast",1000000,128000]]],
   ["gpt-6-astra","GPT-6 Astra",[],[["gpt-6-astra-medium","GPT-6 Astra Medium Thinking",1000000,128000],["gpt-6-astra-low","GPT-6 Astra Low Thinking",1000000,128000],["gpt-6-astra-high","GPT-6 Astra High Thinking",1000000,128000],["gpt-6-astra-xhigh","GPT-6 Astra XHigh Thinking",1000000,128000],["gpt-6-astra-max","GPT-6 Astra Max Thinking",1000000,128000],["gpt-6-astra-low-priority","GPT-6 Astra Low Thinking Fast",1000000,128000],["gpt-6-astra-medium-priority","GPT-6 Astra Medium Thinking Fast",1000000,128000],["gpt-6-astra-high-priority","GPT-6 Astra High Thinking Fast",1000000,128000],["gpt-6-astra-xhigh-priority","GPT-6 Astra XHigh Thinking Fast",1000000,128000],["gpt-6-astra-max-priority","GPT-6 Astra Max Thinking Fast",1000000,128000]]],
@@ -75,19 +75,28 @@ const SNAPSHOT = [
   ["gpt-5.6-terra","GPT-5.6 Terra",[],[["gpt-5-6-terra-none","GPT-5.6 Terra No Thinking",1000000,128000],["gpt-5-6-terra-low","GPT-5.6 Terra Low Thinking",1000000,128000],["gpt-5-6-terra-medium","GPT-5.6 Terra Medium Thinking",1000000,128000],["gpt-5-6-terra-high","GPT-5.6 Terra High Thinking",1000000,128000],["gpt-5-6-terra-xhigh","GPT-5.6 Terra XHigh Thinking",1000000,128000],["gpt-5-6-terra-max","GPT-5.6 Terra Max Thinking",1000000,128000],["gpt-5-6-terra-none-priority","GPT-5.6 Terra No Thinking Fast",1000000,128000],["gpt-5-6-terra-low-priority","GPT-5.6 Terra Low Thinking Fast",1000000,128000],["gpt-5-6-terra-medium-priority","GPT-5.6 Terra Medium Thinking Fast",1000000,128000],["gpt-5-6-terra-high-priority","GPT-5.6 Terra High Thinking Fast",1000000,128000],["gpt-5-6-terra-xhigh-priority","GPT-5.6 Terra XHigh Thinking Fast",1000000,128000],["gpt-5-6-terra-max-priority","GPT-5.6 Terra Max Thinking Fast",1000000,128000]]],
   ["gpt-5.6-luna","GPT-5.6 Luna",[],[["gpt-5-6-luna-none","GPT-5.6 Luna No Thinking",1000000,128000],["gpt-5-6-luna-low","GPT-5.6 Luna Low Thinking",1000000,128000],["gpt-5-6-luna-medium","GPT-5.6 Luna Medium Thinking",1000000,128000],["gpt-5-6-luna-high","GPT-5.6 Luna High Thinking",1000000,128000],["gpt-5-6-luna-xhigh","GPT-5.6 Luna XHigh Thinking",1000000,128000],["gpt-5-6-luna-max","GPT-5.6 Luna Max Thinking",1000000,128000],["gpt-5-6-luna-none-priority","GPT-5.6 Luna No Thinking Fast",1000000,128000],["gpt-5-6-luna-low-priority","GPT-5.6 Luna Low Thinking Fast",1000000,128000],["gpt-5-6-luna-medium-priority","GPT-5.6 Luna Medium Thinking Fast",1000000,128000],["gpt-5-6-luna-high-priority","GPT-5.6 Luna High Thinking Fast",1000000,128000],["gpt-5-6-luna-xhigh-priority","GPT-5.6 Luna XHigh Thinking Fast",1000000,128000],["gpt-5-6-luna-max-priority","GPT-5.6 Luna Max Thinking Fast",1000000,128000]]],
   ["gpt-6-1-sol","GPT-6.1 Sol",[],[["gpt-6-1-sol-low","GPT-6.1 Sol Low Thinking",1000000,128000],["gpt-6-1-sol-medium","GPT-6.1 Sol Medium Thinking",1000000,128000],["gpt-6-1-sol-high","GPT-6.1 Sol High Thinking",1000000,128000],["gpt-6-1-sol-xhigh","GPT-6.1 Sol XHigh Thinking",1000000,128000],["gpt-6-1-sol-max","GPT-6.1 Sol Max Thinking",1000000,128000],["gpt-6-1-sol-low-priority","GPT-6.1 Sol Low Thinking Fast",1000000,128000],["gpt-6-1-sol-medium-priority","GPT-6.1 Sol Medium Thinking Fast",1000000,128000],["gpt-6-1-sol-high-priority","GPT-6.1 Sol High Thinking Fast",1000000,128000],["gpt-6-1-sol-xhigh-priority","GPT-6.1 Sol XHigh Thinking Fast",1000000,128000],["gpt-6-1-sol-max-priority","GPT-6.1 Sol Max Thinking Fast",1000000,128000]]],
-  ["grok-4.5","Grok 4.5",[],[["grok-4-5-low","Grok 4.5 Low",500000,100000],["grok-4-5-medium","Grok 4.5 Medium",500000,100000],["grok-4-5-high","Grok 4.5 High",500000,100000]]],
+  ["gpt-6-1-terra","GPT-6.1 Terra",[],[["gpt-6-1-terra-low","GPT-6.1 Terra Low Thinking",1000000,128000],["gpt-6-1-terra-medium","GPT-6.1 Terra Medium Thinking",1000000,128000],["gpt-6-1-terra-high","GPT-6.1 Terra High Thinking",1000000,128000],["gpt-6-1-terra-xhigh","GPT-6.1 Terra XHigh Thinking",1000000,128000],["gpt-6-1-terra-max","GPT-6.1 Terra Max Thinking",1000000,128000],["gpt-6-1-terra-low-priority","GPT-6.1 Terra Low Thinking Fast",1000000,128000],["gpt-6-1-terra-medium-priority","GPT-6.1 Terra Medium Thinking Fast",1000000,128000],["gpt-6-1-terra-high-priority","GPT-6.1 Terra High Thinking Fast",1000000,128000],["gpt-6-1-terra-xhigh-priority","GPT-6.1 Terra XHigh Thinking Fast",1000000,128000],["gpt-6-1-terra-max-priority","GPT-6.1 Terra Max Thinking Fast",1000000,128000]]],
   ["grok-4-6","Grok 4.6",[],[["grok-4-6-low","Grok 4.6 Low",500000,100000],["grok-4-6-medium","Grok 4.6 Medium",500000,100000],["grok-4-6-high","Grok 4.6 High",500000,100000],["grok-4-6-xhigh","Grok 4.6 XHigh",500000,100000]]],
   ["grok-4-7","Grok 4.7",[],[["grok-4-7-low","Grok 4.7 Low",500000,100000],["grok-4-7-medium","Grok 4.7 Medium",500000,100000],["grok-4-7-high","Grok 4.7 High",500000,100000],["grok-4-7-xhigh","Grok 4.7 XHigh",500000,100000]]],
-  ["inkling","Inkling",[],[["inkling-none","Inkling None",1048576,131072],["inkling-low","Inkling Low",1048576,131072],["inkling-medium","Inkling Medium",1048576,131072],["inkling-high","Inkling High",1048576,131072],["inkling-xhigh","Inkling X-High",1048576,131072],["inkling-max","Inkling Max",1048576,131072]]],
-  ["glm-5-3-flash","GLM-5.3 Flash",[],[["glm-5-3-flash-low","GLM-5.3 Flash Low",1000000,128000],["glm-5-3-flash-high","GLM-5.3 Flash High",1000000,128000],["glm-5-3-flash-max","GLM-5.3 Flash Max",1000000,128000]]],
+  ["muse-wonder-1-0","Muse Wonder",[],[["muse-wonder-1-0-minimal","Muse Wonder Minimal",1048576,131072],["muse-wonder-1-0-low","Muse Wonder Low",1048576,131072],["muse-wonder-1-0-medium","Muse Wonder Medium",1048576,131072],["muse-wonder-1-0-high","Muse Wonder High",1048576,131072],["muse-wonder-1-0-xhigh","Muse Wonder XHigh",1048576,131072],["muse-wonder-1-0-max","Muse Wonder Max",1048576,131072]]],
+  ["nemotron-3-5-super","Nemotron 3.5 Super",[],[["nemotron-3-5-super-none","Nemotron 3.5 Super None",1048576,65536],["nemotron-3-5-super-medium","Nemotron 3.5 Super Medium",1048576,65536],["nemotron-3-5-super-high","Nemotron 3.5 Super High",1048576,65536]]],
+  ["glm-5-3-flash","GLM-5.3 Flash",[],[["glm-5-3-flash-low","GLM-5.3 Flash Low",1000000,131072],["glm-5-3-flash-high","GLM-5.3 Flash High",1000000,131072],["glm-5-3-flash-max","GLM-5.3 Flash Max",1000000,131072]]],
   ["deepseek-v4-flash","DeepSeek V4 Flash",[],[["deepseek-v4-flash-high","DeepSeek V4 Flash High",1048576,384000],["deepseek-v4-flash-max","DeepSeek V4 Flash Max",1048576,384000]]],
-  ["deepseek-v4-1-flash","DeepSeek V4.1 Flash",[],[["deepseek-v4-1-flash-high","DeepSeek V4.1 Flash High",1048576,384000],["deepseek-v4-1-flash-max","DeepSeek V4.1 Flash Max",1048576,384000]]],
+  ["deepseek-v4-1-flash-1017","DeepSeek V4.1 Flash",[],[["deepseek-v4-1-flash-1017-none","DeepSeek V4.1 Flash None",1048576,384000],["deepseek-v4-1-flash-1017-low","DeepSeek V4.1 Flash Low",1048576,384000],["deepseek-v4-1-flash-1017-high","DeepSeek V4.1 Flash High",1048576,384000],["deepseek-v4-1-flash-1017-max","DeepSeek V4.1 Flash Max",1048576,384000]]],
   ["swe-1.7","SWE-1.7",[],[["swe-1-7","SWE-1.7 Max",262000,128000],["swe-1-7-medium","SWE-1.7 Medium",262000,128000]]],
   ["claude-opus-4.6","Claude Opus 4.6",[],[["claude-opus-4-6","Claude Opus 4.6",200000,128000],["claude-opus-4-6-thinking","Claude Opus 4.6 Thinking",200000,128000],["claude-opus-4-6-1m","Claude Opus 4.6 1M",1000000,128000],["claude-opus-4-6-thinking-1m","Claude Opus 4.6 Thinking 1M",1000000,128000]]],
   ["gpt-5.4","GPT-5.4",[],[["gpt-5-4-none","GPT-5.4 No Thinking",272000,128000],["gpt-5-4-low","GPT-5.4 Low Thinking",272000,128000],["gpt-5-4-medium","GPT-5.4 Medium Thinking",272000,128000],["gpt-5-4-high","GPT-5.4 High Thinking",272000,128000],["gpt-5-4-xhigh","GPT-5.4 XHigh Thinking",272000,128000],["gpt-5-4-none-priority","GPT-5.4 No Thinking Fast",272000,128000],["gpt-5-4-low-priority","GPT-5.4 Low Thinking Fast",272000,128000],["gpt-5-4-medium-priority","GPT-5.4 Medium Thinking Fast",272000,128000],["gpt-5-4-high-priority","GPT-5.4 High Thinking Fast",272000,128000],["gpt-5-4-xhigh-priority","GPT-5.4 XHigh Thinking Fast",272000,128000]]],
   ["gpt-5.5","GPT-5.5",["gpt"],[["gpt-5-5-none","GPT-5.5 No Thinking",272000,128000],["gpt-5-5-low","GPT-5.5 Low Thinking",272000,128000],["gpt-5-5-medium","GPT-5.5 Medium Thinking",272000,128000],["gpt-5-5-high","GPT-5.5 High Thinking",272000,128000],["gpt-5-5-xhigh","GPT-5.5 XHigh Thinking",272000,128000],["gpt-5-5-none-priority","GPT-5.5 No Thinking Fast",272000,128000],["gpt-5-5-low-priority","GPT-5.5 Low Thinking Fast",272000,128000],["gpt-5-5-medium-priority","GPT-5.5 Medium Thinking Fast",272000,128000],["gpt-5-5-high-priority","GPT-5.5 High Thinking Fast",272000,128000],["gpt-5-5-xhigh-priority","GPT-5.5 XHigh Thinking Fast",272000,128000]]],
   ["gpt-5.4-mini","GPT-5.4 Mini",[],[["gpt-5-4-mini-low","GPT-5.4 Mini Low Thinking",400000,128000],["gpt-5-4-mini-medium","GPT-5.4 Mini Medium Thinking",400000,128000],["gpt-5-4-mini-high","GPT-5.4 Mini High Thinking",400000,128000],["gpt-5-4-mini-xhigh","GPT-5.4 Mini XHigh Thinking",400000,128000]]],
   ["claude-sonnet-4.6","Claude Sonnet 4.6",[],[["claude-sonnet-4-6","Claude Sonnet 4.6",200000,128000],["claude-sonnet-4-6-thinking","Claude Sonnet 4.6 Thinking",200000,128000],["claude-sonnet-4-6-1m","Claude Sonnet 4.6 1M",1000000,128000],["claude-sonnet-4-6-thinking-1m","Claude Sonnet 4.6 Thinking 1M",1000000,128000]]],
+  ["kimi-k2.6","Kimi K2.6",[],[["kimi-k2-6","Kimi K2.6",262144,8192]]],
+  ["kimi-k2.7","Kimi K2.7",[],[["kimi-k2-7","Kimi K2.7",262144,16000]]],
+  ["nemotron-3-ultra","Nemotron 3 Ultra",[],[["nemotron-3-ultra-none","Nemotron 3 Ultra None",1000000,32768],["nemotron-3-ultra-medium","Nemotron 3 Ultra Medium",1000000,32768],["nemotron-3-ultra-high","Nemotron 3 Ultra High",1000000,32768]]],
+  ["swe-1.6","SWE-1.6",[],[["swe-1-6","SWE-1.6",200000,128000]]],
+  ["deepseek-v4-pro","DeepSeek V4 Pro",[],[["deepseek-v4-pro-high","DeepSeek V4 Pro High",1048576,384000],["deepseek-v4-pro-max","DeepSeek V4 Pro Max",1048576,384000]]],
+  ["swe-1.7-lightning","SWE-1.7 Lightning",[],[["swe-1-7-lightning","SWE-1.7 Lightning Max",202752,96000],["swe-1-7-lightning-medium","SWE-1.7 Lightning Medium",202752,96000]]],
+  ["inkling","Inkling",[],[["inkling-none","Inkling None",1048576,131072],["inkling-low","Inkling Low",1048576,131072],["inkling-medium","Inkling Medium",1048576,131072],["inkling-high","Inkling High",1048576,131072],["inkling-xhigh","Inkling X-High",1048576,131072],["inkling-max","Inkling Max",1048576,131072]]],
+  ["grok-4.5","Grok 4.5",[],[["grok-4-5-low","Grok 4.5 Low",500000,100000],["grok-4-5-medium","Grok 4.5 Medium",500000,100000],["grok-4-5-high","Grok 4.5 High",500000,100000]]],
   ["gpt-5.2","GPT-5.2",[],[["MODEL_GPT_5_2_LOW","GPT-5.2 Low Thinking",384000,128000],["MODEL_GPT_5_2_MEDIUM","GPT-5.2 Medium Thinking",384000,128000],["MODEL_GPT_5_2_NONE","GPT-5.2 No Thinking",384000,128000],["MODEL_GPT_5_2_HIGH","GPT-5.2 High Thinking",384000,128000],["MODEL_GPT_5_2_XHIGH","GPT-5.2 XHigh Thinking",384000,128000]]],
   ["claude-opus-4.5","Claude Opus 4.5",[],[["MODEL_CLAUDE_4_5_OPUS","Claude Opus 4.5",200000,64000],["MODEL_CLAUDE_4_5_OPUS_THINKING","Claude Opus 4.5 Thinking",200000,64000]]],
   ["Claude Haiku 4.5","Claude Haiku 4.5",[],[["MODEL_PRIVATE_11","Claude Haiku 4.5",200000,64000]]],
@@ -95,14 +104,9 @@ const SNAPSHOT = [
   ["GPT-4.1","GPT-4.1",[],[["MODEL_CHAT_GPT_4_1_2025_04_14","GPT-4.1",1047576,32768]]],
   ["gpt-5.1","GPT-5.1",[],[["MODEL_PRIVATE_12","GPT-5.1 No Thinking",272000,128000],["MODEL_PRIVATE_13","GPT-5.1 Low Thinking",272000,128000],["MODEL_PRIVATE_14","GPT-5.1 Medium Thinking",272000,128000],["MODEL_PRIVATE_15","GPT-5.1 High Thinking",272000,128000]]],
   ["gpt-5.3-codex","GPT-5.3-Codex",["codex"],[["gpt-5-3-codex-low","GPT-5.3-Codex Low",400000,128000],["gpt-5-3-codex-medium","GPT-5.3-Codex Medium",400000,128000],["gpt-5-3-codex-high","GPT-5.3-Codex High",400000,128000],["gpt-5-3-codex-xhigh","GPT-5.3-Codex X-High",400000,128000],["gpt-5-3-codex-low-priority","GPT-5.3-Codex Low Fast",400000,128000],["gpt-5-3-codex-medium-priority","GPT-5.3-Codex Medium Fast",400000,128000],["gpt-5-3-codex-high-priority","GPT-5.3-Codex High Fast",400000,128000],["gpt-5-3-codex-xhigh-priority","GPT-5.3-Codex XHigh Fast",400000,128000]]],
-  ["kimi-k2.6","Kimi K2.6",[],[["kimi-k2-6","Kimi K2.6",262144,8192]]],
-  ["kimi-k2.7","Kimi K2.7",[],[["kimi-k2-7","Kimi K2.7",262144,16000]]],
-  ["nemotron-3-ultra","Nemotron 3 Ultra",[],[["nemotron-3-ultra-none","Nemotron 3 Ultra None",1000000,32768],["nemotron-3-ultra-medium","Nemotron 3 Ultra Medium",1000000,32768],["nemotron-3-ultra-high","Nemotron 3 Ultra High",1000000,32768]]],
-  ["swe-1.6","SWE-1.6",[],[["swe-1-6","SWE-1.6",200000,128000]]],
   ["swe-1.6-fast","SWE-1.6 Fast",[],[["swe-1-6-fast","SWE-1.6 Fast",200000,128000]]],
   ["gemini-3.1-pro","Gemini 3.1 Pro",[],[["gemini-3-1-pro-low","Gemini 3.1 Pro Low Thinking",1048576,65535],["gemini-3-1-pro-high","Gemini 3.1 Pro High Thinking",1048576,65535]]],
   ["gemini-3.0-flash","Gemini 3 Flash",[],[["MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL","Gemini 3 Flash Minimal",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_LOW","Gemini 3 Flash Low",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_MEDIUM","Gemini 3 Flash Medium",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH","Gemini 3 Flash High",1048576,65535]]],
-  ["deepseek-v4-pro","DeepSeek V4 Pro",[],[["deepseek-v4-pro-high","DeepSeek V4 Pro High",1048576,384000],["deepseek-v4-pro-max","DeepSeek V4 Pro Max",1048576,384000]]],
 ]
 
 const familiesOf = (rows) => rows.map(([uid, label, aliases, vs]) => ({ uid, label, aliases, models: vs.map(([id, name, context, output]) => ({ id, name, context, output })) }))
@@ -334,7 +338,7 @@ function familyImages(f, images) {
 // magpie's built-in asks it (devin_images.go): `devin models list` says
 // nothing of images and models.dev doesn't know Devin's own ids, so swe-2
 // was said to take none and agents dropped its images (面条 on magpie's
-// Discord). NO_IMAGES are the ids Devin said take none, as of 2026-10-05;
+// Discord). NO_IMAGES are the ids Devin said take none, as of 2026-11-05;
 // every other id in SNAPSHOT takes them, which is what a list is told
 // before Devin is asked, or when it can't be.
 const NO_IMAGES = new Set([
@@ -343,6 +347,7 @@ const NO_IMAGES = new Set([
   "inkling-none", "inkling-low", "inkling-medium", "inkling-high", "inkling-xhigh", "inkling-max",
   "deepseek-v4-flash-high", "deepseek-v4-flash-max", "deepseek-v4-pro-high", "deepseek-v4-pro-max",
   "nemotron-3-ultra-none", "nemotron-3-ultra-medium", "nemotron-3-ultra-high",
+  "swe-2-flash-medium", "swe-2-flash-high", "swe-2-flash-max",
 ])
 const SNAPSHOT_IMAGES = Object.fromEntries(SNAPSHOT.flatMap(([, , , vs]) => vs.map(([id]) => [id, !NO_IMAGES.has(id)])))
 
@@ -600,6 +605,12 @@ function runtimeModel(m) {
 
 // withImages is a list of models with what entries (listed's) say of their
 // images on them; a model they say nothing of is left as it was.
+// fellBack marks a list that isn't the account's own (magpie's plugin
+// host reads Symbol.for("magpie.fellBack"))
+function fellBack(models) {
+  return Object.assign(models, { [Symbol.for("magpie.fellBack")]: true })
+}
+
 function withImages(models, entries) {
   const by = new Map(entries.map((m) => [m.id, m.image]))
   return Object.fromEntries(
@@ -923,17 +934,23 @@ async function exchange(code, verifier, redirect) {
   return { key, webapp: r.devinWebappHost, api: r.devinApiUrl }
 }
 
+// unknownAccount names a credential without revealing it. The same key on
+// the same server keeps its slot, while two unreadable accounts don't both
+// become "Devin" and replace each other in magpie (#931).
+const unknownAccount = (key, server) =>
+  `Devin · ${createHash("sha256").update(server || SERVER).update("\0").update(key).digest("hex").slice(0, 12)}`
+
 // success names a key's account as Devin does when asked with the key
 // (GetUserStatus), or, when Devin can't tell, as the CLI does in a data
 // folder of the plugin's own: never by the CLI alone, which on Windows
 // names its own account whatever key it is given (#17). A key Devin or the
 // CLI says nobody is signed in with fails it; with neither able to tell,
-// the account is just "Devin".
+// a stable fingerprint keeps that credential apart from another (#931).
 async function success(key, server) {
   let who = await whoByKey(key, server)
   if (who === undefined) who = await identity(await homeFor(key, server))
   if (who === null) throw new Error("Devin didn't take the sign-in: nobody is signed in with the token it gave")
-  const metadata = { email: who?.user || "Devin" }
+  const metadata = { email: who?.user || unknownAccount(key, server) }
   if (who?.plan) metadata.plan = who.plan
   const orgId = who?.orgId || who?.teamId
   if (orgId) metadata.orgId = orgId
@@ -1146,6 +1163,55 @@ function frame(msg) {
   return out
 }
 
+// QUIET is how long Devin may send nothing (no reply head, no byte of a
+// reply) before the request is given up as stalled and answered 504, so
+// the agent or the gateway's next account sends it again. Devin, asked and
+// answering, sends frames all through a reply, thinking included: a real
+// GetChatMessage on Claude Opus 5.5 Max and GPT-6 Astra XHigh (11-16) went
+// at most 13s between frames, and its first came 2.5s after the request.
+// A request Devin took and never answered held the agent with keepalives
+// and nothing else, for 10 to 20 minutes, until the user changed the
+// effort or the conversation (wu_chong4136 on X). Only the wait on Devin
+// counts: a reader that is slow to take the next frame is not Devin's.
+let QUIET = 5 * 60_000
+
+// Quiet is the error a request Devin stopped answering ends with.
+class Quiet extends Error {
+  constructor() {
+    super(`Devin sent nothing for ${QUIET >= 60_000 && QUIET % 60_000 === 0 ? QUIET / 60_000 + " minutes" : QUIET + "ms"}; the request was given up so it can be sent again`)
+    this.status = 504
+  }
+}
+
+// quietFetch is fetch with the reply's head waited on for QUIET at most.
+async function quietFetch(url, init = {}) {
+  const ac = new AbortController()
+  const t = setTimeout(() => ac.abort(new Quiet()), QUIET)
+  try {
+    return await fetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, ac.signal]) : ac.signal })
+  } catch (e) {
+    if (ac.signal.aborted && !init.signal?.aborted) throw ac.signal.reason
+    throw e
+  } finally {
+    clearTimeout(t)
+  }
+}
+
+// quietRead is reader.read(), given up (and the body cancelled) when
+// nothing comes for QUIET.
+async function quietRead(reader) {
+  let t
+  const quiet = new Promise((_, reject) => (t = setTimeout(() => reject(new Quiet()), QUIET)))
+  try {
+    return await Promise.race([reader.read(), quiet])
+  } catch (e) {
+    if (e instanceof Quiet) reader.cancel(e).catch(() => {})
+    throw e
+  } finally {
+    clearTimeout(t)
+  }
+}
+
 // frames reads a Connect stream: each message, or its end with its JSON.
 async function* frames(body) {
   let buf = new Uint8Array(0)
@@ -1162,7 +1228,7 @@ async function* frames(body) {
         if (flags & 1) data = new Uint8Array(gunzipSync(data))
         yield { end: !!(flags & 2), data }
       }
-      const { value, done } = await reader.read()
+      const { value, done } = await quietRead(reader)
       if (done) {
         if (buf.length) throw new Error("unexpected EOF")
         return
@@ -1173,7 +1239,9 @@ async function* frames(body) {
       buf = next
     }
   } finally {
-    reader.releaseLock()
+    try {
+      reader.releaseLock()
+    } catch {}
   }
 }
 
@@ -1200,12 +1268,20 @@ function joinSplitCalls(msgs) {
     const prev = out.at(-1)
     if (m?.role === "assistant" && prev?.role === "assistant" && prev.tool_calls?.length) {
       const content = [textOf(prev.content), textOf(m.content)].filter(Boolean).join("\n\n")
-      out[out.length - 1] = { ...prev, content, tool_calls: [...prev.tool_calls, ...(m.tool_calls ?? [])] }
+      const reasoning = [reasoningOf(prev), reasoningOf(m)].filter(Boolean).join("\n\n")
+      out[out.length - 1] = { ...prev, content, tool_calls: [...prev.tool_calls, ...(m.tool_calls ?? [])], ...(reasoning ? { reasoning_content: reasoning } : {}) }
       continue
     }
     out.push(m)
   }
   return out
+}
+
+// reasoningOf is an assistant message's reasoning as a chat completion
+// carries it: reasoning_content, or reasoning as some clients name it.
+function reasoningOf(m) {
+  for (const v of [m?.reasoning_content, m?.reasoning]) if (typeof v === "string" && v) return v
+  return ""
 }
 
 // effortOf is the effort a request names, as magpie reads it.
@@ -1439,7 +1515,22 @@ function inlineImage(p) {
   if (p?.type !== "image_url") return null
   const u = typeof p.image_url === "string" ? p.image_url : p.image_url?.url ?? ""
   const d = /^data:([^,]*),(.*)$/s.exec(u)
-  return d && d[2] ? { data: d[2], type: d[1].replace(/;base64$/, "") || "image/png" } : null
+  return d && d[2] ? { data: d[2], type: imageType(d[2], d[1].replace(/;base64$/, "") || "image/png") } : null
+}
+
+// imageType is the type an image's bytes (base64) are, by their first
+// bytes, else the type it was said to be. Devin answers "There is an issue
+// with this request, please try a different model" (invalid_argument) to
+// a PNG said to be a JPEG or a WebP, on every Claude model, and the
+// picture stays in the conversation, so every turn after fails the same:
+// a tool that names a screenshot by its file's extension is enough.
+function imageType(data, said) {
+  const b = Buffer.from(String(data).slice(0, 24), "base64")
+  if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png"
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg"
+  if (b.length >= 6 && b.toString("latin1", 0, 4) === "GIF8") return "image/gif"
+  if (b.length >= 12 && b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP") return "image/webp"
+  return said
 }
 
 // A chat's tool message holds text alone, so magpie's gateway (buildChat's
@@ -1460,7 +1551,8 @@ function noted(text) {
 
 // build is the GetChatMessage request for a chat completion, to the model
 // uid.
-function build(chat, uid, key) {
+function build(chat, uid, key, opts = {}) {
+  const claude = isClaude(uid)
   const msgs = []
   let pending = [] // calls the last reply made, not yet answered
   const answer = () => {
@@ -1497,7 +1589,17 @@ function build(chat, uid, key) {
       const text = typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter((p) => p?.type === "text" && p.text).map((p) => p.text).join("\n\n") : ""
       if (!text && !calls.length) continue // a turn that only thought, or failed
       answer()
-      msgs.push({ role: ASSISTANT, text, calls })
+      // the reply's reasoning goes back as its thinking (11), unsigned, to
+      // a model that isn't Claude: swe-2 stops thinking on a tool loop's
+      // later turns when the turns before carry none (plugins#703). A chat
+      // completion has no field for a signature, and Claude's thinking
+      // goes back only signed (plugins#665), so Claude gets none, as before.
+      const reasoning = claude ? "" : reasoningOf(m)
+      // a Gemini reply goes back with its thought signature, as the
+      // devin CLI sends it (thoughts)
+      const signed = opts.unsigned ? null : thoughtFor(uid, calls, text)
+      const thinking = signed ? { text: reasoning, ...signed } : reasoning ? { text: reasoning } : null
+      msgs.push({ role: ASSISTANT, text, calls, ...(thinking ? { thinking } : {}) })
       // a copy: answering a call takes it off pending, never off the
       // reply that made it, which goes to Devin with every call it made
       pending = [...calls]
@@ -1540,7 +1642,9 @@ function build(chat, uid, key) {
       }
     }
     settleResults()
-    const text = texts.join("\n\n")
+    // words that are only white space are none: Devin turns a user prompt
+    // of them away (invalid_argument), as it does an empty one
+    const text = texts.join("\n\n").trim() ? texts.join("\n\n") : ""
     if (!text && !images.length) continue
     answer()
     msgs.push({ role: USER, text, images })
@@ -1614,7 +1718,30 @@ function encodeRequest(msgs, tools, chat, uid, key) {
   }
   const bytes = assemble([], chat.max || 128000) // the server holds max to the model's own
   pingOf.set(bytes, () => assemble([encodeMsg({ role: USER, text: "continue" })], 1))
+  sentOf.set(bytes, { signed: msgs.some((m) => m.thinking?.signature), tokens: estimate(msgs, toolParts) })
   return bytes
+}
+
+// sentOf is what each request carried that its failure is read by: any
+// signed thinking, and about how many tokens its prompt is (estimate)
+const sentOf = new WeakMap()
+
+// estimate is about how many tokens msgs and the tools offered come to,
+// a token counted as four bytes of text and an image as 1,600 tokens (a
+// picture's base64 is no measure of its tokens): text runs under four
+// bytes a token, code nearer three (Devin counted 991,278 tokens of
+// 2,350,000 bytes of Go), so this is low, never high, and it is read
+// against half the window (TOO_LONG_AT).
+function estimate(msgs, toolParts) {
+  let bytes = 0
+  let images = 0
+  for (const m of msgs) {
+    bytes += Buffer.byteLength(m.text ?? "") + Buffer.byteLength(m.thinking?.text ?? "")
+    for (const c of m.calls ?? []) bytes += Buffer.byteLength(c.name ?? "") + Buffer.byteLength(c.args ?? "")
+    images += m.images?.length ?? 0
+  }
+  for (const t of toolParts) bytes += t.length
+  return Math.ceil(bytes / 4) + images * 1600
 }
 
 // pingOf is each request's keepalive ping, made when one is first sent
@@ -1630,7 +1757,63 @@ function encodeMsg(m) {
   // own: where the client put cache_control (#566)
   if (m.cache) b.bytes(8, new PB().varint(1, 1))
   for (const p of m.images ?? []) b.bytes(10, new PB().str(1, p.data).str(2, p.type))
+  // the thinking the reply had, sent back as Devin wrote it: thinking
+  // (11), and Claude's signature (12) and signature_type (18) when it was
+  // signed (plugins#665). Another model's thinking has no signature and
+  // goes back as its text alone (plugins#703); which thinking reaches
+  // here is the builders' to say.
+  if (m.thinking?.text) b.str(11, m.thinking.text)
+  if (m.thinking?.signature) {
+    b.str(12, m.thinking.signature)
+    if (m.thinking.type) b.str(18, m.thinking.type)
+    if (m.thinking.model) b.str(22, m.thinking.model)
+  }
   return b.done()
+}
+
+// sigTypes is each thinking signature's type (delta_signature_type) as
+// Devin said it, by the signature, for the next request's thinking: a
+// Messages thinking block has no field for it. The most recent are kept;
+// one not kept is Anthropic's, which is what Devin says for Claude's.
+const sigTypes = new Map()
+const SIG_TYPES_KEPT = 512
+function rememberSigType(signature, type) {
+  if (!signature || !type) return
+  sigTypes.delete(signature)
+  sigTypes.set(signature, type)
+  if (sigTypes.size > SIG_TYPES_KEPT) sigTypes.delete(sigTypes.keys().next().value)
+}
+const sigTypeOf = (signature) => sigTypes.get(signature) ?? "anthropic"
+
+// thoughts is each Gemini reply's thought signature, by the reply's tool
+// call ids (or, for a reply that made none, its text), for the request
+// that sends the reply back. The devin CLI sends a Gemini reply back with
+// its signature (12), its type "gemini" (18) and the model that wrote it
+// (22); without them Devin's Gemini models, deep in a tool loop, answer
+// with usage and nothing else (X, gemini-4-hydrogen in dsh). Neither a
+// chat completion nor a Messages tool_use has a field for it, so it is
+// kept here, as sigTypes are; the most recent are kept.
+const thoughts = new Map()
+const THOUGHTS_KEPT = 4096
+const isGemini = (uid) => /gemini/i.test(String(uid ?? ""))
+const textKey = (text) => "text:" + createHash("sha256").update(String(text).replace(/\s+/g, "")).digest("base64url")
+function rememberThought({ calls, text }, thought) {
+  const keys = calls.length ? calls : text ? [textKey(text)] : []
+  for (const k of keys) {
+    thoughts.delete(k)
+    thoughts.set(k, thought)
+    if (thoughts.size > THOUGHTS_KEPT) thoughts.delete(thoughts.keys().next().value)
+  }
+}
+// thoughtFor is the signature kept for a reply sent back with these calls
+// (Devin's ids) and text, to a Gemini model; null for none.
+function thoughtFor(uid, calls, text) {
+  if (!isGemini(uid)) return null
+  for (const c of calls) {
+    const t = thoughts.get(c.id)
+    if (t) return t
+  }
+  return (!calls.length && text && thoughts.get(textKey(text))) || null
 }
 
 // ---- the reply -----------------------------------------------------------------------
@@ -1660,7 +1843,7 @@ function failure(status, text) {
   if (low.includes("content policy")) return { status: 400, message: msg }
   if (low.includes("too long") || low.includes("context length") || low.includes("too many tokens"))
     return { status: 400, message: "input is too long for the model's context: " + msg }
-  if (code === "invalid_argument") return { status: 400, message: msg }
+  if (code === "invalid_argument") return { status: 400, message: msg, code }
   if (code === "unavailable") return { status: 503, message: msg }
   if (code) return { status: 502, message: msg }
   return { status, message: msg }
@@ -1669,17 +1852,19 @@ function failure(status, text) {
 // events turns the reply's frames into chat completion pieces: text,
 // reasoning, each tool call opened with its id and name, its arguments in
 // pieces after, then the finish with the usage.
-async function* events(it) {
+async function* events(it, uid = "") {
   let tools = -1
   let stop = 0
   let said = 0
+  // a Gemini reply's thought signature, to go back with it (thoughts)
+  const own = { calls: [], text: "", signature: "", type: "" }
   const usage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 }
   for (;;) {
     let r
     try {
       r = await it.next()
     } catch (e) {
-      yield { error: { status: 502, message: "the reply broke off: " + e.message } }
+      yield { error: { status: e instanceof Quiet ? 504 : 502, message: "the reply broke off: " + e.message } }
       return
     }
     if (r.done) break
@@ -1695,10 +1880,23 @@ async function* events(it) {
     for (const x of fields(f.data)) {
       if (x.num === 3 && x.wire === 2 && x.data.length) {
         said += x.data.length
-        yield { text: dec.decode(x.data) }
+        const text = dec.decode(x.data)
+        own.text += text
+        yield { text }
       } else if (x.num === 9 && x.wire === 2 && x.data.length) {
         said += x.data.length
         yield { reasoning: dec.decode(x.data) }
+      } else if (x.num === 10 && x.wire === 2 && x.data.length) {
+        // delta_signature: the thinking's signature, Claude's opaque state
+        // to continue it from (plugins#665); no words of the reply
+        const signature = dec.decode(x.data)
+        own.signature += signature
+        yield { signature }
+      } else if (x.num === 21 && x.wire === 2 && x.data.length) {
+        // delta_signature_type: whose signature it is ("anthropic")
+        const signatureType = dec.decode(x.data)
+        own.type = signatureType
+        yield { signatureType }
       } else if (x.num === 6 && x.wire === 2) {
         let id = ""
         let name = ""
@@ -1710,7 +1908,9 @@ async function* events(it) {
         }
         if (name) {
           tools++
-          yield { tool: { index: tools, id: id ? outID(id) : "call_" + randomBytes(12).toString("hex"), name } }
+          const tool = { index: tools, id: id ? outID(id) : "call_" + randomBytes(12).toString("hex"), name }
+          own.calls.push(inID(tool.id))
+          yield { tool }
         }
         if (args && tools >= 0) yield { args: { index: tools, text: args } }
       } else if (x.num === 5 && x.wire === 0) stop = x.n
@@ -1729,6 +1929,8 @@ async function* events(it) {
     yield { error: { status: 502, message: "an empty reply (Devin returned no text, reasoning or tool call)" } }
     return
   }
+  if (own.signature && isGemini(uid) && (own.type || "gemini") === "gemini")
+    rememberThought(own, { signature: own.signature, type: own.type || "gemini", model: uid })
   if (!usage.output) usage.output = Math.floor((said + 3) / 4)
   const prompt = usage.input + usage.cacheRead + usage.cacheWrite
   yield {
@@ -1769,23 +1971,47 @@ const rpcHeaders = (key, body) => ({ "Content-Type": "application/connect+proto"
 
 // keep, when given, is the conversation's cache keepalive (keepaliveFor):
 // once the reply has finished, its pings are scheduled.
+//
+// Devin answers "There is an issue with this request, please try a
+// different model" (invalid_argument) to a conversation past the model's
+// window and to a thinking signature it didn't give (another vendor's
+// Claude, or one a client changed), alike. Either stays in the
+// conversation, so every turn after fails the same while a new session
+// works (a1pha1nthefog on X). A request with signed thinking that is
+// turned away is sent again once with no signature, its Claude thinking
+// left out, as Anthropic takes a past turn's; one still turned away at
+// half the model's window or more (TOO_LONG_AT) is told as too long, so
+// the agent compacts the conversation rather than stopping.
 async function roundtrip({ key, server, families, keep }, chat, signal, wire = CHAT_WIRE) {
   const uid = variantFor(families, chat.model, wire.effort(chat))
-  const msg = wire.build(chat, uid, key)
+  let msg = wire.build(chat, uid, key)
+  let r = await askOnce(key, server, msg, signal, uid)
+  if (r.code === "invalid_argument" && sentOf.get(msg)?.signed && !signal?.aborted) {
+    msg = wire.build(chat, uid, key, { unsigned: true })
+    r = await askOnce(key, server, msg, signal, uid)
+  }
+  if (r.code === "invalid_argument") r = tooLongFor(r, sentOf.get(msg)?.tokens ?? 0, windowOf(families, uid), uid)
+  if (!r.it) return r
+  return { it: keep ? keptAfter(r.it, keep, { key, server, msg, sentAt: r.sentAt }) : r.it, uid }
+}
+
+// askOnce sends one GetChatMessage, msg, and answers with its event iterator
+// and when it was sent, or an error ({status, message, code}).
+async function askOnce(key, server, msg, signal, uid) {
   const body = frame(msg)
   // when Devin was asked, which its cache's 5 minutes run from: the pings
   // are timed from it, not from the reply's end (plugins#626)
   const sentAt = now()
   let res
   try {
-    res = await fetch(server + CHAT_RPC, {
+    res = await quietFetch(server + CHAT_RPC, {
       method: "POST",
       headers: rpcHeaders(key, body),
       body,
       signal,
     })
   } catch (e) {
-    return { status: 502, message: e.message }
+    return { status: e instanceof Quiet ? 504 : 502, message: e.message }
   }
   if (!res.ok) return failure(res.status, (await res.text()).slice(0, 1 << 20))
   // an error comes as the stream's end, before anything else: read that
@@ -1795,7 +2021,7 @@ async function roundtrip({ key, server, families, keep }, chat, signal, wire = C
   try {
     first = await fr.next()
   } catch (e) {
-    return { status: 502, message: "the reply broke off: " + e.message }
+    return { status: e instanceof Quiet ? 504 : 502, message: "the reply broke off: " + e.message }
   }
   if (first.done) return { status: 502, message: "the reply broke off: EOF" }
   if (first.value.end) {
@@ -1803,15 +2029,33 @@ async function roundtrip({ key, server, families, keep }, chat, signal, wire = C
     return e.status < 300 ? { status: 502, message: "an empty reply" } : e
   }
   // 先等到实际内容或错误，才能让网关在空回复时切换渠道。
-  const source = events(prepend(first.value, fr))
+  const source = events(prepend(first.value, fr), uid)
   const head = await source.next()
   if (head.done) return { status: 502, message: "an empty reply" }
   if (head.value.error) {
     await fr.return?.()
     return head.value.error
   }
-  const it = prepend(head.value, source)
-  return { it: keep ? keptAfter(it, keep, { key, server, msg, sentAt }) : it }
+  return { it: prepend(head.value, source), sentAt }
+}
+
+// TOO_LONG_AT is how much of a model's window a request Devin turns away
+// (invalid_argument) must be estimated at to be told as too long: the
+// estimate runs low (estimate), and Devin says nothing of length.
+const TOO_LONG_AT = 0.5
+
+// tooLongFor is e, a request turned away, as too long for the model's
+// window when it was estimated at TOO_LONG_AT of it or more; e otherwise.
+function tooLongFor(e, tokens, window, uid) {
+  if (!window || tokens < window * TOO_LONG_AT) return e
+  return { status: 400, message: `input is too long for the model's context: about ${tokens} tokens or more, for ${uid}'s window of ${window} (Devin answered: ${e.message})` }
+}
+
+// windowOf is the context window of the model uid, from the account's
+// list or else the snapshot's; 0 when neither says.
+function windowOf(families, uid) {
+  for (const fs of [families, SNAPSHOT_FAMILIES]) for (const f of fs ?? []) for (const m of f.models ?? []) if (m.id === uid && m.context) return m.context
+  return 0
 }
 
 // complete answers a chat completion through GetChatMessage.
@@ -1850,7 +2094,11 @@ async function complete({ key, server, families, keep }, chat, signal) {
         began = true
         ctl.enqueue(chunk({ role: "assistant", content: "" }))
       }
-      const r = await it.next()
+      // a pull that sends nothing isn't pulled again: what a chat
+      // completion has no field for (a thinking signature) is passed over
+      let r
+      do r = await it.next()
+      while (!r.done && (r.value.signature || r.value.signatureType))
       if (r.done) {
         ctl.enqueue(enc.encode("data: [DONE]\n\n"))
         return ctl.close()
@@ -1888,7 +2136,7 @@ const marked = (b) => !!(b && typeof b === "object" && b.cache_control && typeof
 function anthropicImage(b) {
   const s = b?.type === "image" ? b.source : null
   if (s?.type !== "base64" || !s.data) return null
-  return { data: s.data, type: s.media_type || "image/png" }
+  return { data: s.data, type: imageType(s.data, s.media_type || "image/png") }
 }
 
 // anthropicEffort is the effort a Messages request asks for, as magpie
@@ -1911,7 +2159,8 @@ function anthropicEffort(req) {
 // (#566). Every boundary is kept, not only the marked ones: a mark moves
 // forward as the history grows, and the prompts it passed must stay as
 // they were sent for the cache to be read (yetone/magpie#3835).
-function buildMessages(req, uid, key) {
+function buildMessages(req, uid, key, opts = {}) {
+  const claude = isClaude(uid)
   // Messages alternate roles; a client that sends two of one role in a row
   // means one turn
   const turns = []
@@ -1939,20 +2188,48 @@ function buildMessages(req, uid, key) {
       const own = []
       const calls = []
       let mark = false // a tool_use the client marked: the prompt with the calls ends there
-      for (const b of t.blocks) {
+      // a thinking block, for the prompt that follows it: Claude's thinking
+      // goes back with its signature, which Anthropic wants on a tool
+      // loop's next turn (plugins#665), and unsigned thinking to Claude
+      // goes no further, as before. Another model's thinking goes back as
+      // its text alone, never with a signature (plugins#703).
+      let thought = null
+      const take = (p) => {
+        if (thought) [p.thinking, thought] = [thought, null]
+        return p
+      }
+      for (const [i, b] of t.blocks.entries()) {
         if (b?.type === "text" && typeof b.text === "string") {
-          if (b.text) own.push({ role: ASSISTANT, text: b.text, calls: [], cache: marked(b) })
+          if (b.text) own.push(take({ role: ASSISTANT, text: b.text, calls: [], cache: marked(b) }))
           else if (marked(b) && own.length) own[own.length - 1].cache = true
         } else if (b?.type === "tool_use" && b.name) {
           calls.push({ id: inID(b.id), name: b.name, args: JSON.stringify(b.input ?? {}) })
           mark ||= marked(b)
+        } else if (b?.type === "thinking" && claude && !opts.unsigned && typeof b.signature === "string" && b.signature) {
+          // Devin rejects a signed thought on an otherwise empty assistant prompt.
+          // A gateway search can leave adjacent thoughts; keep the last one intact.
+          const next = t.blocks[i + 1]
+          if (next?.type === "thinking" && typeof next.signature === "string" && next.signature) continue
+          if (thought) own.push(take({ role: ASSISTANT, text: "", calls: [] }))
+          thought = { text: typeof b.thinking === "string" ? b.thinking : "", signature: b.signature, type: sigTypeOf(b.signature) }
+        } else if (b?.type === "thinking" && !claude && typeof b.thinking === "string" && b.thinking) {
+          if (thought) own.push(take({ role: ASSISTANT, text: "", calls: [] }))
+          thought = { text: b.thinking }
         }
-        // thinking goes no further: Devin keeps none of a reply's
       }
       if (calls.length) {
-        if (!own.length) own.push({ role: ASSISTANT, text: "", calls: [] })
+        if (!own.length || (thought && own[own.length - 1].thinking)) own.push({ role: ASSISTANT, text: "", calls: [] })
+        take(own[own.length - 1])
         own[own.length - 1].calls = calls
         own[own.length - 1].cache ||= mark
+      } else if (thought && own.length && !own[own.length - 1].thinking) take(own[own.length - 1])
+      // a Gemini reply goes back with its thought signature, on the
+      // prompt with its calls (or its last words), as the devin CLI sends
+      // it (thoughts)
+      const signed = own.length && !opts.unsigned ? thoughtFor(uid, calls, own.map((p) => p.text).join("")) : null
+      if (signed) {
+        const p = own[own.length - 1]
+        p.thinking = { text: p.thinking?.text ?? "", ...signed }
       }
       if (!own.length) continue // a turn that only thought
       answer()
@@ -1979,7 +2256,9 @@ function buildMessages(req, uid, key) {
         continue
       }
       if (b?.type === "text" && typeof b.text === "string") {
-        if (!b.text) {
+        // a block of white space alone is none: Devin turns a user prompt
+        // of it away (invalid_argument), as it does an empty one
+        if (!b.text.trim()) {
           if (marked(b) && words) words.cache = true
           continue
         }
@@ -2057,6 +2336,9 @@ async function completeMessages({ key, server, families, keep }, req, signal) {
   if (!rt.it) return anthropicError(rt)
   const it = rt.it
   const id = "msg_" + randomBytes(12).toString("hex")
+  // a signature is sent on for Claude's thinking only: another model's
+  // thinking stays unsigned, as before, so no path sends it on as Claude's
+  const claude = isClaude(rt.uid)
 
   if (!req.stream) {
     const content = []
@@ -2070,10 +2352,17 @@ async function completeMessages({ key, server, families, keep }, req, signal) {
       return n
     }
     const args = []
+    let sigType = ""
     for await (const e of it) {
       if (e.error) return anthropicError(e.error)
       if (e.text) block("text").text += e.text
       if (e.reasoning) block("thinking").thinking += e.reasoning
+      // the signature goes on the thinking it signs, the last one
+      if (e.signature && claude) {
+        const t = content.findLast((b) => b.type === "thinking")
+        if (t) t.signature += e.signature
+      }
+      if (e.signatureType) sigType = e.signatureType
       if (e.tool) {
         args[e.tool.index] = ""
         content.push({ type: "tool_use", id: e.tool.id, name: e.tool.name, input: {}, index: e.tool.index })
@@ -2090,6 +2379,7 @@ async function completeMessages({ key, server, families, keep }, req, signal) {
       }
       delete b.index
     }
+    for (const b of content) if (b.type === "thinking") rememberSigType(b.signature, sigType)
     return Response.json({ id, type: "message", role: "assistant", model: req.model, content, stop_reason: stop, stop_sequence: null, usage }, { headers: { "X-Magpie-Sign-In": "kept" } })
   }
 
@@ -2097,6 +2387,8 @@ async function completeMessages({ key, server, families, keep }, req, signal) {
   let began = false
   let index = -1
   let open = "" // the kind of the block being sent: text, thinking or tool_use
+  let sig = "" // the signature of the thinking block last sent
+  let sigType = ""
   const stream = new ReadableStream({
     async pull(ctl) {
       if (!began) {
@@ -2104,6 +2396,7 @@ async function completeMessages({ key, server, families, keep }, req, signal) {
         ctl.enqueue(sse("message_start", { message: { id, type: "message", role: "assistant", model: req.model, content: [], stop_reason: null, stop_sequence: null, usage: anthropicUsage() } }))
       }
       const close = () => {
+        if (open === "thinking") rememberSigType(sig, sigType)
         if (open) ctl.enqueue(sse("content_block_stop", { index }))
         open = ""
       }
@@ -2113,15 +2406,37 @@ async function completeMessages({ key, server, families, keep }, req, signal) {
         open = kind
         ctl.enqueue(sse("content_block_start", { index, content_block }))
       }
-      const r = await it.next()
-      if (r.done) return ctl.close()
+      // a pull that sends nothing isn't pulled again: the events that send
+      // nothing are read past here
+      let r
+      for (;;) {
+        r = await it.next()
+        if (r.done) return ctl.close()
+        const q = r.value
+        if (q.signatureType) {
+          sigType = q.signatureType
+          rememberSigType(sig, sigType)
+          continue
+        }
+        // a signature goes on Claude's thinking block, before its stop, as
+        // Anthropic streams it; one that comes once the block has closed
+        // has no block to go on
+        if (q.signature && !(open === "thinking" && claude)) continue
+        break
+      }
       const e = r.value
       if (e.text) {
         if (open !== "text") start("text", { type: "text", text: "" })
         ctl.enqueue(sse("content_block_delta", { index, delta: { type: "text_delta", text: e.text } }))
       } else if (e.reasoning) {
-        if (open !== "thinking") start("thinking", { type: "thinking", thinking: "", signature: "" })
+        if (open !== "thinking") {
+          start("thinking", { type: "thinking", thinking: "", signature: "" })
+          sig = ""
+        }
         ctl.enqueue(sse("content_block_delta", { index, delta: { type: "thinking_delta", thinking: e.reasoning } }))
+      } else if (e.signature) {
+        sig += e.signature
+        ctl.enqueue(sse("content_block_delta", { index, delta: { type: "signature_delta", signature: e.signature } }))
       } else if (e.tool) start("tool_use", { type: "tool_use", id: e.tool.id, name: e.tool.name, input: {} })
       else if (e.args) {
         if (open === "tool_use") ctl.enqueue(sse("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: e.args.text } }))
@@ -2291,7 +2606,7 @@ function hookExit() {
 async function pingOnce(server, key, body, signal) {
   let res
   try {
-    res = await fetch(server + CHAT_RPC, { method: "POST", headers: rpcHeaders(key, body), body, signal })
+    res = await quietFetch(server + CHAT_RPC, { method: "POST", headers: rpcHeaders(key, body), body, signal })
   } catch (e) {
     return { status: 0, error: String(e?.message || e || "fetch failed") }
   }
@@ -2442,14 +2757,18 @@ function v2Chat(options, modelID) {
     }
     if (m.role === "assistant") {
       let text = ""
+      let reasoning = ""
       const calls = []
       for (const p of m.content ?? []) {
         if (p.type === "text") text += (text ? "\n\n" : "") + p.text
+        // the reply's reasoning, which build sends back to a model that
+        // isn't Claude (plugins#703)
+        else if (p.type === "reasoning" && typeof p.text === "string" && p.text) reasoning += (reasoning ? "\n\n" : "") + p.text
         else if (p.type === "tool-call")
           calls.push({ id: p.toolCallId, type: "function", function: { name: p.toolName, arguments: JSON.stringify(p.input ?? {}) } })
       }
       if (!text && !calls.length) continue
-      messages.push({ role: "assistant", content: text, ...(calls.length ? { tool_calls: calls } : {}) })
+      messages.push({ role: "assistant", content: text, ...(reasoning ? { reasoning_content: reasoning } : {}), ...(calls.length ? { tool_calls: calls } : {}) })
       continue
     }
     if (m.role === "tool") {
@@ -2749,6 +3068,8 @@ async function v2Setup(ctx) {
       },
       label: (c) => c?.metadata?.email || "Devin",
     })
+    // a key typed in, as the v1 "api" method saves it (v2Auth reads it)
+    editor.method.update({ integrationID: ID, method: { type: "key", label: "Devin API key (cog_…)" } })
   })
 
   // authFor resolves the active connection's key each call, so a chat goes
@@ -2929,12 +3250,14 @@ async function usage(key, server, onStatus) {
   }
   // with Devin's word on its models unread, which are free is unknown, so
   // the day and the week count them all (a used-up quota then holds SWE-2
-  // too): a row says so and why, instead of nothing
+  // too). Ask in the background so a slow model list doesn't hide quota
+  // GetUserStatus already returned; a later refresh adds free models or
+  // says why the list couldn't be read.
   if (out.windows.length) {
-    const free = await freeIDs(key, server)
+    const free = await freeIDs(key, server, false)
     if (free.length) for (const w of out.windows) w.notModels = free
     else {
-      const c = await configsFor(key, server)
+      const c = await configsFor(key, server, false)
       if (c.error && !c.at) out.windows.push({ name: "Free models", display: "unknown: Devin's model list couldn't be read (" + c.error + ")", aside: true })
     }
   }
@@ -2952,8 +3275,8 @@ async function usage(key, server, onStatus) {
 // may ask for them: each variant's own, and each entry of the list that
 // stands for free variants alone (swe-2 for swe-2-high, -medium and -max).
 // None when Devin hasn't said.
-async function freeIDs(key, server) {
-  const c = await configsFor(key, server)
+async function freeIDs(key, server, wait = true) {
+  const c = await configsFor(key, server, wait)
   if (!c.free?.size) return []
   const ids = new Set(c.free)
   for (const m of listed(c.families ?? [], [], {}, c.free)) if (m.free) ids.add(m.id)
@@ -3032,6 +3355,10 @@ export async function DevinAuthPlugin({ client, magpie } = {}, options = {}) {
       methods: [
         { type: "oauth", label: "Devin (browser)", authorize: browserSignIn },
         { type: "oauth", label: "Devin CLI's sign-in", authorize: cliSignIn },
+        // a key made in Devin's settings (a service user's cog_…, or a
+        // session token): sent as the sign-ins' token is, never renewed;
+        // the first usage read names the account (syncOrg)
+        { type: "api", label: "Devin API key (cog_…)", placeholder: "cog_…" },
       ],
       // magpie's own switches (OpenCode never reads auth.options)
       options: [
@@ -3109,7 +3436,10 @@ export async function DevinAuthPlugin({ client, magpie } = {}, options = {}) {
         const images = await imagesFor(key, server)
         const { free, prices } = await configsFor(key, server)
         const families = await ownFamilies(key, server)
-        if (!families) return withImages(provider.models, listed(familiesOf(SNAPSHOT), Object.keys(provider?.models ?? {}), images))
+        // neither Devin nor the CLI named the account's models: the list
+        // is the snapshot's, so magpie keeps the account's last good list
+        // (and the models the user picked from it) over this one
+        if (!families) return fellBack(withImages(provider.models, listed(familiesOf(SNAPSHOT), Object.keys(provider?.models ?? {}), images)))
         return Object.fromEntries(listed(families, Object.keys(provider?.models ?? {}), images, free, prices).map((m) => [m.id, runtimeModel(m)]))
       },
     },
@@ -3117,4 +3447,4 @@ export async function DevinAuthPlugin({ client, magpie } = {}, options = {}) {
 }
 
 // for tests
-export const _internal = { keepaliveKey, keepaliveSettings, keepalivePing, scheduleKeepalive, stopKeepalive, stopAllKeepalive, keeping: () => [...keeps.keys()], useTimers: (t) => (timers = t ?? realTimers), KEEPALIVE, buildMessages, completeMessages, anthropicEffort, encodeMsg, parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames, v2Chat, v2ToolParts, v2FileData, v2Effort, v2ResponseFormat, v2Usage, v2Auth, v2Credential, v2Models, devinLanguage, v2Setup, connKey }
+export const _internal = { quietFor: (ms) => (QUIET = ms ?? 5 * 60_000), imageType, estimate, windowOf, TOO_LONG_AT, sigTypeOf, forgetSigTypes: () => sigTypes.clear(), forgetThoughts: () => thoughts.clear(), thoughtFor, keepaliveKey, keepaliveSettings, keepalivePing, scheduleKeepalive, stopKeepalive, stopAllKeepalive, keeping: () => [...keeps.keys()], useTimers: (t) => (timers = t ?? realTimers), KEEPALIVE, buildMessages, completeMessages, anthropicEffort, encodeMsg, parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames, v2Chat, v2ToolParts, v2FileData, v2Effort, v2ResponseFormat, v2Usage, v2Auth, v2Credential, v2Models, devinLanguage, v2Setup, connKey }

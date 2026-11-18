@@ -11,10 +11,9 @@ import { take } from "./lock.mjs"
 const execute = promisify(execFile)
 const loginTimeout = 10 * 60 * 1000
 
-// gcloud owns refresh tokens and its on-disk token cache. This module reads
-// them and, only when no ADC exists at all, has gcloud make one from the Chrome
-// sign-in already in progress; it never handles token material itself.
-// Never include command output in failures: it can contain credential material.
+// gcloud owns the ADC file and creates it during sign-in. Its authorized-user
+// credentials can also refresh an access token directly, without a subprocess.
+// Never include command output or credential material in failures.
 //
 // A Google account's ADC is one file in one config directory, so a second
 // account on the same machine gets a directory of its own. Cloud SDK reads
@@ -287,24 +286,98 @@ export async function listUsableProjects(token, request = fetch) {
   }
 }
 
-export function tokenProvider(options = {}, run = runGcloud) {
-  let pending
-  // print-access-token can return a token near expiry. Do not assume it has a
-  // fresh one-hour lifetime; gcloud checks expiry and refreshes on each call.
-  // Simultaneous requests still share a single subprocess. The mode is resolved
-  // once per call chain so an identity resolved earlier pins it.
-  return () => {
-    pending ??= (async () => {
-      const mode = await effectiveAuthMode(options)
-      const args = mode === "adc"
-        ? ["auth", "application-default", "print-access-token"]
-        : ["auth", "print-access-token", `--account=${await resolveAccount(options, run)}`]
-      const token = await run(args, options)
-      if (!token || /\s/.test(token)) throw new Error(`gcloud returned an empty or invalid access token; run ${mode === "adc" ? "gcloud auth application-default login" : "gcloud auth login"} yourself in a terminal`)
-      return token
-    })().finally(() => { pending = undefined })
-    return pending
+// All callers for an identity share a cache and in-flight refresh, so a
+// background endpoint probe and a real request do not refresh separately.
+// The cache is keyed by the fetch function it was given, so a fetch the caller
+// has dropped can be collected and the tokens it fetched go with it. The
+// default fetch is one function, and real callers still share one cache per
+// identity through it. `run` stays in the inner key so two injected runners
+// never serve each other's token.
+const tokenCaches = new WeakMap()
+const callerIds = new WeakMap()
+let nextCallerId = 0
+function callerId(fn) {
+  if (!callerIds.has(fn)) callerIds.set(fn, ++nextCallerId)
+  return callerIds.get(fn)
+}
+
+function tokenState(options, run, request) {
+  let states = tokenCaches.get(request)
+  if (!states) tokenCaches.set(request, states = new Map())
+  const key = JSON.stringify([
+    cloudsdkConfig(options) || "", options.project || "", options.account || "",
+    options.authMode || process.env.VERTEX_GCLOUD_AUTH_MODE || "auto",
+    callerId(run),
+  ])
+  let state = states.get(key)
+  // The first provider for an identity supplies its injected run and request.
+  if (!state) states.set(key, state = { pending: undefined, cached: undefined, refreshing: undefined, run, request })
+  return state
+}
+
+export function tokenProvider(options = {}, run = runGcloud, request = fetch) {
+  const state = tokenState(options, run, request)
+  // Only the OAuth response supplies an expiry; gcloud can print a token near
+  // expiry, so its result is shared concurrently but never cached here. Resolve
+  // auto mode on every call before using the cache, since ADC can be removed.
+  const getToken = async () => {
+    const mode = await effectiveAuthMode(options)
+    if (mode === "adc" && state.cached && Date.now() < state.cached.until) return state.cached.token
+    if (!state.pending || state.pending.mode !== mode) {
+      const promise = (async () => {
+        if (mode === "adc") {
+          try {
+            const credentials = JSON.parse(await readFile(await adcFile(options), "utf8"))
+            const { client_id, client_secret, refresh_token } = credentials
+            if (credentials.type !== "authorized_user" || ![client_id, client_secret, refresh_token].every((value) => typeof value === "string" && value)) throw new Error()
+            const started = Date.now()
+            const response = await state.request("https://oauth2.googleapis.com/token", {
+              method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+              body: new URLSearchParams({ client_id, client_secret, refresh_token, grant_type: "refresh_token" }),
+              signal: AbortSignal.timeout(10000), redirect: "error",
+            })
+            if (!response.ok) throw new Error()
+            const body = await response.json()
+            const lifetime = body.expires_in
+            if (typeof body.access_token !== "string" || !body.access_token || /\s/.test(body.access_token)) throw new Error()
+            // An invalidated refresh must not put its old token back in the cache.
+            if (typeof lifetime === "number" && Number.isFinite(lifetime) && lifetime > 0 && state.pending?.promise === promise) {
+              state.cached = { token: body.access_token, until: started + Math.max(0, lifetime - 60) * 1000 }
+            }
+            return body.access_token
+          } catch { /* gcloud handles other ADC types and reports credential failures. */ }
+        }
+        const args = mode === "adc"
+          ? ["auth", "application-default", "print-access-token"]
+          : ["auth", "print-access-token", `--account=${await resolveAccount(options, state.run)}`]
+        const token = await state.run(args, options)
+        if (!token || /\s/.test(token)) throw new Error(`gcloud returned an empty or invalid access token; run ${mode === "adc" ? "gcloud auth application-default login" : "gcloud auth login"} yourself in a terminal`)
+        return token
+      })()
+      const current = { mode, promise }
+      state.pending = current
+      void promise.finally(() => { if (state.pending === current) state.pending = undefined }).catch(() => {})
+    }
+    return state.pending.promise
   }
+  getToken.invalidate = () => {
+    state.cached = undefined
+    state.pending = undefined
+  }
+  // A 401 drops the cached token and fetches again. Concurrent 401s share this
+  // promise. invalidate() and then getToken() does not: the second invalidate
+  // clears the in-flight entry the first refresh just started.
+  getToken.refresh = () => {
+    if (state.refreshing) return state.refreshing
+    state.cached = undefined
+    state.pending = undefined
+    const refreshing = getToken().finally(() => {
+      if (state.refreshing === refreshing) state.refreshing = undefined
+    })
+    state.refreshing = refreshing
+    return refreshing
+  }
+  return getToken
 }
 
 // This is only a Chrome Console login. gcloud authentication must already be
@@ -469,6 +542,10 @@ export function gcloudDefaultDirectory() {
 export const isGcloudDefault = (directory) => expandPath(directory) === expandPath(gcloudDefaultDirectory())
 
 const ADC_DIRS = "adc-"
+// 0.1.1 staged unnamed sign-ins in mkdtemp(join(root, "adc-pending-")), which
+// appends six alphanumeric characters with no "-". Every validated email has
+// "@" and therefore produces a "-" after the local-part in adcSlug(account).
+const LEGACY_PENDING_ADC = /^adc-pending-[0-9A-Za-z]{6}$/
 
 // Inventory of managed ADC directories, used to choose the first/add-account
 // consent page. These directory labels are NOT Google account identities.
@@ -486,7 +563,7 @@ export async function knownAccounts(options = {}) {
     throw error
   })
   for (const name of names) {
-    if (!name.startsWith(ADC_DIRS)) continue
+    if (!name.startsWith(ADC_DIRS) || LEGACY_PENDING_ADC.test(name)) continue
     // Staging directories use a separate hidden prefix, so a legitimate
     // account whose email starts with "pending-" remains discoverable.
     const present = await lstat(join(root, name, "application_default_credentials.json")).then(() => true, (error) => {
@@ -708,7 +785,7 @@ export async function startLogin(options = {}, openWindow = openSignInWindow) {
       // URL. Its window stays open until ADC is saved and read; only then does
       // this plugin close it. It is closed below, in this block's finally, on
       // every path out of the sign-in.
-      window = openWindow({ profile: options.profile, url: signInUrl(consentUrl, registered), headless: false })
+      window = openWindow({ profile: options.profile, profileDirectory: options.profileDirectory, url: signInUrl(consentUrl, registered), headless: false })
       const signing = await window
       await new Promise((resolve, reject) => {
         const expiry = setTimeout(() => reject(stopped(`Google sign-in did not finish within ${Math.round(limit / 60000)} minutes; start the sign-in again and approve the consent page in the window that opens`)), limit)
@@ -743,8 +820,8 @@ export async function startLogin(options = {}, openWindow = openSignInWindow) {
         // can change. Email alone cannot establish continuity across a rename.
         googleIdentity = await tokenProvider({ authMode: "adc", cloudsdkConfig: directory })()
           .then(identityOf).catch(() => undefined)
-        adcEmail = googleIdentity?.account.toLowerCase()
-        if (!adcEmail || !googleIdentity.subject) {
+        adcEmail = googleIdentity?.account?.toLowerCase()
+        if (!adcEmail || !googleIdentity?.subject) {
           throw stopped("The Google account email and subject could not be confirmed after consent; no new account was recorded")
         }
         // Serialize subject comparison AND registration across processes. Two

@@ -6,6 +6,7 @@ import { useUi } from "../stores/ui";
 import { ws } from "../main";
 import type { Project, ThreadMeta } from "../types/models";
 import { relTime } from "../util/format";
+import { threadDotClass } from "../util/threadDot";
 import { Menu, useMenu, type MenuItem } from "./Menu";
 import { Dialog, ConfirmDialog } from "./Dialog";
 import { Icon } from "./Icons";
@@ -14,12 +15,7 @@ import { displayThreadTitle, errMsg, t as tr, tf } from "../i18n/index.js";
 
 const THREAD_PAGE = 10;
 
-function dotClass(t: ThreadMeta, pendingIds: Set<string>): string {
-  if (pendingIds.has(t.id)) return "dot wait";
-  if (t.status === "running" || t.status === "initializing") return "dot run";
-  if (t.status === "error" || t.lastTurnStatus === "failed") return "dot err";
-  return "dot";
-}
+const dotClass = threadDotClass;
 
 export function Sidebar({ pendingByThread }: { pendingByThread: Set<string> }) {
   const { projects, threads } = useData();
@@ -153,6 +149,7 @@ export function Sidebar({ pendingByThread }: { pendingByThread: Set<string> }) {
   return (
     <>
       <div className="sb-row">
+        <SidebarToggle />
         <button className="sb-new" onClick={() => setNewProjOpen(true)}>
           <span className="sb-new-tile"><Icon name="plus" size={12} /></span>{tr("sidebar.newProject")}
         </button>
@@ -511,4 +508,17 @@ async function exportThread(t: ThreadMeta) {
   } catch (e) {
     toast(tr("sidebar.failExport") + errMsg(e), true);
   }
+}
+
+/** Collapse / expand the sidebar (the same button sits in the top bar while the sidebar is collapsed); Ctrl/⌘+B */
+export function SidebarToggle({ className = "" }: { className?: string }) {
+  const hidden = useUi((s) => s.sbHidden);
+  const open = useUi((s) => s.sbOpen);
+  const label = tr(hidden && !open ? "sidebar.expand" : "sidebar.collapse");
+  return (
+    <button type="button" className={`ibtn sb-toggle ${className}`} title={`${label} (Ctrl+B)`} aria-label={label}
+      aria-expanded={!hidden || open} onClick={() => useUi.getState().toggleSidebar()}>
+      <Icon name="panelLeft" />
+    </button>
+  );
 }

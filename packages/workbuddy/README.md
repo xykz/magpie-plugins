@@ -36,6 +36,17 @@ The package exports `WorkBuddyAuthPlugin` (`workbuddy`) and
   none with a key), and its models are `/v3/config`'s only for `ck_`/`pt_`
   keys, as the CLI asks; any other key keeps the list below.
 
+- **Import from a file** (since 0.2.32; magpie with plugin imports).
+  magpie's "Import accounts from a file…" takes WorkBuddy desktop's
+  sign-in file (`workbuddy-desktop[-ai].info`, above) or a copy of a
+  sign-in: JSON with its access and refresh tokens, as this plugin's
+  `auth.json` entry, `accessToken`/`refreshToken` or
+  `access_token`/`refresh_token`, alone, in a map or in a list. Each is
+  renewed with WorkBuddy before it is added, as a browser sign-in is, so
+  the app or tool the file came from is signed out of that account. An
+  encrypted file (WorkBuddy 5.6 and later) and the other build's sign-in
+  are refused with why.
+
 A browser sign-in is kept as an OpenCode `oauth` auth: the access and
 refresh tokens, their expiry, the user id and the domain; desktop's as a
 marker, `{"type": "oauth", "source": "desktop", "accountId", "uid"}`. OpenCode keeps it in
@@ -60,6 +71,22 @@ app's file. Every request then carries `X-Enterprise-Id` and `X-Tenant-Id`,
 as WorkBuddy's own client sends them; without them WorkBuddy answers as the
 personal account, with the personal plan's models. A browser sign-in made
 before 0.1.13 has no enterprise id kept: sign in again.
+
+A cloud-hosted enterprise's account (its sign-in's domain is
+`<enterprise>.sso.copilot.tencent.com`, `<enterprise>.copilot.qq.com` or
+`<enterprise>.sso.codebuddy.cn`, the cloud-hosted hosts WorkBuddy's own
+`product.json` lists) is served at that host, as WorkBuddy's client sets
+the enterprise's endpoint for it: its refresh, account list, models, usage
+and chats go there. Tencent's own iOA host
+(`tencent.sso.copilot.tencent.com`) stays on `copilot.tencent.com`, as in
+WorkBuddy's `product.ioa.json`. Before 0.2.32 every account was sent to
+the build's own endpoint. A self-hosted enterprise's host isn't known to
+the plugin and isn't routed.
+
+An enterprise's own models (`custom:<name>|<name>`) are listed after the
+plan's, as WorkBuddy's own client lists them, with their context, output,
+images and efforts; the id goes to WorkBuddy as it is. Before 0.2.28 they
+were left out of the list.
 
 Which account a browser sign-in gives is chosen on WorkBuddy's own sign-in
 page. After a phone sign-in it lists the person's accounts (personal, a
@@ -169,6 +196,30 @@ Not sent: `X-Device-Token`, which the desktop app gets from Tencent's
 native device SDK before each prompt, and a `traceparent`, which the CLI
 adds only while its server-side tracing is on.
 
+A WorkBuddy AI chat also carries, in its body, the `extra_vars` its own
+client sends (#691): `initiator: "user"` and `growthEvent`, a JSON string
+holding a `chat_request_send` event for the chat's `X-Conversation-ID`, with
+the user's last message's length, the model's id and name, `mode: "craft"`
+and no command. WorkBuddy AI's CLI sends this event in the chat itself
+instead of on `/v2/report`; whether WorkBuddy reads it for the daily credit
+is not known. Anything the caller put in `extra_vars` is kept. The China
+build's chats go without it.
+
+Since 0.2.35 a WorkBuddy AI chat is also reported on `POST /v2/report`, as
+WorkBuddy AI 5.9.4's client reports one (#691): once the reply has been
+read to its end, `chat_message_send`, then `chat_message_response` and
+`chat_message_status` (with `chat_request_send` first when the user's own
+message opened the step, and `chat_request_response` last when the step
+ends the turn), then `agent_task_completed` and `chat_response_complete`
+for a step that ends it. They carry the chat's ids, model, token counts and
+finish reason, and the client's common fields: the account's id and name,
+WorkBuddy's version, this computer's OS, CPU and memory, and a machine id
+that is a hash of the host's and user's names. Only the user's own chats
+are reported, never a message of the plugin's own; a reply cut off, a
+refusal, a key account and the China build send none, and a report that
+fails is dropped. Whether the daily credit reads these reports is not
+known yet.
+
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
 
@@ -217,6 +268,9 @@ models to each shape below and Kimi's, GPT's, Gemini's and GLM's to some:
 - a tool's parameters with no `type`, empty, or a union (`anyOf`, `oneOf`,
   `allOf`) at the root are an object, the union's fields merged;
 - a `pattern`'s `\0` is `\u0000`, which matches the same;
+- REA's exact `^[^\uD800-\uDFFF]*$` surrogate guard is omitted from the
+  outbound schema: WorkBuddy AI's DeepSeek rejects it with "invalid function
+  call parameters". Other path constraints and REA's own validation stay;
 - a tuple's `items` (a list) is one schema any of them fits;
 - an `enum` with no `type` takes its values' type (or that and `"null"`),
   and an `enum` of several types is an `anyOf` of one typed `enum` for
@@ -304,6 +358,12 @@ on it, so 0.2.8 lifted the cap (#561). A prompt WorkBuddy does find too
 long ("prompt is too long: … > … maximum") is answered with its own 400,
 passed on as it came, which magpie takes as the context overflowing.
 
+A model's reply limit is the config's `maxOutputTokens`. The list used
+before the config is read gives it too since 0.2.26, for the models a
+config read from each site named (Deepseek-V4.1-Flash: 128000 on both).
+Before, that list gave none, and magpie filled in models.dev's: 384000
+for Deepseek-V4.1-Flash. A model it gives none for still gets models.dev's.
+
 A chat goes gzipped (`Content-Encoding: gzip`), as WorkBuddy's own client
 sends its model requests (`RequestBodyGzip` in both builds' product.json).
 Claude's Messages route goes as it came, and so does anything that isn't a
@@ -339,6 +399,36 @@ and says `filtersModels`, so while it is on magpie says under the models
 that the list is filtered (#590). Both are magpie's own fields; an older
 magpie shows the English words and no note.
 
+### Send as CodeBuddy CLI 2.108.1
+
+The China build also has a "Send as CodeBuddy CLI 2.108.1" switch in its
+provider settings, off by default. Off sends WorkBuddy's desktop app shape,
+which is what every request sent before the option existed. On sends the
+shape of Tencent's official CodeBuddy CLI (`@tencent-ai/codebuddy-code`
+2.108.1): nine request headers and no more, the chat's own body transform, and
+one `chat.completion` back for a client that asked for no stream. Both sign in
+as the same account; what differs is the client the endpoint reads.
+
+The AI build has no such switch: only one format was ever captured for it, so
+a switch there would be one that changed nothing. A tuple naming no format
+this plugin knows sends the app's shape, rather than failing a chat.
+
+### Hide DeepSeek Harness's name
+
+Since 0.2.23 each site also has a "Hide DeepSeek Harness's name" switch, on
+by default, and on in OpenCode, which has no switches. A user reported a
+WorkBuddy account banned after use from DeepSeek Harness, with a reply saying
+its built-in prompt is recognised. With the switch on, the harness's name is
+taken out of the system prompt and the tools' descriptions: "You are an AI
+agent powered by DeepSeek Harness." becomes "You are an AI agent.", and the
+runtime lines naming its checkout and Web GUI say "agent implementation
+checkout" and "Web GUI", wherever they are. Since 0.2.25 the user's and the
+assistant's own words go as written (a path such as `/root/DSH/Work/` was
+sent as `/root/the agent harness/Work/` before), and so does the name in a
+path or a file name anywhere. Tools' results, commands and names such as
+`DSH_HOME` or `~/.dsh` go as they were.
+Whether this keeps an account from being banned is not known.
+
 ## Credits in magpie
 
 magpie's usage card shows the account's credits from the resource summary.
@@ -357,9 +447,15 @@ kind WorkBuddy's own usage panel lists: the plan's bonus, top-ups (bought
 credit packs) and platform rewards (gifted and activity credits,
 赠送积分). The summary's CreditGroups say which is which (plan_base
 against plan_bonus, addon and benefit); a summary without them is split
-by package code as WorkBuddy's client does. Only one of the two stops the
-account, since WorkBuddy serves it while any credits are left: the extra
-window is set aside until the plan's credits are spent. A summary with
+by package code as WorkBuddy's client does. Neither stops the account,
+since WorkBuddy serves it while any credits are left: both are set aside,
+and a third window, "Total credits", the two together, stops it. It has
+the plan's cycle and the soonest lapse of the two, so every account reads
+the same, its plan's credits spent or not (ferock on Discord; before
+0.2.24 the extra window stood in for the account only once the plan's
+were spent). Extra credits only the detail lists carry (a China-site free
+account's summary can list the plan's base alone) are their own "Extra
+credits" window, with a "Total credits" by the same rule. A summary with
 only one kind keeps the one "Credits" window (akic404 on Discord; since
 0.2.16 the plan's bonus is extra too, Jiabubu on Discord).
 
@@ -407,6 +503,16 @@ What is measured, and what is easy to read wrongly:
   429 whose named reset is still ahead makes the window full — `used: 100`,
   `resetsAt` the reset the vendor named — whatever the rows add up to. The
   sum carries the window only until the first refusal.
+- **A refusal hidden by routing still counts.** A group that moves to
+  another provider after the 429 writes only the 200 that answered, so the
+  failed WorkBuddy attempt is read from `routing/YYYY-MM-DD.jsonl` (or its
+  `.gz`, and a busy day's numbered `YYYY-MM-DD.N.jsonl` files) as well: its
+  vendor words — or the gateway rest's `until` and `key`, which names the
+  account and model — pin the window the same way. Three days of traces are
+  read a line at a time, never held whole, and what they held is kept until
+  a trace itself changes; an append to `usage.jsonl` does not decompress
+  them again, and an append to today's plain file is read from where the
+  last read stopped.
 - **The sum is shown, not routed on.** Until the vendor refuses, the card is
   set aside (`aside: true`): magpie draws it beside the account and never
   counts it as the account's allowance, so an estimate near its cap does not
@@ -447,14 +553,30 @@ What is measured, and what is easy to read wrongly:
   rather than +08:00 guessed.
 
 A window that has lapsed reports nothing rather than 0%: nothing is
-exhausted, and the next request opens a fresh one. The China build
-(`copilot.tencent.com`) carries the same window: two Free-plan accounts
+exhausted, and the next request opens a fresh one.
+
+### The China build's windows (measured, shown as estimates)
+
+The China build (`copilot.tencent.com`) carries the same kind of window,
+measured one model at a time. `deepseek-v4.1-flash`: two Free-plan accounts
 refused on 2026-11-02 at 200,389,043 and 200,485,923 tokens, so its cap is
-measured at about 2e8 — and its refusals name the reset in Chinese
-(`将在 … UTC+8 重置`), which reads as an edge the same way. Its card reads
-against 2e8. In 0.2.12 and 0.2.13 it read against a soft cap of 1.9e8, so
-that routing rested the model before the vendor refused it; with the sum set
-aside that headroom only stopped the model early, so it is gone.
+about **2e8** — and its refusals name the reset in Chinese
+(`将在 … UTC+8 重置`), which reads as an edge the same way.
+
+Unlike the AI build's, the China model is **charged in credits** (`x0.11`)
+— the token window and the credits meter are two limits on one model — so
+the card is not a "free model" card. It is named after its model and says
+its cap is an estimate: **`deepseek-v4.1-flash tokens (est.)`**, with
+`~200M` in its text (`151.5M / ~200M`). The estimate is this machine's ledger
+against a cap measured on two accounts; the vendor reports neither, and the
+first refusal of a window pins the card full at the reset the vendor names.
+
+The measured windows live in one table (`CN_ESTIMATED_WINDOWS`), one entry
+per model. Only measured models have a card — a guessed cap would read wrong
+every day. Add an entry when another model's window is measured; remove one
+when the vendor stops applying it. Because the card is set aside (shown, not
+routed on), a stale cap costs a wrong percentage, never a wrongly rested
+model: the refusal is what stops a model, on both builds.
 
 ## When free models work but a credit model does not
 

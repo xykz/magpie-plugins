@@ -14,16 +14,25 @@ import { GitService } from "../git/service.js";
 import { FileService } from "../files/service.js";
 import type { TerminalService } from "../terminal/service.js";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, win32 as win32Path } from "node:path";
+import { dirname, isAbsolute, join, sep, win32 as win32Path } from "node:path";
 import { execFile } from "node:child_process";
 import { pickFolder } from "../util/pickFolder.js";
 import { clearBinCache } from "../util/bin.js";
 import { cachedDetect, cachedModels, clearProviderCache } from "../providers/infoCache.js";
 import { launchFromSettings } from "../providers/launch.js";
 import { clampMode } from "../providers/modes.js";
-import { tr, intlLocale } from "../util/i18n.js";
+import { endLegacyDefault, guardLegacyMode, upgradeNotice } from "../migrate/autoApprove13.js";
+import { setAppLocale, tr, intlLocale } from "../util/i18n.js";
+import { MAX_MENTIONS } from "../util/mentions.js";
+import { openExternal } from "../util/openExternal.js";
+import { detectIde, launchDetached, revealLaunch } from "../util/osOpen.js";
+import { agentShellStatus, refreshAgentShell } from "../util/agentShell.js";
+import { checkBashPath, GIT_FOR_WINDOWS_URL } from "../util/gitBash.js";
+import { PreviewError, type PreviewProxy } from "../preview/proxy.js";
+import { checkPreviewUrl, MAX_PREVIEW_URL } from "../preview/url.js";
+import { previewHost } from "../preview/host.js";
 
 const threadModeSchema = z.enum(["plan", "default", "acceptEdits", "bypassPermissions", "ask"]);
 
@@ -36,10 +45,12 @@ export type Services = {
   git: GitService;
   files: FileService;
   terminals: TerminalService;
+  /** 1.2 preview proxy (absent in some tests) */
+  preview?: PreviewProxy;
   // AgentManager provides runtime info once wired in at P1-4; may be empty (no session started)
   runtime?: (threadId: string) => { status: string; queue: unknown[]; pending: unknown[] } | null;
   manager?: {
-    send(threadId: string, input: { text: string; attachments?: { path: string; mime: string; name?: string }[] }, behavior?: "queue" | "steer"): Promise<"started" | "steered" | "queued" | void>;
+    send(threadId: string, input: { text: string; attachments?: { path: string; mime: string; name?: string }[]; mentions?: { rel: string; isDir?: boolean }[]; clientId?: string }, behavior?: "queue" | "steer"): Promise<"started" | "steered" | "queued" | void>;
     interrupt(threadId: string): Promise<void>;
     respond(threadId: string, requestId: string, answer: { optionId?: string; answers?: Record<string, string>; cancelled?: boolean }): Promise<void>;
     setModel(threadId: string, model: string | null): Promise<void>;
@@ -75,6 +86,12 @@ function wrap<T extends z.ZodType>(schema: T, fn: (p: z.infer<T>, ctx: ConnCtx) 
 export function registerMethods(gw: Gateway, svc: Services): void {
   const zEmpty = z.object({}).passthrough().optional();
 
+  // Magpie's language changed while the page is open (1.2): daemon-made text (notices, tool titles) follows it
+  gw.method("app.setLocale", wrap(z.object({ lang: z.string().max(32) }), (p) => {
+    setAppLocale(p.lang);
+    return true;
+  }));
+
   gw.method("app.info", wrap(zEmpty, () => ({
     version: svc.cfg.version,
     dataDir: svc.cfg.dataDir,
@@ -82,10 +99,54 @@ export function registerMethods(gw: Gateway, svc: Services): void {
     port: svc.cfg.port,
   })));
 
+  // 1.3: Git Bash for the agents (Windows). status: what the agents get now; check: validate a path typed in Settings
+  gw.method("shell.status", wrap(zEmpty, async () => {
+    const st = agentShellStatus();
+    return { ...st, platform: process.platform, downloadUrl: GIT_FOR_WINDOWS_URL };
+  }));
+  gw.method("shell.check", wrap(z.object({ path: z.string().max(1024) }), (p) => {
+    if (process.platform !== "win32") return { ok: false, reason: "notWindows" };
+    return checkBashPath(p.path);
+  }));
+
   gw.method("app.shutdown", wrap(zEmpty, () => {
     setTimeout(() => process.exit(0), 100);
     return { ok: true };
   }));
+
+  // 1.2: open an http(s) link in the system browser (the sandboxed page can't open popups)
+  gw.method("app.openExternal", wrap(z.object({ url: z.string().min(1).max(MAX_PREVIEW_URL) }), async (p) => openExternal(p.url)));
+
+  // 1.2 preview: a local-only reverse proxy for a loopback dev URL (see preview/proxy.ts for the limits)
+  gw.method("preview.open", wrap(
+    z.object({ url: z.string().min(1).max(MAX_PREVIEW_URL), threadId: z.string().max(200).optional() }),
+    async (p) => {
+      if (!svc.preview) throw new ApiError("unavailable", tr("err.previewUnavailable"));
+      let r;
+      try {
+        r = await svc.preview.open(p.url);
+      } catch (e) {
+        if (e instanceof PreviewError) {
+          throw new ApiError(e.code === "denied_port" ? "preview_denied" : "preview_url", tr(e.code === "denied_port" ? "err.previewDenied" : "err.previewUrl"));
+        }
+        throw e;
+      }
+      if (p.threadId) {
+        const meta = await svc.threads.get(p.threadId);
+        if (meta && meta.previewUrl !== r.url) {
+          const next = await svc.threads.patch(p.threadId, { previewUrl: r.url });
+          gw.publish("sidebar", { type: "thread.upsert", thread: next });
+        }
+      }
+      // The daemon's real OS (the UA can't carry it, #582): the page refuses Apple WebKit on Darwin < 25 before any
+      // *.localhost name is looked up, and releases this listener
+      return { ...r, host: previewHost() };
+    },
+  ));
+
+  gw.method("preview.release", wrap(z.object({ url: z.string().min(1).max(MAX_PREVIEW_URL) }), (p) => ({
+    ok: svc.preview?.release(p.url) ?? false,
+  })));
 
   gw.method("settings.get", wrap(zEmpty, () => svc.settings.get()));
 
@@ -94,6 +155,12 @@ export function registerMethods(gw: Gateway, svc: Services): void {
     if (!checked.ok) throw new ApiError("bad_params", `Invalid setting: ${checked.error}`);
     const before = await svc.settings.get();
     const next = await svc.settings.set(checked.patch as Partial<Settings>);
+    // 1.3: a default permission mode picked after the upgrade is the user's 1.3 choice (ends the 1.2 全部放行 guard)
+    if ("defaultMode" in checked.patch) await endLegacyDefault(svc.settings);
+    // 1.3: Settings → Bash path (Windows) re-runs Git Bash detection for the next agent start
+    if ("bashPath" in checked.patch && (before.bashPath ?? "") !== (next.bashPath ?? "")) {
+      await refreshAgentShell(typeof next.bashPath === "string" ? next.bashPath : "");
+    }
     // A changed launch command only invalidates that Agent's detection / model cache (B2: toggling never wipes the rest)
     for (const id of Object.keys(checked.patch.providerCommand ?? {})) {
       if (JSON.stringify(before.providerCommand?.[id] ?? null) !== JSON.stringify(next.providerCommand?.[id] ?? null)) {
@@ -124,12 +191,18 @@ export function registerMethods(gw: Gateway, svc: Services): void {
 
   // ---- providers.list (§6): detection + model list + capabilities ----
   // detect/listModels in parallel; 8s total per provider (listModels may start a temporary process).
+  // refresh+provider: clear/reload only that Agent (model picker ↻ inside < Claude Code); refresh alone: all.
   gw.method("providers.list", wrap(
-    z.object({ refresh: z.boolean().optional() }).passthrough().optional(),
+    z.object({ refresh: z.boolean().optional(), provider: z.string().optional() }).passthrough().optional(),
     async (p) => {
       if (p?.refresh) {
-        clearBinCache();
-        clearProviderCache();
+        if (p.provider) {
+          clearBinCache(p.provider);
+          clearProviderCache(p.provider);
+        } else {
+          clearBinCache();
+          clearProviderCache();
+        }
       }
       const settings = await svc.settings.get();
       const rows = await Promise.all(
@@ -216,6 +289,26 @@ export function registerMethods(gw: Gateway, svc: Services): void {
     return { ok: true };
   }));
 
+  // 1.3.8 (issue #3): open the project folder in the first IDE found (Cursor, VS Code, Windsurf, Zed, IntelliJ IDEA,
+  // WebStorm, Sublime Text); argv arrays only (util/osOpen.ts)
+  gw.method("projects.openInIde", wrap(z.object({ id: z.string() }), async (p) => {
+    const proj = await svc.projects.get(p.id);
+    if (!proj) throw new ApiError("not_found", tr("err.projectMissing"));
+    let dir: string;
+    try {
+      dir = await realpath(proj.path);
+      if (!(await stat(dir)).isDirectory()) throw new Error("not a folder");
+    } catch {
+      throw new ApiError("bad_path", tr("err.dirMissing"));
+    }
+    if (process.platform === "win32") dir = win32Path.normalize(dir);
+    const hit = detectIde(dir);
+    if (!hit) throw new ApiError("no_ide", tr("err.noIde"));
+    const r = await launchDetached(hit.launch);
+    if (!r.ok) throw new ApiError("ide_failed", tr("err.ideFailed", { ide: hit.ide, detail: r.reason }));
+    return { ok: true, ide: hit.ide };
+  }));
+
   // ---- fs.* ----
   gw.method("fs.check", wrap(z.object({ path: z.string().min(1) }), (p) => {
     let exists = false;
@@ -266,8 +359,11 @@ export function registerMethods(gw: Gateway, svc: Services): void {
       }
       // B8: the default permission mode is mapped onto this Agent's own modes (same rule as thread.setProvider)
       const provider = getProvider(p.provider);
-      const mode = clampMode(provider?.capabilities.modes ?? [], p.mode);
+      // 1.3 (#727 review 3): a pre-1.3 default of 全部放行 stays 每次询问 for Agents it did nothing for in 1.2 (told once)
+      const guard = await guardLegacyMode(svc.settings, p.provider, clampMode(provider?.capabilities.modes ?? [], p.mode));
+      const mode = guard.mode;
       const meta = await svc.threads.create({ ...p, mode });
+      if (guard.notice) await svc.threads.appendEvent(meta.id, upgradeNotice());
       gw.publish("sidebar", { type: "thread.upsert", thread: meta });
       return meta;
     }
@@ -296,6 +392,7 @@ export function registerMethods(gw: Gateway, svc: Services): void {
       title: z.string().optional(),
       pinned: z.boolean().optional(),
       archived: z.boolean().optional(),
+      previewUrl: z.string().max(MAX_PREVIEW_URL).nullable().optional(),
     }),
     async (p) => {
       const meta = await svc.threads.get(p.id);
@@ -307,6 +404,15 @@ export function registerMethods(gw: Gateway, svc: Services): void {
       }
       if (p.pinned !== undefined) patch.pinned = p.pinned;
       if (p.archived !== undefined) patch.archived = p.archived;
+      if (p.previewUrl !== undefined) {
+        // Only a loopback URL is remembered (normalized); null clears it
+        if (p.previewUrl === null) patch.previewUrl = null;
+        else {
+          const c = checkPreviewUrl(p.previewUrl);
+          if (!c.ok) throw new ApiError("bad_params", tr("err.previewUrl"));
+          patch.previewUrl = c.target.href;
+        }
+      }
       const next = await svc.threads.patch(p.id, patch);
       gw.publish("sidebar", { type: "thread.upsert", thread: next });
       return next;
@@ -350,6 +456,38 @@ export function registerMethods(gw: Gateway, svc: Services): void {
   gw.method("files.read", wrap(z.object({ projectId: z.string(), path: z.string() }), async (p) =>
     svc.files.read(await projectPath(p.projectId), p.path)
   ));
+
+  // 1.3.8 (issue #3): show a file (selected in its folder) or a folder in Explorer / Finder / the file manager.
+  // The target must resolve (symlinks followed) inside the project's real root.
+  gw.method("files.reveal", wrap(z.object({ projectId: z.string(), path: z.string() }), async (p) => {
+    const proj = await svc.projects.get(p.projectId);
+    if (!proj) throw new ApiError("not_found", tr("err.projectMissing"));
+    let root: string;
+    try {
+      root = await realpath(proj.path);
+    } catch {
+      throw new ApiError("bad_path", tr("err.dirMissing"));
+    }
+    const rel = p.path.replace(/\\/g, "/");
+    if (!rel || isAbsolute(rel) || win32Path.isAbsolute(rel) || rel.split("/").includes("..")) {
+      throw new ApiError("bad_path", tr("err.pathOutside"));
+    }
+    let target: string;
+    try {
+      target = await realpath(join(root, rel));
+    } catch {
+      throw new ApiError("bad_path", tr("err.targetMissing"));
+    }
+    const fold = (s: string) => (process.platform === "win32" || process.platform === "darwin" ? s.toLowerCase() : s);
+    const rootSep = root.endsWith(sep) ? root : root + sep;
+    if (fold(target) !== fold(root) && !fold(target).startsWith(fold(rootSep))) {
+      throw new ApiError("bad_path", tr("err.pathOutside"));
+    }
+    const isDir = (await stat(target)).isDirectory();
+    const r = await launchDetached(revealLaunch(process.platform, target, isDir), { ignoreExit: process.platform === "win32" });
+    if (!r.ok) throw new ApiError("reveal_failed", tr("err.revealFailed", { detail: r.reason }));
+    return { ok: true };
+  }));
 
   // ---- history.* (§7.6) ----
   gw.method("history.list", wrap(z.object({ projectId: z.string() }), async (p) => {
@@ -445,11 +583,15 @@ export function registerMethods(gw: Gateway, svc: Services): void {
       id: z.string(),
       text: z.string(),
       attachments: z.array(z.object({ path: z.string(), mime: z.string(), name: z.string().optional() })).optional(),
+      // 1.2: paths dragged from the Files panel, relative to the project (the daemon resolves and checks them)
+      mentions: z.array(z.object({ rel: z.string().min(1).max(4096), isDir: z.boolean().optional() })).max(MAX_MENTIONS).optional(),
       behavior: z.enum(["queue", "steer"]).optional(),
+      // 1.3: the page's id for its optimistic bubble, echoed on the user_message event (dedupe, no jump)
+      clientId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional(),
     }),
     async (p) => {
       // delivered tells the composer what happened: a steer an Agent can't take is queued (B7)
-      const delivered = await needManager().send(p.id, { text: p.text, attachments: p.attachments }, p.behavior ?? "queue");
+      const delivered = await needManager().send(p.id, { text: p.text, attachments: p.attachments, mentions: p.mentions, clientId: p.clientId }, p.behavior ?? "queue");
       return { ok: true, delivered: delivered ?? "started" };
     }
   ));
@@ -533,7 +675,11 @@ export function registerMethods(gw: Gateway, svc: Services): void {
     L.push(`> ${meta.provider} · ${meta.model ?? tr("export.defaultModel")} · ${meta.mode} · ${new Date(meta.createdAt).toLocaleString(intlLocale())}`, "");
     for (const e of events) {
       switch (e.type) {
-        case "user_message": L.push(`**${tr("export.me")}**${e.steered ? tr("export.steered") : ""}:\n\n${e.text}`, ""); break;
+        case "user_message": {
+          const refs = e.mentions?.length ? "\n\n" + e.mentions.map((m) => `- \`${m.path}${m.isDir ? "/" : ""}\``).join("\n") : "";
+          L.push(`**${tr("export.me")}**${e.steered ? tr("export.steered") : ""}:\n\n${e.text}${refs}`, "");
+          break;
+        }
         case "assistant_message": L.push(e.text, ""); break;
         case "reasoning": L.push(`<details><summary>${tr("export.reasoning")}</summary>\n\n${e.text}\n</details>`, ""); break;
         case "tool_call": {

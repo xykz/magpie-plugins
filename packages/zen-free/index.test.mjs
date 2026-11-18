@@ -1110,6 +1110,166 @@ for (const { protocol, path, model } of protocols) {
   });
 }
 
+// DSH 0.2.2's edit, read and skill (SuperWheel, plugins#632, 2026-11-16):
+// each description is refused under any name, and edit and read are refused
+// by name with their own parameters (the same parameters under another name
+// are served). They go reworded and renamed; the core stand-ins Zen wants
+// still go as edit and read; a call of a renamed tool comes back as DSH's.
+const DSH_EDIT = {
+  name: "edit",
+  description: "Edit an existing UTF-8 text file by replacing literal text.",
+  parameters: { type: "object", properties: { file_path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" }, sandbox_permissions: { type: "string" }, justification: { type: "string" } } },
+};
+const DSH_READ = {
+  name: "read",
+  description: "Read a UTF-8 text file and return line-numbered content.",
+  parameters: { type: "object", properties: { file_path: { type: "string" }, offset: { type: "integer" }, limit: { type: "integer" } } },
+};
+const DSH_SKILL = {
+  name: "skill",
+  description: " Load the full instructions for a skill. Call it before acting on a task that names or clearly matches a skill in the session skill catalog. ",
+  parameters: { type: "object", properties: { name: { type: "string" } } },
+};
+for (const { protocol, path, model } of protocols) {
+  test(`${protocol}: DSH's edit, read and skill go reworded, edit and read renamed, and come back as DSH's (#632)`, async (t) => {
+    const { plugin, state, origin } = await fixture(t);
+    await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+    const loader = await plugin.auth.loader(publicAuth);
+    const tools = [DSH_EDIT, DSH_READ, DSH_SKILL].map(({ name, description, parameters }) => {
+      const tool = { name, description };
+      if (protocol === "chat") return { type: "function", function: { ...tool, parameters } };
+      if (protocol === "anthropic") return { ...tool, input_schema: parameters };
+      return { type: "function", ...tool, parameters };
+    });
+    const body = { model, stream: false, tools };
+    if (protocol === "responses") body.input = [{ role: "user", content: "hi" }];
+    else body.messages = [{ role: "user", content: "hi" }];
+    const send = () => loader.fetch(`${origin}/v1/${path}`, { method: "POST", body: JSON.stringify(body) });
+    for (const [upstream, expected] of [["text_replace", "edit"], ["file_view", "read"], ["skill", "skill"]]) {
+      state.reply = toolReply(protocol, upstream, true);
+      const response = await send();
+      assert.equal(response.status, 200);
+      assert.match(await response.text(), new RegExp(`"name"\\s*:\\s*"${expected}"`), upstream);
+    }
+    const sent = state.calls.at(-1).body;
+    const nameOf = (tool) => tool.function?.name ?? tool.name;
+    const descriptionOf = (tool) => tool.function?.description ?? tool.description;
+    const sentNames = sent.tools.map(nameOf);
+    assert.deepEqual(sentNames.slice(0, 3), ["text_replace", "file_view", "skill"]);
+    // the stand-ins Zen wants for its core tools, beside the renamed ones
+    assert.ok(sentNames.includes("edit") && sentNames.includes("read"), sentNames.join(","));
+    assert.equal(descriptionOf(sent.tools[0]), "Replace an exact piece of text in a UTF-8 file that already exists.");
+    assert.equal(descriptionOf(sent.tools[1]), "Read a UTF-8 text file. Each line comes back with its number.");
+    assert.equal(descriptionOf(sent.tools[2]), "Open a skill's whole instructions. Use it first when a task names a skill from the session's skill catalog, or plainly fits one.");
+    for (const text of sent.tools.map(descriptionOf)) assert.ok(![DSH_EDIT, DSH_READ, DSH_SKILL].some((tool) => text?.trim() === tool.description.trim()), text);
+  });
+}
+
+test("a read or edit without DSH's parameters keeps its name (#632)", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  // OpenCode's own read: filePath, offset, limit
+  const tools = [
+    { type: "function", function: { name: "read", description: "Reads a file", parameters: { type: "object", properties: { filePath: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } } } } },
+    { type: "function", function: { name: "edit", description: "Edits a file", parameters: { type: "object", properties: { file_path: { type: "string" } } } } },
+  ];
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "chat-free", stream: false, tools }) });
+  await response.text();
+  assert.deepEqual(state.calls.at(-1).body.tools.slice(0, 2).map((tool) => tool.function.name), ["read", "edit"]);
+});
+
+// Z.ai's ZCode 3.17.2 declares its dynamic-workflow tools, and Zen refuses
+// the whole request when two of them travel together: CreateWorkflow beside
+// GetWorkflowRun, and AmendWorkflow beside FillWorkflowHole. Either name
+// alone is served (a real 55-tool ZCode request bisected on 2026-11-04,
+// plugins#693). Its other workflow tools, ListWorkflowRuns included, keep
+// their names.
+for (const { protocol, path, model } of protocols) {
+  test(`${protocol}: ZCode's workflow pairs go under other names and come back as ZCode's (#693)`, async (t) => {
+    const { plugin, state, origin } = await fixture(t);
+    await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+    const loader = await plugin.auth.loader(publicAuth);
+    const schema = { type: "object", properties: { run_id: { type: "string" } } };
+    const names = ["CreateWorkflow", "GetWorkflowRun", "AmendWorkflow", "FillWorkflowHole", "ListWorkflowRuns"];
+    const tools = names.map((name) => {
+      const tool = { name, description: `ZCode ${name}` };
+      if (protocol === "chat") return { type: "function", function: { ...tool, parameters: schema } };
+      if (protocol === "anthropic") return { ...tool, input_schema: schema };
+      return { type: "function", ...tool, parameters: schema };
+    });
+    const body = { model, stream: false, tools };
+    if (protocol === "chat") {
+      body.messages = [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: [], tool_calls: [{ id: "c0", type: "function", function: { name: "GetWorkflowRun", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c0", content: "ok" },
+      ];
+      body.tool_choice = { type: "function", function: { name: "CreateWorkflow" } };
+    } else if (protocol === "anthropic") {
+      body.messages = [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: [{ type: "tool_use", id: "c0", name: "GetWorkflowRun", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "c0", content: "ok" }] },
+      ];
+      body.tool_choice = { type: "tool", name: "CreateWorkflow" };
+    } else {
+      body.input = [
+        { role: "user", content: "hi" },
+        { type: "function_call", call_id: "c0", name: "GetWorkflowRun", arguments: "{}" },
+        { type: "function_call_output", call_id: "c0", output: "ok" },
+      ];
+      body.tool_choice = { type: "function", name: "CreateWorkflow" };
+    }
+    const send = () => loader.fetch(`${origin}/v1/${path}`, { method: "POST", body: JSON.stringify(body) });
+    for (const [upstream, expected] of [
+      ["workflow_inspect", "GetWorkflowRun"],
+      ["workflow_amend", "AmendWorkflow"],
+      ["ListWorkflowRuns", "ListWorkflowRuns"],
+    ]) {
+      state.reply = toolReply(protocol, upstream, true);
+      const response = await send();
+      assert.equal(response.status, 200);
+      const text = await response.text();
+      assert.match(text, new RegExp(`"name"\\s*:\\s*"${expected}"`), upstream);
+    }
+    const sent = state.calls.at(-1).body;
+    const sentNames = sent.tools.map((tool) => (protocol === "chat" ? tool.function.name : tool.name));
+    assert.deepEqual(sentNames.slice(0, names.length), [
+      "workflow_create",
+      "workflow_inspect",
+      "workflow_amend",
+      "workflow_answer",
+      "ListWorkflowRuns",
+    ]);
+    const described = sent.tools.find((tool) => (tool.function?.name ?? tool.name) === "workflow_amend");
+    assert.equal(described.function?.description ?? described.description, "ZCode AmendWorkflow");
+    const past =
+      protocol === "chat"
+        ? sent.messages.find((message) => message.tool_calls).tool_calls[0].function.name
+        : protocol === "anthropic"
+          ? sent.messages[1].content[0].name
+          : sent.input[1].name;
+    assert.equal(past, "workflow_inspect");
+    assert.equal(sent.tool_choice.function?.name ?? sent.tool_choice.name, "workflow_create");
+  });
+}
+
+test("a ZCode workflow tool alone goes as named (#693)", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  for (const name of ["CreateWorkflow", "GetWorkflowRun", "AmendWorkflow", "FillWorkflowHole"]) {
+    const tools = [...declaredTools("chat"), { type: "function", function: { name, parameters: { type: "object" } } }];
+    const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "chat-free", stream: false, tools }),
+    });
+    await response.text();
+    assert.deepEqual(state.calls.at(-1).body.tools.slice(0, tools.length), tools, name);
+  }
+});
+
 test("read_image or working_directory alone goes as named (#632)", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
@@ -1124,3 +1284,114 @@ test("read_image or working_directory alone goes as named (#632)", async (t) => 
     assert.deepEqual(state.calls.at(-1).body.tools.slice(0, tools.length), tools, name);
   }
 });
+
+// DSH's ptc tool is named run_code and is the only tool its main request
+// offers, and Zen's free tier answers 429 FreeUsageLimitError to any tool
+// name with "run_code" in it, in any case (alonewolfsy-web, plugins#704).
+// It goes as exec_program, in the agent's past calls and tool_choice too,
+// streamed or not, and a call of it comes back as run_code. An agent's own
+// exec_program keeps its name, and DSH's goes as exec_program_2.
+for (const { protocol, path, model } of protocols) {
+  for (const stream of [true, false]) {
+    test(`${protocol}: run_code goes as exec_program and comes back as run_code, client stream=${stream} (#704)`, async (t) => {
+      const { plugin, state, origin } = await fixture(t);
+      await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+      const loader = await plugin.auth.loader(publicAuth);
+      const schema = { type: "object", properties: { code: { type: "string" } } };
+      const define = (name) => {
+        const tool = { name, description: `DSH ${name}` };
+        if (protocol === "chat") return { type: "function", function: { ...tool, parameters: schema } };
+        if (protocol === "anthropic") return { ...tool, input_schema: schema };
+        return { type: "function", ...tool, parameters: schema };
+      };
+      const nameOf = (tool) => (protocol === "chat" ? tool.function.name : tool.name);
+      const past = (sent) =>
+        protocol === "chat"
+          ? sent.messages.find((message) => message.tool_calls).tool_calls[0].function.name
+          : protocol === "anthropic"
+            ? sent.messages[1].content[0].name
+            : sent.input[1].name;
+      const request = (names) => {
+        const body = { model, stream, tools: names.map(define) };
+        if (protocol === "chat") {
+          body.messages = [
+            { role: "user", content: "hi" },
+            { role: "assistant", content: null, tool_calls: [{ id: "c0", type: "function", function: { name: "run_code", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "c0", content: "ok" },
+          ];
+          body.tool_choice = { type: "function", function: { name: "run_code" } };
+        } else if (protocol === "anthropic") {
+          body.messages = [
+            { role: "user", content: "hi" },
+            { role: "assistant", content: [{ type: "tool_use", id: "c0", name: "run_code", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "c0", content: "ok" }] },
+          ];
+          body.tool_choice = { type: "tool", name: "run_code" };
+        } else {
+          body.input = [
+            { role: "user", content: "hi" },
+            { type: "function_call", call_id: "c0", name: "run_code", arguments: "{}" },
+            { type: "function_call_output", call_id: "c0", output: "ok" },
+          ];
+          body.tool_choice = { type: "function", name: "run_code" };
+        }
+        return (upstream) => {
+          state.reply = toolReply(protocol, upstream, true);
+          return loader.fetch(`${origin}/v1/${path}`, { method: "POST", body: JSON.stringify(body) });
+        };
+      };
+      const reply = async (response) => {
+        assert.equal(response.status, 200);
+        return response.text();
+      };
+
+      // DSH's request: run_code alone
+      let send = request(["run_code"]);
+      let text = await reply(await send("exec_program"));
+      assert.match(text, /"name"\s*:\s*"run_code"/);
+      assert.doesNotMatch(text, /exec_program/);
+      let sent = state.calls.at(-1).body;
+      assert.equal(nameOf(sent.tools[0]), "exec_program");
+      assert.equal(sent.tools[0].function?.description ?? sent.tools[0].description, "DSH run_code");
+      assert.equal(past(sent), "exec_program");
+      assert.equal(sent.tool_choice.function?.name ?? sent.tool_choice.name, "exec_program");
+      // only names are read; the description goes as written
+      assert.ok(!sent.tools.some((tool) => /run_code/i.test(nameOf(tool))));
+
+      // every case of the word, wherever it stands; runCode and code_run
+      // were served and keep their names
+      const names = ["RUN_CODE", "Run_Code", "host_run_code", "run_code_v2", "runCode", "code_run"];
+      send = request(names);
+      await reply(await send("Bash"));
+      sent = state.calls.at(-1).body;
+      assert.deepEqual(sent.tools.slice(0, names.length).map(nameOf), [
+        "EXEC_PROGRAM",
+        "Exec_Program",
+        "host_exec_program",
+        "exec_program_v2",
+        "runCode",
+        "code_run",
+      ]);
+      for (const [upstream, expected] of [
+        ["EXEC_PROGRAM", "RUN_CODE"],
+        ["host_exec_program", "host_run_code"],
+        ["runCode", "runCode"],
+      ]) {
+        text = await reply(await send(upstream));
+        assert.match(text, new RegExp(`"name"\\s*:\\s*"${expected}"`), upstream);
+      }
+
+      // an agent's own exec_program keeps its name and its calls
+      send = request(["exec_program", "run_code"]);
+      text = await reply(await send("exec_program_2"));
+      assert.match(text, /"name"\s*:\s*"run_code"/);
+      sent = state.calls.at(-1).body;
+      assert.deepEqual(sent.tools.slice(0, 2).map(nameOf), ["exec_program", "exec_program_2"]);
+      assert.equal(past(sent), "exec_program_2");
+      assert.equal(sent.tool_choice.function?.name ?? sent.tool_choice.name, "exec_program_2");
+      text = await reply(await send("exec_program"));
+      assert.match(text, /"name"\s*:\s*"exec_program"/);
+      assert.doesNotMatch(text, /"name"\s*:\s*"run_code"/);
+    });
+  }
+}

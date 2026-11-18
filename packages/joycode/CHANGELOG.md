@@ -1,5 +1,28 @@
 # 更新记录
 
+## 0.2.7
+
+- Responses SSE 不再把空完成当成功：空 `response.completed` 转成 `empty_response`，缺少终止事件的 EOF 转成 `incomplete_response`，流内 JoyCode `FAILED_RESPONSE` 错误保留原始字段并转成标准错误事件。按事件增量处理，不缓存整段回复。
+- 实际 magpie 0.1.2392 隔离验证：原版原协议透传接受空完成；修复后明确失败，随后上游恢复时可重试成功。真实短工具结果续答在本机 magpie 通道 2.96 秒返回 `OK`。历史静默结束没有保留原始 SSE，不能证明全部历史触发原因。
+
+## 0.2.6
+
+- 将真实验证通过的 GPT-6.1 Sol 和 GLM-5.3 加入长上下文白名单，最高采用 900k；仍要求账号目录声明更大的 Desktop 窗口，输出上限不变。
+- 2026-11-04 经 magpie Responses 实测：900,064 输入 Token、25 输出 Token，15.95 秒正常完成并返回三个正确标记；约 1,000k 输入填充加指令被拒绝为 `context_length_exceeded`。GLM-5.3 经 Chat Completions 实测 900,074 输入 Token、64 输出 Token，98.31 秒正常结束并返回全部标记；1,000k 档返回 `Prompt exceeds max length`。GLM 的 jcloud / agent 别名保持不变，原 Codex 会话压缩未重跑。
+
+## 0.2.5
+
+- 对账号目录声明长窗口且真实请求成功的 GPT-6 Astra 和 DeepSeek-V4.1-Flash，分别采用最高 900k / 1,000k 的保守上下文声明；按 100k 向下取整，输出上限不变。未知模型和静态回退不变。
+- 验证：Astra 实际输入 921,497 Token、DeepSeek 实际输入 1,000,073 Token 均正常结束并找回三个标记。Claude 900k 请求返回拒绝，未作为通过证据，暂不提高。未重跑原 Codex 长会话压缩。
+
+## 0.2.4
+
+- 从额度接口的有效期文字解析套餐到期时间。账号卡片悬停用量时显示「N 积分 将于 … 过期」（中国时区当天 23:59:59），并写入 magpie 的 `until`。套餐行优先，否则取最早的一份。不写成「重置于」，也不当成额度窗口的重置时间。
+- 网关返回 `AI_GRAY_ACCESS_DENIED` 时丢弃缓存的账号身份，重新拉取一次并重发该请求。第二次仍被拒绝则返回 403，不把账号标成登录失效。其它 403 不重试。
+- 模型目录成功但为空时保留内置模型。内置模型不再声明未验收的图片输入。非流式 JSON 读到结束再解析，超过 8MB 返回 `response_too_large`。
+
+这次没有抓到新的网关原文。灰度重试只由 mock 覆盖，没有对 JoyCode 再做一次真实请求。
+
 ## 0.2.2
 
 - 根据真实网关支持值修复 Codex 压缩的推理强度：GPT-6 Astra、GPT-6.1 Sol 的 `none` / `minimal` 转为 `low`；GPT-6 Sol、GPT-5.6 Sol 的 `minimal` 转为 `low`，保留这两个模型支持的 `none`。其他模型、协议、有效强度和未指定强度不变。

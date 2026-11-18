@@ -288,6 +288,37 @@ test("words, in English and Chinese", () => {
   expect(M.duration(130e3, "en")).toBe("2m 10s")
 })
 
+test("the Settings chevron and Language, Scene and Quality pickers are SVG app menus, with no native <select>", () => {
+  const html = read("index.html")
+  const css = read("style.css")
+  const app = read("app.js")
+  expect(html).not.toContain("⌄")
+  expect(html).not.toContain("<select")
+  expect(html).toMatch(/id="settingsBtn"[^>]*><span data-t="settings">Settings<\/span><svg class="chev" viewBox="0 0 10 6"/)
+  for (const [lblId, btnId, listId] of [["lblLang", "optLang", "optLangList"], ["lblScene", "optScene", "optSceneList"], ["lblQuality", "optQuality", "optQualityList"]]) {
+    expect(html).toMatch(new RegExp(`<button[^>]*id="${btnId}"[^>]*aria-labelledby="${lblId} ${btnId}"[^>]*aria-haspopup="listbox"[^>]*aria-expanded="false"[^>]*aria-controls="${listId}"[^>]*>.*<svg class="chev" viewBox="0 0 10 6"`))
+    expect(html).toMatch(new RegExp(`<div[^>]*id="${listId}"[^>]*role="listbox"[^>]*aria-labelledby="${lblId}"`))
+  }
+  expect(css).toContain("--faint: var(--magpie-faint, #b9b9c2);")
+  expect(css).toMatch(/\[data-theme="dark"\][^{]*\{[^}]*--faint:\s*var\(--magpie-faint,\s*#56565f\);/)
+  expect(css).toMatch(/::-webkit-scrollbar\s*\{\s*width:\s*8px;\s*height:\s*8px;\s*background:\s*transparent;\s*\}/)
+  expect(css).toMatch(/::-webkit-scrollbar-thumb\s*\{\s*background:\s*var\(--faint\);\s*border:\s*2px solid transparent;\s*border-radius:\s*8px;\s*background-clip:\s*padding-box;\s*\}/)
+  expect(css).toMatch(/::-webkit-scrollbar-thumb:hover\s*\{\s*background-color:\s*var\(--muted\);\s*\}/)
+  expect(css).toMatch(/::-webkit-scrollbar-button,\s*::-webkit-scrollbar-corner\s*\{\s*display:\s*none;\s*background:\s*transparent;\s*\}/)
+  expect(css).not.toContain("scrollbar-width")
+  expect(css).toMatch(/\.picker-list\s*\{[^}]*overscroll-behavior:\s*contain;/)
+  expect(css).toMatch(/\.btn\s*\{[^}]*display:\s*inline-flex;[^}]*align-items:\s*center;[^}]*gap:\s*7px;/)
+  expect(css).toContain(".today-tokens:empty { display: none; }")
+  expect(css).toContain('#settingsBtn[aria-expanded="true"] .chev, .lang-select[aria-expanded="true"] .chev { transform: rotate(180deg); }')
+  expect(css).not.toContain("appearance: none")
+  expect(css).toMatch(/prefers-reduced-motion:\s*reduce[\s\S]*\.chev/)
+  expect(app).toContain('setAttribute("role", "option")')
+  expect(app).toContain('getAttribute("aria-controls")')
+  for (const btnId of ["optLang", "optScene", "optQuality"]) {
+    expect(app).toContain(`makePicker(\n    "${btnId}"`)
+  }
+})
+
 // ---- the host part --------------------------------------------------------
 
 test("the host part writes what it reads, and changes no request", async () => {
@@ -302,6 +333,12 @@ test("the host part writes what it reads, and changes no request", async () => {
   hook.stop()
   const c = { origin: "local", protocol: "anthropic", agent: "cursor", session: "cu1", cwd: "/x", model: "m", query: "hi", options: {}, state: {}, report() {} }
   expect(await hook.onRequest({ model: "m", tools: [{ name: "x" }], messages: [{ role: "user", content: "hi" }] }, c)).toBeUndefined()
+  // with no remote option set, a request from another computer is only counted
+  const far = { ...c, origin: "gateway-key", agent: "opencode", session: "far1", state: {} }
+  await hook.onRequest({ model: "m", tools: [{ name: "x" }], messages: [{ role: "user", content: "hi" }] }, far)
+  expect(far.state.office).toBeNull()
+  expect(hook.snapshot().sessions.some((s) => s.session === "far1")).toBe(false)
+  expect(hook.snapshot().dropped).toBeGreaterThanOrEqual(1)
   hook.write()
   const live = readFileSync(join(out, "live.js"), "utf8")
   const snap = JSON.parse(live.slice("globalThis.AgentOfficeLive = ".length).replace(/;\s*$/, ""))
@@ -317,6 +354,33 @@ test("the gateway part still reads replies in each API", () => {
   expect(outcomeOf(replyOf({ output: [{ type: "function_call", name: "shell", arguments: "{}" }] }, "responses"))).toBe("tools")
   const t = createTracker()
   expect(t.request({ model: "m", tools: [1], messages: [{ role: "user", content: "x" }] }, { origin: "remote", agent: "a", session: "s" }, 1)).toBeNull()
+  expect(t.snapshot(1).dropped).toBe(1)
+  const remoteOn = createTracker({ remote: true })
+  expect(remoteOn.request({ model: "m", tools: [1], messages: [{ role: "user", content: "x" }] }, { origin: "gateway-key", agent: "a", session: "s" }, 1)).toBe("a|s")
+  expect(remoteOn.snapshot(1).dropped).toBe(0)
+})
+
+test("a gateway install counts dropped non-local requests until remote is enabled", async () => {
+  const out = tmp()
+  process.env.MAGPIE_AGENT_OFFICE_PAGE = out
+  const hook = await import("./office.hooks.mjs")
+  const body = { model: "m", tools: [{ name: "x" }], messages: [{ role: "user", content: "hi" }] }
+  await hook.onRequest(body, { origin: "gateway-key", protocol: "anthropic", agent: "cursor", session: "r1", cwd: "/srv", model: "m", query: "hi", options: { remote: false, text: true }, state: {}, report() {} })
+  expect(hook.snapshot().dropped).toBeGreaterThanOrEqual(1)
+  // toggling text while remote stays false preserves the dropped count
+  await hook.onRequest(body, { origin: "local", protocol: "anthropic", agent: "cursor", session: "l1", cwd: "/srv", model: "m", query: "hi", options: { remote: false, text: false }, state: {}, report() {} })
+  expect(hook.snapshot().dropped).toBeGreaterThanOrEqual(1)
+  // enabling remote resets dropped to 0 and records the remote agent
+  await hook.onRequest(body, { origin: "gateway-key", protocol: "anthropic", agent: "cursor", session: "r1", cwd: "/srv", model: "m", query: "hi", options: { remote: true, text: true }, state: {}, report() {} })
+  expect(hook.snapshot().dropped).toBe(0)
+  expect(hook.snapshot().sessions.some((s) => s.session === "r1")).toBe(true)
+  expect(read("index.html")).toContain('id="optRemote"')
+  expect(read("app.js")).toContain("remote: view.remote")
+  expect(read("app.js")).toContain("state.snap.dropped > 0")
+  for (const lang of M.LANGS) {
+    expect(M.TEXT[lang].remote).toBeTruthy()
+    expect(M.TEXT[lang].emptyRemote).toBeTruthy()
+  }
 })
 
 test("live.js is no file of the package's", () => {
