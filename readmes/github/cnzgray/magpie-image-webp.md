@@ -1,104 +1,124 @@
 # magpie-image-webp
 
-Magpie 网关 hook：把请求里的内联图片转成 WebP 并按宽度降采样，减少上行字节和首 token 等待。
+A Magpie gateway hook that re-encodes inline images as WebP and caps their width before a request leaves your gateway. [中文说明](README.zh.md)
 
-## 为什么
+## Why
 
-无状态 HTTP + base64 内联，网关必须收完整个 body 才能转发；同一张 2560×1600 截图每轮重发约 4.1 MB。上行只有 6 Mbps 时，首 token 被拖到 8–12 秒，而压缩发生在网关内部，不改变任何客户端行为。
+Magpie's gateway is stateless HTTP, and agents inline images as base64, so the whole body must arrive before it can be forwarded. A 2560×1600 screenshot re-sent every turn is about 4.1 MB. On a 6 Mbps uplink that pushed time to first token to 8–12 s; the same request after compression reached 2.6–3.1 s.
 
-实测（`agents: ["dsh"]`，1600px / q85）：
-
-| 位置 | 请求体 | 首 token |
+| Where | Body | Time to first token |
 |---|---|---|
-| 腾讯云网关（sharp） | 3.93 MB → 293 KB | 9.25 s → 2.6–3.1 s |
-| 本机 Mac（cwebp） | 3.93 MB → 280 KB | 3.7–4.0 s |
+| Tencent Cloud gateway (sharp) | 3.93 MB → 293 KB | 9.25 s → 2.6–3.1 s |
+| Local Mac (cwebp) | 3.93 MB → 280 KB | 3.7–4.0 s |
 
-本机到上游首 token 由 provider 主导，压图收益小；收益主要在多历史图、慢上行和按字节计费的 provider。
+Compression runs inside the gateway; clients and providers see ordinary requests. The gains matter most on slow uplinks, on long image histories, and with byte-billed providers.
 
-## 行为
+## What it does
 
-- 只改 `data:image/...;base64,...` 形式的图片，覆盖 chat 和 responses 两种协议的请求体。
-- 已压缩更大时保留原图；单张小于 `min` 字节的图不处理。
-- 只处理 `agents` 列出的 agent；`agents: []` 表示全部。
-- 任何异常、编码器缺失、超时都 fail-open：请求原样转发。
-- 改完的图片统一在全部压缩结束后写回请求体，不会留下半改状态。
+- Handles `data:image/...;base64,...` images in chat and Responses bodies, Anthropic `source.data` (rewriting `media_type` too), and Gemini `inlineData.data` / `inline_data.data` (rewriting `mimeType` / `mime_type`, keeping the spelling the request used).
+- Leaves non-inline references alone: Anthropic `url` sources and Gemini `fileData`.
+- Keeps the original when the WebP result is not smaller, and skips images below `min`.
+- Only touches the agents listed in `agents`; an empty list means every agent.
+- Fails open: any error, missing encoder, or timeout forwards the request untouched.
+- Applies every replacement only after all jobs succeed, so a rejected hook never leaves a half-rewritten body.
+- Caches results in an LRU keyed by the first 16 hex characters of the input's SHA-256 plus `width` and `quality`. Capacity is counted in compressed bytes and bounded by `cacheMB` and 256 entries.
+- The bundled WASM decoder reads PNG and JPEG. Other formats pass through unchanged.
 
-当前不支持 Anthropic 的 `source.data` 与 Gemini 的 `inlineData.data`（它们的 base64 不是 data URL，替换时还要改 `media_type` / `mimeType`）。这两条路径尚未对上游做 WebP 兼容性验证，见路线图。
+Requires Magpie 0.1.1273 or newer for async gateway hooks; page-saved options reach hooks on the next request with Magpie 0.1.1531 or newer.
 
-## 安装
+## Install
 
-仓库尚未发布到 npm。在 Magpie 的 Plugins 页面把本仓库的 `image-webp.hooks.mjs` 加为本地 hook，或手写条目：
+Install with Magpie's git spec:
+
+```sh
+magpie plugin add cnzgray/magpie-image-webp
+```
+
+Pin a release with `#v0.1.0`:
+
+```sh
+magpie plugin add cnzgray/magpie-image-webp#v0.1.0
+```
+
+The plugin is not published to npm; Magpie installs it from this repository and shows an update when the branch or the pinned ref moves. You can also add the folder or the hooks file from Plugins. The plugin's options live in `plugins.json`; the settings page edits the same object:
 
 ```json
 {
-  "spec": "/absolute/path/to/image-webp.hooks.mjs",
+  "spec": "/absolute/path/to/image-webp",
   "options": {
-    "agents": ["dsh"],
+    "agents": ["dsh", "codex"],
     "width": 1600,
     "quality": 85,
     "max": 4,
     "min": 131072,
+    "cacheMB": 64,
     "gatewayTimeoutMs": 5000
   }
 }
 ```
 
-安装后重启网关或用 `--force-recreate` 让 hook 生效。插件名就是 hooks 文件的路径，`magpie plugin options image-webp` 会报 no plugin。
+Restart the gateway (or use `--force-recreate`) after installing.
 
-## 选项
+## Options
 
-| 选项 | 默认 | 说明 |
+| Option | Default | Meaning |
 |---|---|---|
-| `agents` | `["dsh"]` | 生效的 agent；空数组表示全部 |
-| `width` | `1600` | 最大宽度（px），只会缩小，不会放大 |
-| `quality` | `85` | WebP 质量，1–100 |
-| `max` | `4` | 每请求最多处理几张图 |
-| `min` | `131072` | 原图小于该字节数时跳过 |
-| `gatewayTimeoutMs` | `5000` | 本 hook 的执行预算，magpie 侧限制在 100–30000 ms |
+| `agents` | `["dsh", "codex"]` | Agents to process; an empty list means all |
+| `width` | `1600` | Maximum width in pixels; only shrinks |
+| `quality` | `85` | WebP quality, 1–100 |
+| `max` | `4` | Images processed per request |
+| `min` | `131072` | Skip originals smaller than this many bytes |
+| `cacheMB` | `64` | Byte budget of the compressed-result LRU; `0` disables it |
+| `gatewayTimeoutMs` | `5000` | This hook's budget; Magpie clamps it to 100–30000 ms |
 
-## 编码后端
+## Settings page
 
-按顺序探测，第一个可用的胜出：
+The plugin adds an "Image WebP" page under Plugins with fields for every option: agent chips, maximum width, quality slider, images per request, minimum size, cache budget, and time budget. Saving writes the same options object; changes take effect on the next request.
 
-1. **sharp**：同目录装有 `sharp` 时使用，跨平台，自带 EXIF 旋转与宽度探测。
-2. **cwebp**：PATH 里的 `cwebp`，或环境变量 `IMAGE_WEBP_CWEBP` 指定的路径。宽度由内置的 PNG/JPEG 头解析得出；未知格式不带 `-resize`，仍尝试转码。
-3. 都没有：打印一条警告并跳过，请求原样转发。
+The page declares no permissions and makes no network requests. `test/page.test.mjs` checks for network calls, undeclared `magpie.read` calls, and that the page defaults match `lib/options.mjs`.
 
-默认零依赖。要用 sharp 时在 hooks 文件同目录执行 `bun add sharp`。
+## Encoders
 
-## WASM 后端实测
+Probed in order; the first one available wins:
 
-2026-11-20 在 Bun 1.4.4 上验证 `@jsquash/png` + `@jsquash/resize` + `@jsquash/webp`（1.5.0 / 3.1.1 / 2.1.1），尚未接入 `lib/backends.mjs`。单张图片，q85，Apple Silicon：
+1. **sharp** — used when it resolves from the plugin folder. Cross-platform, with EXIF rotation and width probing.
+2. **cwebp** — from `PATH` or `IMAGE_WEBP_CWEBP`. Width comes from the built-in PNG/JPEG header parser; an unknown format is encoded without `-resize`.
+3. **wasm** — bundled `@jsquash/png`, `@jsquash/jpeg`, `@jsquash/resize`, and `@jsquash/webp`. No system tools; PNG and JPEG decoding, no resize when the width already fits, and `Bun.gc(true)` after each image to keep RSS bounded.
+4. **none** — logs a warning and forwards the request untouched.
 
-| 样本 | WASM 冷 / 热 | sharp | cwebp | 输出 | WASM 峰值 RSS |
+Set `IMAGE_WEBP_BACKEND=sharp|cwebp|wasm` to skip probing. Install sharp beside the plugin (`bun add sharp`) to use it.
+
+## WASM measurements
+
+Bun 1.4.4, `@jsquash` 1.5.0 / 3.1.1 / 2.1.1, quality 85, Apple Silicon. Single image:
+
+| Sample | WASM cold / warm | sharp | cwebp | Output | WASM peak RSS |
 |---|---|---|---|---|---|
-| 1600×1000 截图样张（58 KB PNG） | 85 / 63 ms | 42 ms | 50 ms | 12.5 KB | 143 MB |
-| 2560×1600 噪声 → 1600（16.4 MB PNG） | 516 / 461 ms | 278 ms | 280 ms | 2.5 MB | 384 MB |
+| 1600×1000 screenshot sample (58 KB PNG) | 85 / 63 ms | 42 ms | 50 ms | 12.5 KB | 143 MB |
+| 2560×1600 noise → 1600 (16.4 MB PNG) | 516 / 461 ms | 278 ms | 280 ms | 2.5 MB | 384 MB |
 
-- 冷启动的 wasm 实例化包含在首张耗时内，没有额外初始化开销。
-- 4 张 2560 图一轮耗时 1.84 s，在 5 s 预算内，但只剩约 3 s 余量。
-- 编码体积比 native 大约 5%（噪声样本）；截图样张两者一致。
-- 宽度已达标时调用 resize 仍需 117–125 ms，后端必须跳过同宽 resize。
-- 不加干预时 RSS 每张上涨约 40 MB（2560）或 10 MB（1600）；每轮调用 `Bun.gc(true)` 后稳定在 296 MB / 118 MB，单次 GC 约 18 ms，相对 450 ms 的压缩成本可忽略。
+- WASM instantiation is included in the first image; there is no separate warm-up.
+- Four 2560-wide images take 1.84 s in one request, inside the 5 s budget but with about 3 s left.
+- Output is about 5% larger than native on the noise sample; the screenshot sample matches exactly.
+- Resizing a 1600-wide image still costs 117–125 ms, so the backend skips resize when the width already fits.
+- Without intervention RSS grows by about 40 MB per 2560 image or 10 MB per 1600 image; `Bun.gc(true)` after each image keeps it at 296 MB / 118 MB, at about 18 ms per call versus 450 ms of compression.
+- A 1600×1000 JPEG takes 298 ms, 2.6 MB → 1.2 MB, with a 177 MB peak.
 
-结论：WASM 可以作为默认后端，但需要配合 GC 与 resize 跳过；sharp 仍是快 1.7 倍、省 2.8 倍内存的可选加速。
+The WASM backend is the default because it needs no system dependencies; sharp is about 1.7× faster with 2.8× less memory.
 
-## 开发
+## Development
 
 ```sh
 bun test
 ```
 
-测试用确定性噪声生成 PNG，并像网关一样直接调用 `onRequest`。压缩相关用例在缺少 `cwebp` 与 `sharp` 的机器上跳过。
+Tests generate deterministic PNGs and call `onRequest` the way the gateway does. `cases.json` holds the protocol cases and is driven by `test/cases.test.mjs`; `test/wasm.test.mjs` runs the cold path in a separate process with the WASM backend forced.
 
-## 路线图
+## Roadmap
 
-- [ ] `lib/protocols.mjs` 增加 Anthropic / Gemini 图片字段，先补 `cases.json` 再实现
-- [ ] 上游 WebP 兼容矩阵：yescode、Gemini、Anthropic 原生路径各测一次，必要时按 provider 回退 JPEG
-- [ ] 按 sha256 前缀的 LRU 缓存，避免历史图每轮重压
-- [ ] 图形化 options 表单（page 插件）
-- [ ] 发布 npm，并提 PR 到 `magpie-community/plugins`（命名为 `@magpie-community/gateway-image-webp`）
+- Verify upstream WebP acceptance for yescode, Gemini, and Anthropic native paths, falling back to JPEG per provider if needed.
+- Open a PR against `magpie-community/plugins` as `@magpie-community/gateway-image-webp` if the community list wants it.
 
-## 许可
+## License
 
 MIT
