@@ -44,12 +44,13 @@ such by `scripts/check.mjs`). A fork release keeps both in `files` beside the
 modules it adds; `index.mjs` stays where it was and is what the two re-export,
 so neither a fork edit nor an upstream release has to touch the other.
 
-## One switch per plugin, and what each of them turns on
+## One switch per card, and what each of them turns on
 
-All three of this fork's plugins put their difference from upstream behind a
-single magpie switch (`auth.options`), off by default: off sends what upstream
-sends, on sends what the vendor's own client sends. They are drawn in the
-provider's editor under the models — Provider › Edit › **Plugin options** — and
+All five of this fork's plugins put their difference from upstream behind
+magpie switches (`auth.options`), off by default: off sends what upstream sends,
+on sends what the vendor's own client sends. `codearts` and `officeace` are two
+providers of one package with a card each, so they carry a switch each. They
+are drawn in the provider's editor under the models — Provider › Edit › **Plugin options** — and
 magpie reads them as the plugin works, so a flip reaches the next request and
 nothing restarts.
 
@@ -58,13 +59,23 @@ nothing restarts.
 | `workbuddy` | `request_format_2108` — *Send as CodeBuddy CLI 2.108.1* | chats go out in the CLI's shape |
 | `raccoon` | `request_shape_desktop_1_1_5` — *Send as the Raccoon desktop app 1.1.5* | chats go out in the app's shape |
 | `loomy` | `request_shape_client_0_9_39` — *Send as the Loomy client 0.9.39* | chats go out in the client's shape |
+| `codearts` | `request_shape_ide_0_2_9` — *Send as the CodeArts IDE 0.2.9 agent* | chats go out in the IDE agent kernel's shape, and the check-in names the desktop client's channel |
+| `officeace` | `request_shape_officeace_1_8_1` — *Sign the daily claim the way OfficeAce 1.8.1 does* | the claim stops signing `x-subscription-type`, and a refused model catalog stops reading as a dead sign-in |
+| `trae` | `request_shape_client_0_1_69` — *Send as the TRAE SOLO CN client 0.1.69* | chats go out in the client's shape |
 
 The switches cover the *request's shape* and nothing else: headers, the body's
 transform, the stream's framing. What each plugin reads off the vendor — the
 credit windows, the model lists, the check-in, the sign-in's renewal — is not
 behind a switch, because turning that off would make the plugin lie about the
-account instead of sending a different client. The sections below say for each
-plugin exactly where the line is.
+account instead of sending a different client.
+
+There is one deliberate exception, and it is about a misreading rather than a
+read: `officeace`'s switch also decides what a *refused* model catalog means.
+Upstream calls it a dead sign-in; the client's own reading is that the derived
+MaaS pair went stale. Both are conclusions about an answer that already came
+back, so putting the choice behind the switch is not hiding a fact — the
+section below says exactly what moves. The sections below say for each plugin
+where the line is.
 
 **In OpenCode** there are no switches, so each plugin reads its shape from
 what OpenCode does have: `raccoon` and `loomy` keep the vendor client's shape
@@ -682,6 +693,224 @@ balance over every grant counts as used, a reply without the pair is an amount
 without a limit, and the vendor's capabilities arrive where the host reads
 them.
 
+## `codearts`: the IDE agent kernel's request shape
+
+The CodeArts IDE does not send its model requests from JavaScript: an agent
+kernel (`resources/bin/agent-kernel.exe`) makes them, and it names itself
+differently from the plugin on eight points. Most are `shapeOn()` gates in
+`packages/codearts/index.mjs`, all off unless the switch is on; two live in the
+signer and the check-in instead, for the reasons below:
+
+| | upstream's plugin | the IDE kernel |
+|---|---|---|
+| thinking | `thinking: {type: "enabled"｜"disabled"}` | `enable_thinking: true｜false` |
+| session | `Chat-Id` and `Session-Id` beside `x-ot-session-id` | `x-ot-session-id` alone |
+| parent | `x-ot-parent-session-id: ""` | the session id itself |
+| signature | `x-sdk-content-sha256` and `content-type` in the signed set | `host;x-sdk-date;x-security-token` only |
+| usage | nothing | `stream_options: {include_usage: true}` |
+| token | the STS token once, as `x-security-token` | also as `x-auth-token` |
+| identity | none | `plugin-name`/`plugin-version`/`ide-name`/`ide-version` (all `codearts_space`, `0.2.9`), `x-ot-client-type: desktop`, `x-ot-client-version`, `traceid`, `client-ip`, `user-msg-id`, `created-time`, `model-id`, `model-name` |
+| check-in | `channel=IDE` | `channel=DESKTOP` |
+| session state | no heartbeat | `PUT /snap-manager/v1/chat-session/heartbeat?status=busy｜idle` |
+
+Nothing else in the request changes: the same host, the same
+`SDK-HMAC-SHA256` signing, the same `maas_type` for a benefit-pool model. The
+kernel sends `tool_stream: true` beside `enable_thinking`, which the switch
+adds too.
+
+The trace header differs in shape as well as in name: the kernel sends
+`x-snap-traceid: <uuid>_<host suffix>` and repeats the trace as `traceid`,
+where upstream sends bare hex in `x-snap-traceid` and nothing else.
+
+The heartbeat is deliberately small — `busy` before the chat, `idle` after,
+empty body, the same three signed headers, plus `accept`, `content-type`,
+`user-session-id` and `x-snap-traceid`. It is best effort throughout: a failed
+beat changes nothing the caller sees, and the `idle` one is not awaited.
+
+The two gates outside `index.mjs`'s header block are the signer's
+`omitContentType` (the kernel does not sign `content-type`, though it still
+sends it) and `opsChannel()` (the check-in's `channel` word).
+
+The switch is `request_shape_ide_0_2_9`, declared in
+`packages/codearts/extras.mjs` beside `extendCodeArts`; `index.mjs` reaches it
+in a handful of marked places — an import, the gates, and the
+`return extendCodeArts(` at the bottom — so following upstream's `index.mjs`
+never has to merge past the new code. `auth.methods` is a getter (it answers which sign-in methods this
+machine has), so the wrap carries it over with `keepGetters` rather than
+freezing one answer.
+
+The one place the switch does *not* reach is the signer's other callers. IAM's
+phone lookup, the opengw benefit claim, the trace queue — those are the
+plugin's own routes to the same account, not the kernel's, so they keep
+`x-sdk-content-sha256`, `content-type` and the upstream signature whatever the
+switch says. The signer takes both as arguments (`omitContentHash`,
+`omitContentType`), and only the chat transport passes the switch's answer.
+
+## `officeace`: the claim signs one header fewer
+
+`officeace` is the second provider of the `codearts` package, with a card and a
+switch of its own — `request_shape_officeace_1_8_1`. It changes two things: the
+daily claim stops signing `x-subscription-type`, and a refused model catalog
+stops meaning "signed out".
+
+The client signs that header on reads and not on the claim. `GET
+/v1/subscription` goes out as
+`SignedHeaders=host;x-project-id;x-sdk-date;x-security-token;x-subscription-type`;
+`POST /v1/subscription/bonus/claim` goes out as
+`content-type;host;x-project-id;x-sdk-date;x-security-token` — no
+`x-subscription-type` at all, signed or sent. Upstream signed and sent it on
+both. Measured 2026-11-20 on the OfficeAce 1.8.1 client.
+
+Everything else about the claim is already right and stays as upstream has it:
+the path (`/v1/subscription/bonus/claim`), the method, the empty body, and
+reading the answer's `bonus_skus` for the points. Reads keep the header in both
+shapes.
+
+**The second change is about a message, not a request.** Upstream's
+`provider.models` hook reads a 401 from the model catalog as a dead sign-in and
+throws `signIn: "expired"`, so the card says *登录已失效，请重新登录* the moment it
+first draws the model list — right after signing in, which is when it is least
+likely to be true.
+
+That catalog is not authenticated with the sign-in. It carries
+`Basic base64(appKey:appSecret)`, a pair **derived** from the sign-in by the
+permission check and cached for six hours. A pair that was refused means the
+derived material went stale or was never minted; the account itself is still
+signed in. Upstream has no way back from that, because the healing path only
+runs when the pair is *absent* — a stale one is trusted as it stands.
+
+With the switch on, a refused catalog is read that way: re-read the pair once
+(past the cache), ask the catalog again, and if it is still refused stay on the
+static table with the account signed in. Nothing about the sign-in, the
+refresh, or the account record changes. Off is upstream's behaviour
+byte-for-byte, including the throw.
+
+It is two gates — one in `signOfficeAceV11`, one in the models hook, both
+`shapeOn("officeace")` — plus the `return extendOfficeAce(` at the bottom and
+the import.
+
+**The two switches do not reach each other.** `WIRE_SWITCHES` names the
+provider each key belongs to, because magpie asks `option(provider, key)` and
+both cards live in this one package: an unbound list would let either card's
+switch turn the other's requests on. `shapeOn()` is keyed by provider for the
+same reason.
+
+**In OpenCode** there are no switches, so `shapeOn()` has no reader and reads
+false: the request keeps upstream's shape. That is the opposite of `raccoon`
+and `loomy`, and deliberately — those two are the only shape their vendor's
+client has, while this one has two, and the one the fork is built on is
+upstream's.
+
+What the switch does not carry: the model list's capabilities, the credit
+windows, the check-in, the renewal. Those are readings of what the vendor
+says, not shapes of the request. In particular `packages/codearts/index.mjs`
+reads no multimodal field at all — a model is taken as text-only unless its id
+ends in `-vl` — which the plugin's README says plainly is a guess the vendor's
+own answers could replace (`supports_images` on the agent list). That is a
+change of its own, not this switch.
+
+Checked with `node --test packages/codearts/index.test.mjs` (216 tests, all
+passing) and `node --test packages/codearts/extras.test.mjs` (9 more, which open
+the switches and look at what moves) — with the switch off, which is what a
+test's plugin gets, every assertion upstream wrote still holds: the `thinking`
+body, the signed header set, one `Chat-Id` per account, and the 400-retry that
+drops the thinking field.
+
+## `codearts` and `officeace`: the total says what is left
+
+Both providers report one window that routing reads — this package's `总积分`
+and OfficeAce's `总积分 · 剩 N`, every bucket beside them `aside` — and neither
+said a balance, so magpie had nothing to order an account of one provider by
+once the shares tied. `raccoon` has said one since the day's split
+(`balance` on both readings of `每日积分`), and magpie reads it in `byLeft`:
+seats in one provider's one unit go by what they have left, most first.
+
+The two windows now carry it (`creditWindow` and the aggregate in
+`fetchOfficeAceUsage`, both in `packages/codearts/index.mjs`). Nothing else
+changes: the share, the amounts, the display and the aside marks are upstream's.
+
+- **A balance of 0 is left out**, as raccoon leaves it out. `Allowance.Left`
+  takes the *least* balance among a model's windows, and `allowanceOf` reads a
+  balance of 0 as `used = max(used, 100)` — a total down to nothing would both
+  drag the account's `Left` to nothing and file it used up on its own, which
+  its share already says.
+- **It orders only inside one provider.** `byLeft` keeps each unit's seats in
+  the places its own seats take and leaves two kinds in `before`'s order
+  between them, so a group of providers is not sorted by whose credits are
+  larger — the amounts are not comparable (CodeArts credits are not
+  OfficeAce's points, and neither converts to the other).
+- **The card reads the balance first.** magpie's `quotaText` answers a balance
+  before it answers a share (`app.js`: `if (w.balance != null) return t("{n}
+  left", ...)`), so these two rows now say "还剩 3800 credits" where they said
+  "200 / 4600 credits · 4.3% used". `quotaNoShare` counts a window with a
+  balance as having no share to draw a bar from, so the bar goes with it. The
+  count is still in the tooltip's `amount`/`limit`, and the expiry line
+  (`runsOutText`) is untouched.
+
+**What it does not do** is make a monthly pool outrank a daily one. Under
+`pace` the codearts accounts still measure 0.14 points an hour against
+raccoon's 0.85–1.06, because a 4700-credit month spread over 700 hours is a
+smaller rate than 400 credits over 22 — the balance tiebreaks inside a
+provider, and no further. Sorting three providers by "spend what expires
+soonest" is the routing's job, not a window field's: under Smart the first key
+is `Seat.Soon`, which `Allowance.Renewal` fills from `runsOutAt` when it comes
+before the reset, and both windows already name it.
+
+Checked with `node --test packages/codearts/index.test.mjs` (216 tests: the
+package total with a balance, a spent one without, and an OfficeAce account
+whose every bucket expired still carrying `used: 100` and no balance).
+
+## `trae`: the client names its conversation twice
+
+Trae CN's client writes the conversation id into `session_id` **and**
+`conversation_id`, and says in `access_type` (always `0`) how the request
+reaches the model. Upstream's plugin writes `session_id` alone. That is the
+whole of the switch `request_shape_client_0_1_69`: with it on, `chatBody` adds
+`conversation_id` and `access_type`, and both names carry the same id — one
+conversation, named twice, not two.
+
+It is one gate in `packages/trae/index.mjs`, marked `shapeOn()`, plus the
+`return extendTrae(` at the bottom and the import; the switch itself is in
+`packages/trae/extras.mjs`. `session_id` already came from
+`conversationID()` (the account and the session, hashed behind a salt of its
+own), so which id the client would have sent is not in question — only whether
+it is said twice.
+
+**In OpenCode** there are no switches, so `shapeOn()` reads false and the
+request keeps upstream's shape.
+
+Two things this fork changes in Trae that are *not* behind the switch, because
+they are the account's life rather than the request's shape:
+
+- **The session salt has to survive the process.** `conversationID()` derives
+  a conversation's id from the account plus the session, hashed behind a salt
+  read from `MAGPIE_TRAE_SESSION_SALT` or `~/.config/magpie/trae-session-salt`
+  and written there if absent. In a container without a persistent volume the
+  salt is new after every rebuild, so the same conversation reaches Trae as a
+  new one each time — visible as one conversation split across several rows in
+  the usage list. Set the variable or mount the directory.
+- **Nothing else reads this machine unless the machine is there.** Three
+  readings in the plugin look for a local Trae client — the sign-in in its
+  `storage.json`, the device id for the check-in, the host facts those two go
+  with. All three are skipped when the file is not there, and the check-in
+  falls back to a derived device id, so a container with no client on it works.
+  What it cannot do is claim to be a device it cannot measure; the derived id
+  is the honest fallback, and Trae may or may not count it.
+
+The Max variant of a model (`deepseek-v4.1-flash-max`) is this plugin's own
+construction, not an id the vendor lists: the models hook offers it beside the
+base id when the vendor's entry carries a `__max` detail, and a chat sent to it
+is rewritten back to the base id with `max_tokens` and
+`user_message_context.model_info.prompt_max_tokens` carrying the window. The
+client has a `max_mode`/`is_max_default` flag pair in its model schema instead;
+whether Trae wants one of those said explicitly is not established here, and is
+left as an open question rather than guessed at.
+
+Checked with `node --test packages/trae/extras.test.mjs` (6 tests). The rest of
+the package's tests import `bun:test` and do not run under `node --test`, which
+is what this checkout has; they are unchanged either way, since with the switch
+off — what a test's plugin gets — `chatBody` sends exactly what it sent before.
+
 ## `helper/`: carrying sign-ins in from other tools
 
 Both scripts read another tool's store and write magpie's
@@ -731,11 +960,12 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
 发版把这两个文件连它自己新增的模块一起列进 `files`；`index.mjs` 位置不动，
 正是这两个文件要再导出的东西 —— 于是 fork 的改动与上游的发版互不碰面。
 
-### 三个插件各一个开关，开关管的是请求形状
+### 五张卡片各一个开关，开关管的是请求形状
 
-本 fork 的三个插件都把与上游的差别收在一个 magpie 开关（`auth.options`）
-后面，默认关闭：关＝上游本来发的请求，开＝厂商自己客户端发的请求。开关画在
-提供商编辑器的模型列表下面 —— 提供商 › 编辑 › **插件选项** —— magpie 边用边
+本 fork 的五个插件都把与上游的差别收在 magpie 开关（`auth.options`）后面，
+默认关闭：关＝上游本来发的请求，开＝厂商自己客户端发的请求。`codearts` 与
+`officeace` 是同一个包里的两个提供商、各有一张卡片，所以各带一个开关。开关
+画在提供商编辑器的模型列表下面 —— 提供商 › 编辑 › **插件选项** —— magpie 边用边
 读，打开后下一笔请求即生效，不重启任何东西。
 
 | 插件 | 开关 | 打开的含义 |
@@ -743,21 +973,33 @@ base 是 fork 改动落地时上游的那个版本，不是 `packages/*/package.
 | `workbuddy` | `request_format_2108` — *Send as CodeBuddy CLI 2.108.1* | 按 CLI 的形状发 |
 | `raccoon` | `request_shape_desktop_1_1_5` — *Send as the Raccoon desktop app 1.1.5* | 按桌面端的形状发 |
 | `loomy` | `request_shape_client_0_9_39` — *Send as the Loomy client 0.9.39* | 按客户端的形状发 |
+| `codearts` | `request_shape_ide_0_2_9` — *Send as the CodeArts IDE 0.2.9 agent* | 按 IDE 里那个 agent 内核的形状发，签到频道也用桌面端的 |
+| `officeace` | `request_shape_officeace_1_8_1` — *Sign the daily claim the way OfficeAce 1.8.1 does* | 每日领取不再签名 `x-subscription-type`，目录被拒不再当成登出 |
+| `trae` | `request_shape_client_0_1_69` — *Send as the TRAE SOLO CN client 0.1.69* | 按客户端的形状发 |
 
 开关只管**请求的形状**：请求头、请求体的改写、流的包装。插件从厂商读回来的
 东西 —— 积分窗口、模型列表、签到、登录态的续期 —— 不在开关后面，因为把它们
-关掉是让插件对账号说谎，而不是换一个客户端发请求。每一节下面写了那条线画在
-哪里。
+关掉是让插件对账号说谎，而不是换一个客户端发请求。
+
+有一处刻意的例外，而它管的是"把一个答复读错"、不是"读什么"：`officeace`
+的开关还决定**模型目录被拒**意味着什么。上游当成登录态已死，客户端那边的
+读法是派生出来的 MaaS 密钥过期了。两种都是对"已经回来的答复"下的结论，把它
+放在开关后面不算藏事实 —— 下面那一节逐条写了动的是什么。每一节下面写了那条
+线画在哪里。
 
 **在 OpenCode 里没有开关**，因此插件改读 OpenCode 有的东西：`raccoon` 与
 `loomy` 在那里保持厂商客户端的形状 —— 正是它们开关打开时要求的东西，所以
 `input.magpie` 缺席被读作"开"而不是"关"（各自的 `extras.mjs` 里叫 `shapeOf`）；
 `workbuddy` 则按安装 tuple 里的 `requestFormat` 取值，那里没写时发 magpie 自己的
-形状（`index.mjs` 的 `formatOf`）。
+形状（`index.mjs` 的 `formatOf`）;`codearts` 与 `trae` 反过来 —— 没有 `magpie`
+时读作"关"，发上游的形状（各自 `extras.mjs` 里叫 `shapeOn`）。这两家与另两家
+的取法相反是有意的：`raccoon`/`loomy` 的厂商客户端只有一种形状，而
+`codearts`/`trae` 有两个，本 fork 站在上游那个上。
 
 开关不带 `default: true`，所以新装的插件发的是上游的请求，直到有人把它打开。
 magpie 把选项的 label 截到 60 字符、description 截到 300（`host.js` 的
-`shown`），超长的部分静默丢掉；带开关的两个插件在测试里断言四种语言都在限内。
+`shown`），超长的部分静默丢掉；带开关的插件在测试里断言四种语言都在限内
+（`codearts`/`trae` 的选项是逐条量过的：label 最长 38、description 最长 280）。
 
 - **`workbuddy` 的 CodeBuddy CLI 2.108.1 请求形状**：可以按官方 CodeBuddy
   CLI（`@tencent-ai/codebuddy-code` 2.108.1）的形状，而不是桌面客户端的形状，
@@ -1074,3 +1316,127 @@ magpie 把选项的 label 截到 60 字符、description 截到 300（`host.js` 
   工具调用。上游 0.1.8 修了这个（#1141），本 fork 跟随（`listedModel`，
   `packages/loomy/index.mjs`）：厂商的 `capabilities` 以运行时形状覆盖已知的
   值，厂商没提到的字段保留原值，而不是变成 false。
+- **`codearts` 的 IDE agent 内核请求形状**：CodeArts IDE 的模型请求不是它的
+  JavaScript 发的，是 `resources/bin/agent-kernel.exe` 这个 agent 内核发的，
+  它在这些点上与插件自称的方式不同：思考用 `enable_thinking` 布尔（外加
+  `tool_stream` 布尔）而不是 `thinking: {type}` 对象；会话只写在
+  `x-ot-session-id` 里，不带 `Chat-Id` 与 `Session-Id`；`x-ot-parent-session-id`
+  填的是会话 id 本身而不是空串；签名的头集合只有
+  `host;x-sdk-date;x-security-token`——没有 `x-sdk-content-sha256`，也
+  **不签 `content-type`**（虽然照发）；带
+  `stream_options: {include_usage: true}` 让网关计数；STS token 除
+  `x-security-token` 外再用 `x-auth-token` 发一遍；另有一组身份头
+  （`plugin-name`/`plugin-version`/`ide-name`/`ide-version` 全是
+  `codearts_space`+`0.2.9`、`x-ot-client-type: desktop`、
+  `x-ot-client-version`、`traceid`、`client-ip`、`user-msg-id`、
+  `created-time`、`model-id`、`model-name`）；签到的 `channel` 用 `DESKTOP`
+  而不是 `IDE`；聊天前后各发一次
+  `PUT /snap-manager/v1/chat-session/heartbeat?status=busy|idle`（空体、同样
+  那三个签名头）。trace 头的形状也不同：内核发
+  `x-snap-traceid: <uuid>_<主机后缀>` 并把同一个 trace 再写成 `traceid`，
+  上游只发裸十六进制。别的都不变：同一个 host、同一套 `SDK-HMAC-SHA256` 签名、
+  免费池模型仍然带参与签名的 `maas_type`。心跳刻意做得很小，且全程尽力而为：
+  失败不影响调用方看到的东西，`idle` 那一次不等待。开关是
+  `request_shape_ide_0_2_9`，声明在
+  `packages/codearts/extras.mjs`；`index.mjs` 只碰几处标好的位置——一处
+  import、各处 `shapeOn()` 门、底部一句 `return extendCodeArts(`——所以跟上游
+  的 `index.mjs` 永远不必把新代码合并过去。`auth.methods` 是 getter（它回答这台机器有哪几种
+  登录方式），所以包装时用 `keepGetters` 原样搬过去，而不是展开时把它求值、
+  冻成一个答案。开关唯一够不到的地方是签名函数的其它调用者：IAM 取手机号、
+  opengw 领免费额度、并发队列查询——那是插件自己账号的路径，不是内核的，所以
+  它们无论开关如何都照旧带 `x-sdk-content-sha256`、照旧签 `content-type`、
+  用上游的签名。签名函数把这两件事做成参数（`omitContentHash`、
+  `omitContentType`），只有聊天这条传输把开关的答案传进去。开关不管：模型列表的能力声明、积分窗口、签到、续期——那些是
+  读厂商说了什么，不是请求的形状。特别地，`packages/codearts/index.mjs` 根本
+  不读任何模态字段，除 id 以 `-vl` 结尾的以外一律当纯文本，这一点包的 README
+  已经写明是猜的、可以用厂商自己的答复（agent 列表的 `supports_images`）替掉；
+  那是另一件事，不在这个开关下面。验证：`node --test
+  packages/codearts/index.test.mjs`（216 条全绿）与 `node --test
+  packages/codearts/extras.test.mjs`（另有 9 条，专门打开开关看哪些东西动了）
+  —— 测试里拿到的插件没有 `magpie`，开关即关闭，上游写下的每条断言照样成立：
+  `thinking` 请求体、签名头集合、一个账号一个 `Chat-Id`、以及那条在 400 时把
+  thinking 字段删掉的重试。
+- **`officeace` 的领取少签一个头、目录被拒不再等于登出**：`officeace` 是
+  `codearts` 这个包里的第二个提供商，有自己的卡片和开关
+  `request_shape_officeace_1_8_1`。它改两件事：每日领取不再签名、也不再发
+  `x-subscription-type`；模型目录被拒不再被读成登出。客户端读的时候签它
+  （`GET /v1/subscription` →
+  `SignedHeaders=host;x-project-id;x-sdk-date;x-security-token;x-subscription-type`），
+  领取的时候不签
+  （`POST /v1/subscription/bonus/claim` →
+  `content-type;host;x-project-id;x-sdk-date;x-security-token`，压根没有这个头）。
+  上游两边都签。领取的其它部分本来就对、保持原样：路径、方法、空体、从回执的
+  `bonus_skus` 读积分。读侧两种形状都保留这个头。
+  **第二件事改的是一句提示，不是一个请求。** 上游的 `provider.models` 钩子把
+  模型目录的 401 读成登录态已死，抛 `signIn: "expired"`，于是卡片在第一次画
+  模型列表时就说"登录已失效，请重新登录"——也就是刚登录完的那一刻，最不可能
+  成立的时候。可那个目录用的不是登录凭据：它带的是
+  `Basic base64(appKey:appSecret)`，一对由登录态经权限校验**派生**出来、缓存
+  六小时的密钥。这对密钥被拒，说明派生物过期或根本没换到，账号本身还登着。
+  上游没有回头的路，因为自愈那条路只在密钥**缺失**时才走，陈旧的就当好的用。
+  开关打开后，目录被拒按这个理解处理：绕过缓存重读一次密钥、再问一次目录，
+  还被拒就停在静态表、账号继续登着。登录、续期、账号记录一概不动。关闭时是
+  上游的行为，逐字节，包括那句 throw。它是两处 `shapeOn("officeace")` 门
+  （一处在 `signOfficeAceV11`、一处在 models 钩子）、底部一句
+  `return extendOfficeAce(`、一处 import。
+  **两个开关互不影响**：`WIRE_SWITCHES` 里每一项都写明自己属于哪个提供商，
+  因为 magpie 是按 `option(provider, key)` 问的、而两张卡片在同一个包里——
+  不绑提供商的列表会让任意一张卡片的开关打开另一张的请求；`shapeOn()` 也
+  按提供商分键。
+- **`codearts` 与 `officeace` 的总积分带上剩余额**：两家各只有一个窗口参与
+  路由——本包的 `总积分` 与 OfficeAce 的 `总积分 · 剩 N`，其余桶全是 `aside`
+  明细——而这两个窗口原先都不带 `balance`，所以份额打平时 magpie 手里没有
+  任何东西可以把同一个 provider 的两个账号排出先后。`raccoon` 自日积分拆分
+  起就带（`每日积分` 的两种读法都带），magpie 在 `byLeft` 里读它：同一个
+  provider 同一个单位内，剩得多的排前面。
+  两个窗口现在都带上了（`creditWindow` 与 `fetchOfficeAceUsage` 里的汇总，
+  都在 `packages/codearts/index.mjs`）。其余一概不动：份额、金额、`display`、
+  `aside` 标记全是上游的。
+  - **余额为 0 不带**，与 raccoon 一样。`Allowance.Left` 取的是该模型各窗口
+    balance 的**最小**值，而 `allowanceOf` 把 balance 0 读成
+    `used = max(used, 100)`——一个已经归零的总积分窗口既会把账号的 `Left`
+    拖到零，又会自己把账号判成已用尽，而它的份额本来就说了这件事。
+  - **只在同一个 provider 内排序**。`byLeft` 把每个单位自己的座位排在它们
+    原本占的位置上，两种单位之间仍按 `before` 的顺序，所以一个组里各 provider
+    的账号不会按“谁剩得多”排——这些数额本来就不可比（CodeArts 的积分不是
+    OfficeAce 的积分，两者也不换算）。
+  - **卡片先读余额**。magpie 的 `quotaText` 先看 balance 再看份额（`app.js`：
+    `if (w.balance != null) return t("{n} left", ...)`），所以这两行现在说
+    “还剩 3800 credits”，而不是“200 / 4600 credits · 已用 4.3%”；`quotaNoShare`
+    把带 balance 的窗口当成没有份额、因而不画进度条。计数仍在 tooltip 的
+    `amount`/`limit` 里，到期那一行（`runsOutText`）不受影响。
+  **它做不到的事**：让月度池压过日更池。`pace` 下 codearts 三个账号仍是
+  0.14 点/小时，而 raccoon 是 0.85–1.06——4700 分摊在 700 小时上就是比 400 分
+  摊在 22 小时上小。余额只在同一个 provider 内部破平手。按“先花最快过期的”
+  排三个 provider 是路由的事，不是窗口字段的事：Smart 的第一个比较键是
+  `Seat.Soon`，而 `Allowance.Renewal` 在 `runsOutAt` 早于续期时会拿它顶替，
+  两个窗口本来就都写了 `runsOutAt`。
+  验证：`node --test packages/codearts/index.test.mjs`（216 条：总积分带余额、
+  用尽时不带、以及 OfficeAce 全部过期时仍保留 `used: 100` 且不带余额）。
+- **`trae` 的客户端把会话写两遍**：Trae CN 的客户端把会话 id 同时写进
+  `session_id` 与 `conversation_id`，并用 `access_type`（恒为 `0`）说明请求
+  怎么到达模型；上游插件只写 `session_id`。开关
+  `request_shape_client_0_1_69` 的全部内容就是这一件事：打开后 `chatBody` 补上
+  `conversation_id` 与 `access_type`，两个名字装同一个 id —— 一段对话被说了
+  两遍，不是两段。它是一处 `shapeOn()` 门、底部一句 `return extendTrae(` 和
+  一处 import；开关本身在 `packages/trae/extras.mjs`。`session_id` 本来就来自
+  `conversationID()`（账号 + 会话，过一层自己的盐再哈希），所以"客户端会发
+  哪个 id"不是问题，有问题的只是"要不要写第二遍"。另有两件本 fork 改了、但
+  **不在开关后面**，因为它们是账号的生命而不是请求的形状：**会话盐必须跨进程
+  存活** —— `conversationID()` 用一个盐把账号与会话哈希成会话 id，盐取自
+  `MAGPIE_TRAE_SESSION_SALT` 或 `~/.config/magpie/trae-session-salt`，文件不
+  存在就生成并落盘；容器里没有持久卷，重建后盐是新的，同一段对话每次都到
+  Trae 那里变成新的，表现为用量明细里一次对话被拆成多条，所以要设这个变量或
+  挂这个目录。**没有客户端就不读客户端** —— 插件里有三处读本机 Trae 客户端
+  （`storage.json` 里的登录态、签到用的设备号、以及配套的机器信息），文件不在
+  就整段跳过，签到退回派生的设备号，所以没有客户端的环境照常工作；它做不到的
+  是自称一台它量不到的机器，派生号是诚实的退路，Trae 认不认它另说。另外
+  `deepseek-v4.1-flash-max` 这个 id 是插件自己造出来的，不是厂商列出的：
+  models hook 在厂商条目带 `__max` 明细时于基础 id 旁边多给一行，发给它的
+  对话会被改回基础 id，并用 `max_tokens` 与
+  `user_message_context.model_info.prompt_max_tokens` 承载窗口。客户端那边是
+  `max_mode`/`is_max_default` 一对标志；Trae 是否要求显式说出其中之一，这里
+  没有确立，留作未决问题而不是猜一个。验证：`node --test
+  packages/trae/extras.test.mjs`（6 条）。包里其余测试 `import "bun:test"`，在
+  这个只有 node 的 checkout 里跑不起来；它们本来也不受影响 —— 开关关闭（测试
+  里拿到的插件就是这个状态）时 `chatBody` 发的与改动之前逐字相同。

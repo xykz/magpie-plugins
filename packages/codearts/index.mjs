@@ -49,6 +49,10 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
+// The fork's own piece — the request-shape switch — in a file a merge of
+// upstream's index.mjs can leave alone. See extras.mjs.
+import { extendCodeArts, extendOfficeAce, shapeOn, wireOn } from "./extras.mjs"
+
 const PROVIDER = "codearts"
 const NPM = "@ai-sdk/openai-compatible" // chat completions
 
@@ -156,7 +160,26 @@ const CREDIT_BATCHES_TTL_MS = 10 * 60 * 1000
 const OPS_DELIVERY_URL = `${SNAP_HOST}/v1/ops/delivery?channel=IDE`
 const OPS_CLAIM_URL = `${SNAP_HOST}/v1/ops/claim`
 const OPS_CONFIRM_URL = `${SNAP_HOST}/v1/ops/confirm`
+// Upstream names this route `IDE`; the desktop client (0.2.9, 0.2.9's own
+// activity pane) asks for `DESKTOP` — five `GET /v1/ops/delivery` and every
+// `POST /v1/ops/claim` in the 2026-11-20 captures. The switch picks; off keeps
+// upstream's word, since the gateway has been taking it.
 const OPS_CHANNEL = "IDE"
+const OPS_CHANNEL_CLIENT = "DESKTOP"
+/** The channel this build names on the ops routes. */
+const opsChannel = () => (shapeOn() ? OPS_CHANNEL_CLIENT : OPS_CHANNEL)
+/** `GET /v1/ops/delivery` with that channel on it. */
+const opsDeliveryUrl = () => `${SNAP_HOST}/v1/ops/delivery?channel=${opsChannel()}`
+
+// The kernel keeps its upstream session marked busy while a chat is in flight
+// (`PUT /snap-manager/v1/chat-session/heartbeat?status=busy`, empty body, signed
+// over the same three headers as the chat itself). Upstream sends no heartbeat
+// at all; without one the gateway is free to treat each chat as a new session,
+// which is what the three-session cap is counted against.
+const CHAT_SESSION_HEARTBEAT_URL = `${SNAP_HOST}/snap-manager/v1/chat-session/heartbeat`
+// One beat every 30s would be the kernel's own cadence; a chat here is
+// request/response, so the first beat before it and one after are enough.
+const HEARTBEAT_ARM_MS = 30 * 1000
 const DAILY_CHECKIN_TYPE = "USER_LOGIN"
 // A campaign of that type is a daily check-in when its title says so; the list
 // also holds one-time USER_LOGIN campaigns (a contest's sign-up gift), which are
@@ -448,6 +471,25 @@ function randomHex(n) {
   return hex(randomBytes(n))
 }
 
+/** A v4 UUID, as the kernel's trace header carries it. */
+function randomUuid() {
+  const b = randomBytes(16)
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = hex(b)
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+/** The machine's first non-internal IPv4 address, as the kernel reports one. */
+function localIpOf() {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const net of list ?? []) {
+      if (net.family === "IPv4" && !net.internal) return net.address
+    }
+  }
+  return undefined
+}
+
 function b64url(u8) {
   let s = ""
   for (const b of u8) s += String.fromCharCode(b)
@@ -531,8 +573,19 @@ function canonicalQuery(url) {
  * Sign a Huawei request; returns the header map to merge into the request.
  * Extra headers (e.g. `maas_type: benefit`) participate in the canonical
  * request and must be sent verbatim, or the server rejects the signature.
+ *
+ * `omitContentHash` leaves `x-sdk-content-sha256` out — of the headers and of
+ * `SignedHeaders`, which have to agree or the gateway refuses. Only the chat
+ * transport asks for it (see extras.mjs's switch): the other signed calls here
+ * (IAM, opengw, the benefit claim) are the plugin's own routes, not the
+ * kernel's, so their signature stays as it was.
+ *
+ * `omitContentType` leaves `content-type` out of `SignedHeaders` while still
+ * sending it: the kernel's chat POST is signed over
+ * `host;x-sdk-date;x-security-token` alone (measured 2026-11-20 across four
+ * chats and three heartbeats) and carries an unsigned `content-type`.
  */
-async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, extraHeaders, dateStampOverride) {
+async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, extraHeaders, dateStampOverride, omitContentHash = false, omitContentType = false) {
   const url = new URL(urlStr)
   let uri = url.pathname
   if (!uri.endsWith("/")) uri += "/"
@@ -544,15 +597,20 @@ async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, ex
   const headers = new Map()
   headers.set("host", url.host)
   headers.set("x-sdk-date", dateStamp)
-  headers.set("x-sdk-content-sha256", payloadHash)
+  if (!omitContentHash) headers.set("x-sdk-content-sha256", payloadHash)
   headers.set("x-security-token", securityToken)
   if (extraHeaders !== undefined) {
     for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v)
   }
   if (method.toUpperCase() !== "GET") headers.set("content-type", "application/json")
 
-  const signedHeaders = [...headers.keys()].sort()
-  const canonicalRequest = buildCanonicalRequest(method.toUpperCase(), uri, query, headers, payloadHash)
+  // What the signature covers: every header above, minus the ones this shape
+  // sends unsigned. The header still travels; only `SignedHeaders` and the
+  // canonical request leave it out.
+  const unsigned = omitContentType ? new Set(["content-type"]) : new Set()
+  const covered = new Map([...headers].filter(([k]) => !unsigned.has(k)))
+  const signedHeaders = [...covered.keys()].sort()
+  const canonicalRequest = buildCanonicalRequest(method.toUpperCase(), uri, query, covered, payloadHash)
   const canonicalHash = await sha256Hex(utf8(canonicalRequest))
   const stringToSign = `SDK-HMAC-SHA256\n${dateStamp}\n${canonicalHash}`
   const signature = await hmacSha256Hex(utf8(sk), utf8(stringToSign))
@@ -1069,6 +1127,14 @@ function prepareChatBody(parsed, { thinking = true, station = "mainland" } = {})
   if (!parsed || typeof parsed.model !== "string" || !Array.isArray(parsed.messages)) return null
   const body = { ...parsed, model: upstreamModelId(parsed.model) }
   const names = shortenToolNames(body)
+  // The kernel's shape (extras.mjs's switch) has no `thinking` object: it asks
+  // for the thinking with two booleans of its own (`enable_thinking`,
+  // `tool_stream`) and reads the token count off `stream_options`. A caller's
+  // `thinking` object is the upstream shape and means the same thing, so it is
+  // read here and said the kernel's way below.
+  const kernel = shapeOn()
+  const callerThought = kernel ? body.thinking : undefined
+  if (kernel) delete body.thinking
   // `injected`: ours to take back should a model refuse the parameter.
   //
   // The caller's level is the gateway's own word for it (measured 2026-11-04:
@@ -1083,13 +1149,15 @@ function prepareChatBody(parsed, { thinking = true, station = "mainland" } = {})
   // "No thinking" is the one thing the level alone does not do (measured:
   // `reasoning_effort: none` still thought, 89 to 135 characters of it), so it
   // is the switch that is used: `thinking: disabled` is the gateway's own way
-  // of not thinking at all.
+  // of not thinking at all, and the kernel says it as `enable_thinking: false`.
   const spoken = typeof body.reasoning_effort === "string" ? body.reasoning_effort.trim().toLowerCase() : ""
   const levels = reasoningLevelsOf(body.model)
   if (spoken !== "") {
     if (NO_THINKING.has(spoken)) {
       delete body.reasoning_effort
-      if (body.thinking === undefined) body.thinking = DISABLE_THINKING
+      if (kernel) {
+        if (body.enable_thinking === undefined) body.enable_thinking = false
+      } else if (body.thinking === undefined) body.thinking = DISABLE_THINKING
     } else if (levels.length === 0 || levels.includes(spoken)) {
       body.reasoning_effort = spoken
     } else {
@@ -1098,8 +1166,24 @@ function prepareChatBody(parsed, { thinking = true, station = "mainland" } = {})
       delete body.reasoning_effort
     }
   }
-  const injected = thinking && spoken === "" && body.thinking === undefined
-  if (injected) body.thinking = ENABLE_THINKING
+  // The caller's own `thinking: { type: "disabled" }` is the kernel's
+  // `enable_thinking: false` (and its `enabled` the same true).
+  let asked = kernel ? body.enable_thinking : body.thinking
+  if (kernel && asked === undefined && callerThought && typeof callerThought === "object") {
+    if (callerThought.type === "disabled") body.enable_thinking = false
+    if (callerThought.type === "enabled") body.enable_thinking = true
+    asked = body.enable_thinking
+  }
+  const injected = thinking && spoken === "" && asked === undefined
+  if (injected) {
+    if (kernel) body.enable_thinking = true
+    else body.thinking = ENABLE_THINKING
+  }
+  if (kernel) {
+    // The kernel streams tool calls and has the gateway count the tokens.
+    body.tool_stream = true
+    body.stream_options = { ...(body.stream_options ?? {}), include_usage: true }
+  }
   for (const k of ["max_tokens", "max_completion_tokens"]) {
     if (typeof body[k] === "number" && body[k] > MAX_OUTPUT_TOKENS) body[k] = MAX_OUTPUT_TOKENS
   }
@@ -1812,11 +1896,11 @@ const refusalTo = (url, cred) =>
  * goes with `redirect: "error"`: a redirect would forward the security token
  * to wherever it points.
  */
-async function signFor(cred, method, url, body, extraSigned) {
+async function signFor(cred, method, url, body, extraSigned, { omitContentHash = false, omitContentType = false } = {}) {
   if (!isSignedHostUrl(url, cred)) throw new Error(refusalTo(url, cred))
   const signed = await signRequestHuawei(
     cred.access_key_id, cred.secret_access_key, cred.security_token,
-    method, url, body, extraSigned,
+    method, url, body, extraSigned, undefined, omitContentHash, omitContentType,
   )
   const headers = new Headers()
   signed.forEach((value, key) => {
@@ -1879,21 +1963,59 @@ async function signedFetch(cred, input, init, context) {
 
   let active = cred
   const send = async () => {
-    const signed = await signFor(active, method, url, body, extra)
+    // The kernel's signed set has no content hash (extras.mjs's switch); the
+    // plugin's other signed routes keep theirs, so this is asked for here and
+    // not inside the signer.
+    const signed = await signFor(active, method, url, body, extra, { omitContentHash: shapeOn(), omitContentType: shapeOn() })
     const headers = new Headers(baseHeaders)
     // The body may have been reshaped: the transport counts it again.
     headers.delete("content-length")
     signed.forEach((value, key) => headers.set(key, value))
-    headers.set("Chat-Id", context.chatId)
-    headers.set("Session-Id", context.sessionId)
+    // `Chat-Id` and `Session-Id` are the upstream plugin's own: the kernel
+    // sends neither (it names its session in `x-ot-session-id` alone, which
+    // both shapes carry), so with the kernel's shape on they are left out.
+    if (!shapeOn()) {
+      headers.set("Chat-Id", context.chatId)
+      headers.set("Session-Id", context.sessionId)
+    }
     // The session headers the CodeArts agent sends: one session per account,
-    // a fresh trace per request.
+    // a fresh trace per request. `traceId` is that trace in both shapes: the
+    // kernel repeats it as `traceid` below.
+    const traceId = randomHex(16)
     headers.set(SESSION_HEADER, context.sessionId)
     headers.set("user-session-id", context.sessionId)
-    headers.set("x-ot-parent-session-id", "")
-    headers.set("x-ot-trace-id", randomHex(16))
+    // The kernel points the parent at the same session and carries the STS
+    // token a second time under `x-auth-token`; upstream sent an empty parent
+    // and no `x-auth-token` at all. Neither is signed, so both go here.
+    headers.set("x-ot-parent-session-id", shapeOn() ? context.sessionId : "")
+    if (shapeOn()) {
+      // The kernel's own identity headers, none of them signed and none of
+      // them sent by upstream: it names the IDE and the plugin that is
+      // talking (both `codearts_space`, version 0.2.9), repeats the trace as
+      // `traceid`, stamps the message and the model, and reports a client IP
+      // it read off the machine.
+      if (active.security_token) headers.set("x-auth-token", String(active.security_token).trim())
+      headers.set("x-ot-client-type", "desktop")
+      headers.set("x-ot-client-version", "0.2.9")
+      headers.set("plugin-name", "codearts_space")
+      headers.set("plugin-version", "0.2.9")
+      headers.set("ide-name", "codearts_space")
+      headers.set("ide-version", "0.2.9")
+      headers.set("traceid", traceId)
+      headers.set("client-ip", localIpOf() ?? "10.0.0.1")
+      headers.set("user-msg-id", `msg_${randomHex(12)}`)
+      headers.set("created-time", new Date().toISOString().replace(/\.\d{3}Z$/, "Z"))
+      // `model` is this request's own upstream id, parsed above.
+      if (model) {
+        headers.set("model-id", model)
+        headers.set("model-name", model)
+      }
+    }
+    headers.set("x-ot-trace-id", traceId)
     headers.set("x-ot-span-id", randomHex(8))
-    headers.set("x-snap-traceid", randomHex(16))
+    // The client's trace is `<uuid>_<host suffix>`, not bare hex, and it
+    // repeats the trace id as `traceid` beside `x-ot-trace-id`.
+    headers.set("x-snap-traceid", shapeOn() ? `${randomUuid()}_${randomHex(8)}` : randomHex(16))
     headers.set("lang", "en")
     return context.fetcher(url, {
       ...init,
@@ -1921,8 +2043,36 @@ async function signedFetch(cred, input, init, context) {
     return withSignInMark(await send())
   }
 
+  // The kernel marks its session busy before a chat and idle after it. Best
+  // effort throughout: a heartbeat that fails changes nothing a caller sees.
+  const beat = async (status) => {
+    if (!shapeOn() || !chat) return
+    try {
+      const beatUrl = `${CHAT_SESSION_HEARTBEAT_URL}?status=${status}`
+      const signed = await signFor(active, "PUT", beatUrl, new Uint8Array(), undefined, {
+        omitContentHash: shapeOn(), omitContentType: shapeOn(),
+      })
+      // The client's heartbeat carries exactly these beside the signed three
+      // (measured 2026-11-20: accept, content-type, user-session-id,
+      // x-snap-traceid) — no trace ids, no auth token, no ot-* family.
+      const headers = new Headers(signed)
+      headers.set("accept", "*/*")
+      headers.set("content-type", "application/json")
+      headers.set("user-session-id", context.sessionId)
+      headers.set("x-snap-traceid", randomHex(16))
+      await context.fetcher(beatUrl, {
+        method: "PUT", headers, body: undefined,
+        signal: AbortSignal.timeout(HEARTBEAT_ARM_MS), redirect: "error",
+      })
+    } catch {
+      /* the chat goes ahead either way */
+    }
+  }
   const release = await context.gate.acquire(signal)
   let handedOver = false
+  // The beat goes out once this request holds the slot: `busy` means a chat is
+  // in flight, not that one is queueing for it.
+  if (chat) await beat("busy")
   try {
     const clock = context.now ?? Date.now
     const started = clock()
@@ -1979,10 +2129,13 @@ async function signedFetch(cred, input, init, context) {
       }
       if (res.status === 403) return rebuildResponse(res, text, { "X-Magpie-Sign-In": "expired" })
       // The thinking parameter is the plugin's own: a model that refuses it
-      // gets the request again as the caller wrote it.
+      // gets the request again as the caller wrote it — whichever of the two
+      // shapes it was said in.
       if (res.status === 400 && chat.injected && /thinking/i.test(text)) {
         chat.injected = false
         delete chat.body.thinking
+        delete chat.body.enable_thinking
+        delete chat.body.tool_stream
         body = utf8(JSON.stringify(chat.body))
         continue
       }
@@ -2025,6 +2178,9 @@ async function signedFetch(cred, input, init, context) {
     }
   } finally {
     if (!handedOver) release()
+    // The kernel releases with an idle beat; so does this, once the answer is
+    // taken. Not awaited on the way out: a chat's answer must not wait on it.
+    void beat("idle")
   }
 }
 
@@ -2104,7 +2260,7 @@ async function snapRequest(method, url, cred, fetcher, payload) {
 
 /** The account's 「每日领取」 campaigns from the activity list, or a reason they can't be read. */
 async function dailyCampaigns(cred, fetcher) {
-  const listed = await snapRequest("GET", OPS_DELIVERY_URL, cred, fetcher)
+  const listed = await snapRequest("GET", opsDeliveryUrl(), cred, fetcher)
   if (!listed.ok) return { error: `活动列表读取失败：${listed.message}` }
   const items = asRecord(listed.data).items
   if (!Array.isArray(items)) return { error: "活动列表缺少 items" }
@@ -2367,7 +2523,7 @@ async function dailyCheckin(cred, fetcher, { unconfirmed } = {}) {
       continue
     }
 
-    const claimed = await snapRequest("POST", OPS_CLAIM_URL, cred, fetcher, { campaignId: item.campaignId, channel: OPS_CHANNEL })
+    const claimed = await snapRequest("POST", OPS_CLAIM_URL, cred, fetcher, { campaignId: item.campaignId, channel: opsChannel() })
     if (!claimed.ok) {
       // Claimed elsewhere a moment ago (the IDE, another magpie): look again.
       const again = await dailyCampaigns(cred, fetcher)
@@ -2701,6 +2857,12 @@ const BENEFIT_WINDOW_LABEL = "免费额度"
  */
 function creditWindow(name, limit, remain, { resetsAt, expiring = 0 } = {}) {
   const used = Math.max(0, limit - remain)
+  // The package total says what is left in credits, as raccoon's daily window
+  // does, so magpie can order accounts of one provider by what they still hold
+  // (`byLeft`, which only trades places inside a provider and unit). Zero is
+  // left out on purpose: magpie reads balance 0 as "spent", which would drop a
+  // total already down to its last credit out of the pool.
+  const balance = remain > 0 && name === CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC] ? { balance: remain } : {}
   return {
     name,
     used: clamp(limit > 0 ? (used / limit) * 100 : 0),
@@ -2710,6 +2872,7 @@ function creditWindow(name, limit, remain, { resetsAt, expiring = 0 } = {}) {
     unit: "credits",
     ...(resetsAt ? { resetsAt } : {}),
     ...(name !== CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC] ? { aside: true } : {}),
+    ...balance,
   }
 }
 
@@ -3143,7 +3306,7 @@ async function renewFromIde(cred, read) {
 
 // ---- the plugin -------------------------------------------------------------
 
-export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
+const codeartsBase = async ({ client } = {}, options = {}) => {
   const fetcher = typeof options?.fetch === "function" ? options.fetch : fetch
   // Tunables (magpie: `magpie plugin options <name> '{…}'`). `maxInflight` can
   // only lower the gate: above 3 the account would pass the vendor's cap.
@@ -3626,6 +3789,15 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   }
 }
 
+// extras: everything above is upstream's, unchanged; the wrapper adds the
+// request-shape switch's option to the card and registers how it is read (the
+// three gates inside are marked `shapeOn()`). See extras.mjs.
+export const CodeArtsAuthPlugin = async (args = {}, options = {}) => {
+  const plugin = await codeartsBase(args, options)
+  // read at each request, so a change reaches the plugin without a restart
+  return extendCodeArts(plugin, { wire: () => wireOn(args?.magpie, PROVIDER) })
+}
+
 /** Is the credential this close to its expiry (unknown expiry: no)? */
 function nearExpiry(cred) {
   const at = Date.parse(cred?.expires_at || "")
@@ -3932,12 +4104,18 @@ function signOfficeAceV11(urlStr, cred, method = "GET", body, dateOverride) {
   const path = url.pathname.split("/").map((s) => rfc3986(decodeURIComponent(s))).join("/")
   const canonicalUri = path.endsWith("/") ? path : `${path}/`
 
+  // `x-subscription-type` is a read-side header: the client's `GET
+  // /v1/subscription` signs it, its `POST /v1/subscription/bonus/claim` signs
+  // only `content-type;host;x-project-id;x-sdk-date;x-security-token`. Upstream
+  // signed it on both, so the claim carried a header the client never signs.
+  // Behind `request_shape_officeace_1_8_1` (extras.mjs): off keeps upstream's
+  // signature exactly.
   const original = {
-    "x-subscription-type": "v2",
     "X-Sdk-Date": xdate,
     "X-Security-Token": String(cred.security_token ?? "").trim(),
     Host: url.host,
   }
+  if (method !== "POST" || !shapeOn("officeace")) original["x-subscription-type"] = "v2"
   if (method === "POST") original["Content-Type"] = "application/json;charset=utf8"
   if (cred.project_id) original["X-Project-ID"] = cred.project_id
 
@@ -4308,6 +4486,10 @@ async function fetchOfficeAceUsage(cred, fetcher = fetch) {
       amount,
       limit,
     })
+    // What is left, for magpie to order accounts of this provider among
+    // themselves (raccoon's daily window reports its balance the same way).
+    // Nothing left is left out: magpie reads balance 0 as "spent".
+    if (rawRemaining > 0) total.balance = remaining
     const lapse = active ? soonestLapse(aggregateBatches, nowMs) : undefined
     if (lapse && rawRemaining > 0) {
       const runsOut = Math.min(lapse.credit, rawRemaining)
@@ -4747,7 +4929,7 @@ async function persistOfficeAceRecord(client, cred, prev) {
  * in through that package are read from where magpie already keeps them
  * (`officeace`, `officeace#xxxxxx`) and nobody signs in again.
  */
-export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
+const officeAceBase = async ({ client } = {}, options = {}) => {
   const fetcher = typeof options?.fetch === "function" ? options.fetch : fetch
   const log = (message, level = "info") => {
     try {
@@ -4795,13 +4977,15 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
         // static table is all there is (and it is honest: nobody knows yet).
         if (!cred.model_app_key) return provider.models
 
-        const base = officeAceMaasBase(cred)
-        try {
-          const rows = await fetchOfficeAceCatalog(cred, fetcher)
-          if (!rows.length) return provider.models
+        // The catalog as a set of model rows, or null when there is nothing
+        // worth showing (no rows, no rates, no overlap with the known ids).
+        const liveFrom = async (c) => {
+          const base = officeAceMaasBase(c)
+          const rows = await fetchOfficeAceCatalog(c, fetcher)
+          if (!rows.length) return null
           let rates = null
           try {
-            rates = await fetchOfficeAceTokenRates(cred, fetcher)
+            rates = await fetchOfficeAceTokenRates(c, fetcher)
           } catch {
             rates = null
           }
@@ -4813,20 +4997,51 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
             log("倍率表不可用（空表）—— 目录只列出已知可调用的 id", "warn")
             const known = rows.filter((row) => Object.hasOwn(OA_FALLBACK_MODELS, row.id))
             const live = officeAceLiveModels(known, base, null)
-            return Object.keys(live).length > 0 ? live : provider.models
+            return Object.keys(live).length > 0 ? live : null
           }
           const live = officeAceLiveModels(rows, base, rates)
           if (Object.keys(live).length === 0) {
             log("倍率表与模型目录零交集 —— 退回静态表", "warn")
-            return provider.models
+            return null
           }
           return live
+        }
+
+        try {
+          return (await liveFrom(cred)) ?? provider.models
         } catch (e) {
           log(`目录拉取失败，回退静态表：${e?.message ?? e}`, "warn")
-          if (/401|403|unauthorized|被拒/i.test(String(e?.message))) {
+          const refused = /401|403|unauthorized|被拒/i.test(String(e?.message))
+          if (!refused) return provider.models
+          // Off: upstream's reading — the catalog was refused, so the sign-in is
+          // called dead and the card says so.
+          if (!shapeOn("officeace")) {
             throw Object.assign(new Error("OfficeAce 登录已失效，请重新登录"), { signIn: "expired" })
           }
-          return provider.models
+          // On: the client's reading. The catalog is signed with the MaaS Basic
+          // pair, which is a *derivative* of the sign-in — minted by the
+          // permission check and cached for hours — so a refused pair means the
+          // derivative went stale or was never minted, not that the account is
+          // signed out. Read a fresh pair, try the catalog once more, and
+          // otherwise stay on the static table with the account still signed in.
+          const fresh = await fetchOfficeAceMaasInfo(cred, fetcher).catch(() => null)
+          if (!fresh?.model_app_key) {
+            log("MaaS 密钥重读失败 —— 目录保持静态表，登录态不受影响", "warn")
+            return provider.models
+          }
+          const healed = { ...cred, ...fresh }
+          const cacheKey = accountIdentityOf(healed).id || healed.access_key_id
+          if (cacheKey) oaMaasCache.set(cacheKey, { at: Date.now(), info: fresh })
+          if (oaBasicFingerprint(fresh) === oaBasicFingerprint(cred)) {
+            log("重读的 MaaS 密钥与被拒的相同 —— 目录保持静态表", "warn")
+            return provider.models
+          }
+          try {
+            return (await liveFrom(healed)) ?? provider.models
+          } catch (again) {
+            log(`换过 MaaS 密钥后目录仍被拒：${again?.message ?? again}`, "warn")
+            return provider.models
+          }
         }
       },
     },
@@ -5018,6 +5233,17 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
       output.headers["x-officeace-session"] = String(input.sessionID).slice(0, 128)
     },
   }
+}
+
+// extras: everything above is upstream's, unchanged; the wrapper puts this
+// provider's own switch on its card and registers how it is read (the two gates
+// inside are marked `shapeOn("officeace")` — the claim's signature in
+// signOfficeAceV11, and what a refused model catalog is taken to mean). See
+// extras.mjs.
+export const OfficeAceAuthPlugin = async (args = {}, options = {}) => {
+  const plugin = await officeAceBase(args, options)
+  // read at each request, so a change reaches the plugin without a restart
+  return extendOfficeAce(plugin, { wire: () => wireOn(args?.magpie, OFFICEACE_PROVIDER) })
 }
 
 // for tests (never a plugin: magpie only calls exported functions)

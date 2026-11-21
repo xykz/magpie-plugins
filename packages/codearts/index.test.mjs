@@ -584,10 +584,20 @@ test("usageFromStatistics maps credit metrics to windows with real numbers", () 
   // The package total is listed first, then the buckets, all with display
   // numbers; only the total may pause the account, the buckets are aside.
   assert.deepEqual(usage.windows, [
-    { name: "总积分", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
+    { name: "总积分", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits", balance: 250 },
     { name: "基础积分包", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits", aside: true },
     { name: "按需积分包", used: 0, display: "0 / 2.0万", amount: 0, limit: 20000, unit: "credits", aside: true },
   ])
+})
+
+test("a spent package total carries no balance, so magpie does not read it as spent twice", () => {
+  const usage = x.usageFromStatistics({
+    package: { package_name_cn: "企业版" },
+    metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 1000, package_credit_remain: 0 }],
+  })
+  const total = usage.windows.find((w) => w.name === "总积分")
+  assert.equal(total.used, 100)
+  assert.equal("balance" in total, false)
 })
 
 test("usageFromStatistics adds the free daily pool as an aside window for the free models", () => {
@@ -2427,7 +2437,7 @@ test("auth.usage reports the plan's credit window (the free pool is best-effort)
   const usage = await plugin.auth.usage(async () => makeAuth(cred))
   assert.equal(usage.plan, "企业版")
   assert.deepEqual(usage.windows, [
-    { name: "总积分", used: 60, display: "600 / 1000", amount: 600, limit: 1000, unit: "credits" },
+    { name: "总积分", used: 60, display: "600 / 1000", amount: 600, limit: 1000, unit: "credits", balance: 400 },
   ])
   assert.deepEqual(asked, [x.SNAP_STATISTICS_URL, x.BENEFIT_BALANCE_URL, x.PACKAGE_CREDIT_PAGE_URL, x.PACKAGE_CREDIT_PAGE_URL, x.OPS_CREDIT_OVERVIEW_URL])
   // Read again within ten minutes: the batches aren't.
@@ -3393,6 +3403,8 @@ test("an OfficeAce account with only expired buckets keeps a used-up routing tot
   assert.equal(total.limit, 100)
   assert.equal(total.used, 100)
   assert.equal("aside" in total, false)
+  // Nothing left: no balance, which magpie reads as "spent" on top of used 100.
+  assert.equal("balance" in total, false)
   assert.equal(windows.filter((w) => !w.aside).length, 1)
 })
 

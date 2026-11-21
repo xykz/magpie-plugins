@@ -16,6 +16,10 @@ import { createServer, STATUS_CODES } from "node:http"
 import { homedir, release, version as osVersion } from "node:os"
 import { dirname, join } from "node:path"
 
+// The fork's own piece — the request-shape switch — in a file a merge of
+// upstream's index.mjs can leave alone. See extras.mjs.
+import { clientShape, extendTrae, shapeOn, wireOn } from "./extras.mjs"
+
 // SEES is a fallback model that takes images, as Trae's lists mark it
 // (multimodal: true)
 const SEES = { attachment: true, modalities: { input: ["text", "image"], output: ["text"] } }
@@ -1620,6 +1624,9 @@ function sessionOf(headers) {
 // for, and serves its default when none is asked.
 function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees = false, levels = null, entry = null) {
   const config = max?.base ?? req.model
+  // One conversation, one id: the client's shape names it twice (see
+  // extras.mjs's switch), so both names are written from this one.
+  const conversation = session || randomUUID()
   const body = {
     messages: traeMessages(req, sees),
     function: fn,
@@ -1628,7 +1635,8 @@ function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees =
     ...(modelName ? { model_name: modelName } : {}),
     stream: true, // Trae answers in SSE either way
     request_id: randomUUID(),
-    session_id: session || randomUUID(),
+    session_id: conversation,
+    ...(shapeOn() ? clientShape(conversation) : {}),
   }
   const effort = effortOf(levels, req.reasoning_effort ?? req.reasoningEffort)
   if (effort) body.reasoning_effort = effort
@@ -3470,7 +3478,7 @@ function dollarUsageOf(v) {
 
 // ---- the plugin ---------------------------------------------------------------------
 
-const makePlugin = (site) => async ({ client }) => {
+const pluginBase = (site) => async ({ client }) => {
   // renewals under way, one to a refresh token (Trae spends it once), and
   // the last each account got here, so a sign-in from before it is given
   // that one rather than spending the token again
@@ -4340,8 +4348,17 @@ const makePlugin = (site) => async ({ client }) => {
   }
 }
 
+// extras: everything above is upstream's, unchanged; the wrapper adds the
+// request-shape switch's option to the card and registers how it is read (the
+// gate inside chatBody is marked `shapeOn()`). See extras.mjs.
+const shapePlugin = (site) => async (args = {}) => {
+  const plugin = await pluginBase(site)(args)
+  // read at each request, so a change reaches the plugin without a restart
+  return extendTrae(plugin, { wire: () => wireOn(args?.magpie, site.id) })
+}
+
 // for tests: the CN realm's table as before, plus both realms' factories
-export const TraeCNAuthPlugin = makePlugin(SITES["trae-cn"])
-export const TraeGlobalAuthPlugin = makePlugin(SITES["trae-global"])
+export const TraeCNAuthPlugin = shapePlugin(SITES["trae-cn"])
+export const TraeGlobalAuthPlugin = shapePlugin(SITES["trae-global"])
 
 export const _internal = { chatModel, ownClient, clientStoragePaths, clientDevice, clientProfiles, deviceNote, clientDecode, thisMachine, traeHost, accountOf, HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, nameCall, toolNamed, unwrapped, traeMessages, chatBody, nativeTools, moonshotSchema, credits, dollarUsageOf, seatPoolOf, seatSpentOf, entResetOf, isEnterprise, yuan, whenOf, newDevice, ugDevice, proofOf, SITES, SESSION, conversationID, LEVELS, levelsOf, variantsOf, effortOf, offered, traeRateOf }
